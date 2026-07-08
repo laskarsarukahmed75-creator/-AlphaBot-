@@ -9,7 +9,7 @@ class DatabaseHandler:
         self._init_sqlite()
 
     def _init_sqlite(self):
-        cur = self.conn.conn.cursor()
+        cur = self.conn.cursor()
         cur.execute('''
             CREATE TABLE IF NOT EXISTS candles (
                 asset TEXT, tf INTEGER, timestamp INTEGER,
