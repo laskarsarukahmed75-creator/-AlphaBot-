@@ -39,8 +39,8 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
-    MIN_CONFLUENCE_SCORE = 70
-    MIN_LAYER_PASS = 5
+    MIN_CONFLUENCE_SCORE = 60
+    MIN_LAYER_PASS = 3
     SIGNAL_COOLDOWN = 3600
     DB_PATH = "trades.db"
     MAX_CANDLES = 500
@@ -736,6 +736,7 @@ class SignalScoringEngine:
             passed_layers.append("adx")
         elif adx > 20:
             adx_score = self.weights["adx"] * 0.5
+            passed_layers.append("adx")
         breakdown["adx"] = {"score": adx_score, "weight": self.weights["adx"], "pass": adx_score>0}
         total_score += adx_score
 
@@ -1079,8 +1080,8 @@ class AIOrchestrator:
         if len(candles_15m) > 10:
             closes = [c["close"] for c in candles_15m if c.get("complete", False)]
             if len(closes) > 10:
-                ema_short = self.topology._ema(closes, 9)
-                ema_long = self.topology._ema(closes, 21)
+                ema_short = self.topology._ema(closes, 5)
+                ema_long = self.topology._ema(closes, 13)
                 if len(ema_short) > 1 and len(ema_long) > 1:
                     if ema_short[-1] > ema_long[-1]:
                         self.asset_state[asset]["trend"] = "BULLISH"
@@ -1095,8 +1096,8 @@ class AIOrchestrator:
         if len(candles_1h) > 10:
             closes_1h = [c["close"] for c in candles_1h if c.get("complete", False)]
             if len(closes_1h) > 10:
-                ema_short_1h = self.topology._ema(closes_1h, 9)
-                ema_long_1h = self.topology._ema(closes_1h, 21)
+                ema_short_1h = self.topology._ema(closes_1h, 5)
+                ema_long_1h = self.topology._ema(closes_1h, 13)
                 if len(ema_short_1h) > 1 and len(ema_long_1h) > 1:
                     if ema_short_1h[-1] > ema_long_1h[-1]:
                         self.asset_state[asset]["htf_trend"] = "BULLISH"
