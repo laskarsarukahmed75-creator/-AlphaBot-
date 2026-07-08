@@ -852,18 +852,18 @@ class BinancePublicStream:
         import websocket
         while self.running:
             try:
-                ws_url = "wss://stream.binance.com:9443/ws"
                 streams = [f"{asset.lower()}@kline_1m" for asset in Config.ASSETS]
-                combined_url = ws_url + "/" + "/".join(streams)
+                stream_str = "/".join(streams)
+                ws_url = f"wss://stream.binance.com:9443/stream?streams={stream_str}"
                 self.ws = websocket.WebSocketApp(
-                    combined_url,
+                    ws_url,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,
                     on_pong=self._on_pong
                 )
-                threading.Thread(target=self._heartbeat, daemon=True).start()
+                # threading.Thread(target=self._heartbeat, daemon=True).start()
                 self.ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
                 logger.error(f"WebSocket loop error: {e}")
