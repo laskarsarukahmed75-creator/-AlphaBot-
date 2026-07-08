@@ -116,7 +116,7 @@ class TradeDatabase:
         ''')
         self.conn.commit()
 
-    def log_trade((self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
+    def log_trade(self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
                   volatility, regime, htf_trend, news_score):
         cur = self.conn.cursor()
         cur.execute('''
