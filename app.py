@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-app.py – Institutional‑Grade Crypto AI Analyst v3.1 (Bugfix)
+app.py – Institutional‑Grade Crypto AI Analyst v3.1 (Persistent DB + Anti‑Sleep)
 Data Source: Binance Public WebSocket (No API Keys)
 Target Win‑Rate: 75‑85% | Horizon: 1 Hour
 Features: Layered Filtering, Multi‑Timeframe, Smart Money Concepts, Dynamic Risk, Trade Journal, Health API
@@ -22,6 +22,10 @@ from collections import deque
 from datetime import datetime
 import math
 
+# ---- NEW INTEGRATION IMPORTS ----
+from db_handler import DatabaseHandler
+from keepalive import KeepAliveEngine
+
 # Optional for health metrics
 try:
     import psutil
@@ -39,8 +43,8 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
-    MIN_CONFLUENCE_SCORE = 60
-    MIN_LAYER_PASS = 3
+    MIN_CONFLUENCE_SCORE = 70
+    MIN_LAYER_PASS = 5
     SIGNAL_COOLDOWN = 3600
     DB_PATH = "trades.db"
     MAX_CANDLES = 500
@@ -112,7 +116,7 @@ class TradeDatabase:
         ''')
         self.conn.commit()
 
-    def log_trade(self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
+    def log_trade((self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
                   volatility, regime, htf_trend, news_score):
         cur = self.conn.cursor()
         cur.execute('''
@@ -142,13 +146,10 @@ class TradeDatabase:
         self.conn.commit()
 
     def get_performance_metrics(self):
-        """Return correct performance metrics including win rate and profit factor."""
         cur = self.conn.cursor()
-        # Total closed trades with PnL
         cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl IS NOT NULL")
         total = cur.fetchone()[0] or 0
 
-        # Winning trades count
         cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0")
         wins = cur.fetchone()[0] or 0
 
@@ -230,7 +231,6 @@ class CryptoNewsScanner:
                             "timestamp": article.get("published_on", 0),
                             "importance": importance
                         })
-                    # Store the most important article as last_news
                     if articles:
                         self.last_news = articles[0]
                     return {"articles": articles, "fresh": True}
@@ -307,6 +307,10 @@ class CandleTopologyEngine:
         if not storage or storage[-1].get("timestamp") != start:
             if storage and not storage[-1].get("complete", False):
                 storage[-1]["complete"] = True
+                # NEW: Save finalized candle to local persistent DB
+                db = DatabaseHandler()
+                db.save_candle(asset, tf, storage[-1])
+                
             storage.append({
                 "timestamp": start,
                 "open": price,
@@ -736,7 +740,6 @@ class SignalScoringEngine:
             passed_layers.append("adx")
         elif adx > 20:
             adx_score = self.weights["adx"] * 0.5
-            passed_layers.append("adx")
         breakdown["adx"] = {"score": adx_score, "weight": self.weights["adx"], "pass": adx_score>0}
         total_score += adx_score
 
@@ -795,7 +798,6 @@ class TelegramPipeline:
         icon = "🔥" if direction == "BUY" else "❄️"
         strength = "STRONG" if score["total_score"] >= 70 else "MODERATE"
         display = Config.DISPLAY_NAMES.get(asset, asset)
-        pattern_text = "\n".join([f"  • {k.replace('_', ' ').title()}" for k in patterns.keys()]) if patterns else "None"
         msg = (
             f"{icon} <b>AI SIGNAL: {direction}</b> {icon}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -864,27 +866,11 @@ class BinancePublicStream:
                     on_close=self._on_close,
                     on_pong=self._on_pong
                 )
-                # threading.Thread(target=self._heartbeat, daemon=True).start()
                 self.ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
                 logger.error(f"WebSocket loop error: {e}")
                 self.reconnect_count += 1
                 time.sleep(5)
-
-    def _heartbeat(self):
-        """Send periodic ping; do not break on network errors – let reconnection handle it."""
-        while self.running and self.ws:
-            try:
-                # Only send if connection is likely alive (websocket-client keeps internal state)
-                if self.ws.sock and self.ws.sock.connected:
-                    self.ws.send(json.dumps({"op": "ping"}))
-                    self.last_ping = time.time()
-                else:
-                    # If sock is None or not connected, just wait and let the main loop reconnect
-                    logger.debug("WebSocket not connected, skipping heartbeat ping")
-            except Exception as e:
-                logger.warning(f"Heartbeat send error: {e} (will retry)")
-            time.sleep(30)
 
     def _on_pong(self, ws, data):
         self.latency = time.time() - self.last_ping if self.last_ping else 0
@@ -999,18 +985,101 @@ class AIOrchestrator:
         self.rejected_signals = 0
         self.accepted_signals = 0
 
+    # ---- NEW INTEGRATION: RECOVER FROM DATABASE ON BOOT ----
+    def _recover_from_db(self):
+        logger.info("📂 Checking local persistent database for cached historical candles...")
+        db = DatabaseHandler()
+        for asset in Config.ASSETS:
+            for tf in [60, 300, 900, 3600]:
+                candles = db.load_candles(asset, tf, limit=Config.MAX_CANDLES)
+                if candles:
+                    self.topology.candles[tf][asset] = candles
+                    self.topology.last_tick_time[asset] = candles[-1]["timestamp"]
+                    logger.info(f"✅ Loaded {len(candles)} cached candles for {asset} ({tf}s) from local DB.")
+                    self._fetch_missing_candles(asset, tf, candles[-1]["timestamp"])
+                else:
+                    logger.info(f"📥 Empty database for {asset} ({tf}s). Cold seeding 3 months history...")
+                    start_ts = int(time.time()) - (90 * 24 * 3600)
+                    self._fetch_missing_candles(asset, tf, start_ts)
+
+    # ---- NEW INTEGRATION: SYNC MISSING CANDLES/GAPS FROM BINANCE REST ----
+    def _fetch_missing_candles(self, asset, tf, since_ts):
+        limit = 1000
+        url = "https://api.binance.com/api/v3/klines"
+        interval_map = {60: "1m", 300: "5m", 900: "15m", 3600: "1h"}
+        interval = interval_map.get(tf, "1m")
+        params = {
+            "symbol": asset,
+            "interval": interval,
+            "limit": limit,
+            "startTime": since_ts * 1000 if since_ts else None
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                db = DatabaseHandler()
+                added_count = 0
+                for item in data:
+                    candle = {
+                        "timestamp": item[0] // 1000,
+                        "open": float(item[1]),
+                        "high": float(item[2]),
+                        "low": float(item[3]),
+                        "close": float(item[4]),
+                        "volume": float(item[5]),
+                        "complete": True
+                    }
+                    if self.topology.candles[tf][asset] and candle["timestamp"] <= self.topology.candles[tf][asset][-1]["timestamp"]:
+                        continue
+                    self.topology.candles[tf][asset].append(candle)
+                    db.save_candle(asset, tf, candle)
+                    added_count += 1
+                logger.info(f"🧱 Synced {added_count} missing/historical data gap for {asset} ({interval})")
+                
+                if len(self.topology.candles[tf][asset]) > Config.MAX_CANDLES:
+                    self.topology.candles[tf][asset] = self.topology.candles[tf][asset][-Config.MAX_CANDLES:]
+        except Exception as e:
+            logger.error(f"Error executing REST history sync for {asset}: {e}")
+
+    # ---- NEW INTEGRATION: DAILY FIFO PRUNING ENGINE ----
+    def _prune_old_data(self):
+        cutoff = int(time.time()) - (90 * 24 * 3600)
+        db = DatabaseHandler()
+        for asset in Config.ASSETS:
+            for tf in [60, 300, 900, 3600]:
+                db.delete_older_than(asset, tf, cutoff)
+        logger.info("✂️ Daily Pruning Completed: Removed historical items older than 3 months.")
+
     def run(self):
-        logger.info("🚀 Institutional AI Analyst v3.1 (Bugfix) Starting...")
+        logger.info("🚀 Institutional AI Analyst v3.1 (Persistent DB) Starting...")
+        
+        # 1. NEW: Cold Boot Memory Restoration Layer
+        self._recover_from_db()
+        
+        # 2. NEW: Initialize Internal Anti-Sleep Engine Thread
+        ka = KeepAliveEngine()
+        ka.start()
+
         self.stream = BinancePublicStream(on_price_update=self._handle_price_tick)
         self.stream.start()
+        
         self.telegram.fire_news_alert(
-            "AI v3.1 Online - Layered Filtering + Smart Money Concepts",
+            "AI v3.1 Online - Layered Filtering + Smart Money Concepts (Persistent DB Layer)",
             "BULLISH", 85, 1.0
         )
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
+        
+        last_prune = time.time()
         while True:
             try:
                 time.sleep(15)
+                
+                # NEW: Trigger internal data management pruning engine once per day
+                if time.time() - last_prune > 86400:
+                    self._prune_old_data()
+                    last_prune = time.time()
+                    
                 if int(time.time()) - self.last_news_time > 30:
                     news_data = self.news.fetch_latest()
                     if news_data.get("fresh") and news_data.get("articles"):
@@ -1080,8 +1149,8 @@ class AIOrchestrator:
         if len(candles_15m) > 10:
             closes = [c["close"] for c in candles_15m if c.get("complete", False)]
             if len(closes) > 10:
-                ema_short = self.topology._ema(closes, 5)
-                ema_long = self.topology._ema(closes, 13)
+                ema_short = self.topology._ema(closes, 9)
+                ema_long = self.topology._ema(closes, 21)
                 if len(ema_short) > 1 and len(ema_long) > 1:
                     if ema_short[-1] > ema_long[-1]:
                         self.asset_state[asset]["trend"] = "BULLISH"
@@ -1096,8 +1165,8 @@ class AIOrchestrator:
         if len(candles_1h) > 10:
             closes_1h = [c["close"] for c in candles_1h if c.get("complete", False)]
             if len(closes_1h) > 10:
-                ema_short_1h = self.topology._ema(closes_1h, 5)
-                ema_long_1h = self.topology._ema(closes_1h, 13)
+                ema_short_1h = self.topology._ema(closes_1h, 9)
+                ema_long_1h = self.topology._ema(closes_1h, 21)
                 if len(ema_short_1h) > 1 and len(ema_long_1h) > 1:
                     if ema_short_1h[-1] > ema_long_1h[-1]:
                         self.asset_state[asset]["htf_trend"] = "BULLISH"
