@@ -895,7 +895,16 @@ class BinancePublicStream:
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
-            if "k" in data:
+            if "data" in data and "k" in data["data"]:
+                kline = data["data"]["k"]
+                symbol = kline.get("s")
+                if symbol not in Config.ASSETS:
+                    return
+                price = float(kline.get("c", 0))
+                volume = float(kline.get("v", 0))
+                if price > 0:
+                    self.on_price_update(symbol, price, volume)
+            elif "k" in data:
                 kline = data["k"]
                 symbol = kline.get("s")
                 if symbol not in Config.ASSETS:
