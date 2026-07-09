@@ -1,3 +1,50 @@
+import math
+from typing import List, Dict, Optional, Tuple
+
+class InstitutionalLiquidityEngine:
+    def __init__(self, lookback_candles: int = 200, wick_ratio_threshold: float = 1.5):
+        self.lookback = lookback_candles
+        self.wick_ratio_threshold = wick_ratio_threshold
+        self.proximity_pct = 0.005
+
+    def get_liquidity_pools(self, candles: List[Dict]) -> Dict[str, float]:
+        window = candles[-self.lookback:] if len(candles) >= self.lookback else candles
+        if not window:
+            return {"buy_side_liquidity": 0.0, "sell_side_liquidity": 0.0}
+        highs = [c['high'] for c in window]
+        lows = [c['low'] for c in window]
+        return {"buy_side_liquidity": max(highs), "sell_side_liquidity": min(lows)}
+
+    def get_mtf_confirmation(self, candles_5m: List[Dict], level: float, direction: str) -> bool:
+        complete = [c for c in candles_5m if c.get("complete", False)]
+        if not complete: return False
+        c_curr = complete[-1]
+        body = abs(c_curr["close"] - c_curr["open"])
+        if body == 0: body = 1e-9
+        if direction == "SELL":
+            upper_wick = c_curr["high"] - max(c_curr["open"], c_curr["close"])
+            return c_curr["high"] > level and c_curr["close"] < level and (upper_wick / body) >= self.wick_ratio_threshold
+        elif direction == "BUY":
+            lower_wick = min(c_curr["open"], c_curr["close"]) - c_curr["low"]
+            return c_curr["low"] < level and c_curr["close"] > level and (lower_wick / body) >= self.wick_ratio_threshold
+        return False
+
+    def analyze(self, candles_4h: List[Dict], candles_5m: List[Dict], candle_1m: Dict, ltp: float, atr: float, bsl: float, ssl: float) -> Dict:
+        if bsl == 0.0 or ssl == 0.0 or atr == 0.0: 
+            return {"trigger": "WAIT", "logic": "Insufficient range variables"}
+        m1_high, m1_low, m1_close = candle_1m["high"], candle_1m["low"], candle_1m["close"]
+        short_proximity = (ltp >= bsl * (1 - self.proximity_pct))
+        long_proximity = (ltp <= ssl * (1 + self.proximity_pct))
+        if m1_high >= bsl and m1_close < bsl and short_proximity:
+            if self.get_mtf_confirmation(candles_5m, bsl, "SELL"):
+                return {"trigger": "SELL", "entry": ltp, "sl": m1_high + (1.5 * atr), "tp": ssl - (1.0 * atr), "logic": "Whale Trap Blaster (Wick Confirmed) → Macro SHORT"}
+        if m1_low <= ssl and m1_close > ssl and long_proximity:
+            if self.get_mtf_confirmation(candles_5m, ssl, "BUY"):
+                return {"trigger": "BUY", "entry": ltp, "sl": m1_low - (1.5 * atr), "tp": bsl + (1.0 * atr), "logic": "Whale Accumulation (Wick Confirmed) → Macro LONG"}
+        return {"trigger": "WAIT", "logic": "Waiting for Macro Extremes"}
+
+
+
 #!/usr/bin/env python3
 """
 app.py – Institutional‑Grade Crypto AI Analyst v3.1 (Persistent DB + Anti‑Sleep)
