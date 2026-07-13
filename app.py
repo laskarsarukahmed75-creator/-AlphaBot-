@@ -90,7 +90,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
-    MIN_CONFLUENCE_SCORE = 70
+    MIN_CONFLUENCE_SCORE = 55          # MODIFIED: 70 → 55
     MIN_LAYER_PASS = 5
     SIGNAL_COOLDOWN = 3600
     DB_PATH = "trades.db"
@@ -101,6 +101,8 @@ class Config:
         "high": (1.8, 3.0),
         "extreme": (2.0, 3.5)
     }
+    MAX_SIGNALS_PER_DAY = 3            # NEW: global cap
+    MIN_RISK_REWARD = 1.3              # NEW: minimum RR (1.3)
 
 # =====================================================================
 # DATABASE (Trade Journal + Rejected Logs + Performance)
@@ -872,15 +874,7 @@ class TelegramPipeline:
         )
         self.queue.put(msg)
 
-    def fire_diagnostic(self, asset: str, score: float, trend: str, patterns: List, vol_ratio: float, avg_score: float):
-        msg = (
-            f"🔍 DIAG - {asset}\n"
-            f"Score: {score:.0f} | Avg: {avg_score:.1f}\n"
-            f"Trend: {trend} | Patterns: {', '.join(patterns) if patterns else 'None'}\n"
-            f"Vol Ratio: {vol_ratio:.2f}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━"
-        )
-        self.queue.put(msg)
+    # REMOVED fire_diagnostic – no longer used
 
 # =====================================================================
 # BINANCE PUBLIC WEBSOCKET (with heartbeat & reconnect)
@@ -1016,7 +1010,7 @@ class AIOrchestrator:
         self.stream = None
         self.last_signal_time = {asset: 0 for asset in Config.ASSETS}
         self.last_news_time = 0
-        self._last_score_log = 0
+        # self._last_score_log = 0  # removed – no longer needed
         self.asset_state = {asset: {
             "trend": "NEUTRAL",
             "htf_trend": "NEUTRAL",
@@ -1031,6 +1025,9 @@ class AIOrchestrator:
         self.signal_count = 0
         self.rejected_signals = 0
         self.accepted_signals = 0
+
+        # NEW: global signal timestamps (for daily cap)
+        self.signal_timestamps = deque(maxlen=100)
 
     # ---- NEW INTEGRATION: RECOVER FROM DATABASE ON BOOT ----
     def _recover_from_db(self):
@@ -1142,52 +1139,12 @@ class AIOrchestrator:
                                 self.asset_state[asset]["news_importance"] = article["importance"]
                             self.last_news_time = int(time.time())
 
-                now = time.time()
-                if now - self._last_score_log > 300:
-                    self._log_scores()
-                    self._last_score_log = now
+                # DIAGNOSTIC LOOP REMOVED – no longer sending Telegram diagnostics
+                # (We keep the loop but without any Telegram fire)
             except KeyboardInterrupt:
                 break
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
-
-    def _log_scores(self):
-        for asset in Config.ASSETS:
-            candles = self.topology.candles[900][asset]
-            if len(candles) < 10:
-                continue
-            price = candles[-1]["close"] if candles else 0
-            patterns = self.topology.detect_candle_patterns(asset)
-            sr_data = self.topology.support_resistance[asset]
-            trend = self.asset_state[asset]["trend"]
-            vol_ratio = self.asset_state[asset]["volume_ratio"]
-            rsi = self.asset_state[asset]["rsi"]
-            adx = self.asset_state[asset]["adx"]
-            vol = self.asset_state[asset]["volatility"]
-            htf_trend = self.asset_state[asset]["htf_trend"]
-            bos = self.topology.bos[asset]
-            choch = self.topology.choch[asset]
-            fvgs = self.topology.detect_fvg(asset)
-            ob = self.topology.detect_order_block(asset)
-            liquidity_sweep = self.topology.detect_liquidity_sweep(asset, price)
-            news_sent = self.asset_state[asset]["news_sentiment"]
-            news_imp = self.asset_state[asset]["news_importance"]
-
-            score = self.scoring.evaluate(
-                asset=asset, price=price, patterns=patterns, sr_data=sr_data,
-                trend=trend, news_sentiment=news_sent, volume_ratio=vol_ratio,
-                rsi=rsi, adx=adx, volatility=vol,
-                htf_trend=htf_trend, bos=bos, choch=choch,
-                fvgs=fvgs, order_block=ob, liquidity_sweep=liquidity_sweep,
-                news_importance=news_imp
-            )
-            self.asset_state[asset]["score_history"].append(score["total_score"])
-            avg_score = sum(self.asset_state[asset]["score_history"]) / max(1, len(self.asset_state[asset]["score_history"]))
-            pattern_names = list(patterns.keys())
-            self.telegram.fire_diagnostic(
-                asset, score["total_score"], trend, pattern_names, vol_ratio, avg_score
-            )
-            logger.info(f"🔍 {asset} DIAG -> Score: {score['total_score']:.0f} | Avg: {avg_score:.1f} | Passed: {score['num_passed']}/9")
 
     def _handle_price_tick(self, asset: str, price: float, volume: float):
         self.topology.process_tick(asset, price, volume)
@@ -1318,6 +1275,27 @@ class AIOrchestrator:
             sl = price * 1.02
             tp = price * 0.96
 
+        # ---- NEW: enforce minimum risk‑reward ----
+        rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
+        if rr < Config.MIN_RISK_REWARD:
+            if direction == "BUY":
+                tp = price + abs(price - sl) * Config.MIN_RISK_REWARD
+            else:
+                tp = price - abs(price - sl) * Config.MIN_RISK_REWARD
+            rr = abs(tp - price) / abs(price - sl)  # recalc
+
+        # ---- NEW: global daily signal cap (max 3 per 24h) ----
+        # Filter timestamps in last 24h
+        now_ts = time.time()
+        recent_signals = [t for t in self.signal_timestamps if now_ts - t < 86400]
+        if len(recent_signals) >= Config.MAX_SIGNALS_PER_DAY:
+            reason = f"Daily signal limit reached ({Config.MAX_SIGNALS_PER_DAY})"
+            self.db.log_rejected(asset, price, score["total_score"], reason, vol, self.topology.get_volatility_regime(asset))
+            self.rejected_signals += 1
+            logger.info(f"⛔ {asset} rejected: {reason}")
+            return
+
+        # ---- Build and fire signal ----
         logic_parts = []
         if htf_trend != "NEUTRAL":
             logic_parts.append(f"HTF {htf_trend} + 15m {trend}")
@@ -1347,7 +1325,6 @@ class AIOrchestrator:
         chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
         entry_zone = f"{price - atr*0.5:.2f} - {price + atr*0.5:.2f}"
         exit_zone = f"{tp - atr*0.5:.2f} - {tp + atr*0.5:.2f}"
-        rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
 
         rolling_win = self.db.get_rolling_win_rate(asset, lookback=50)
         prob = (rolling_win * 100 * 0.5 + (50 + (score["total_score"] - 50) * 0.6) * 0.5)
@@ -1361,7 +1338,10 @@ class AIOrchestrator:
         )
         self.signal_count += 1
         self.accepted_signals += 1
-        self.last_signal_time[asset] = now
+        self.last_signal_time[asset] = now_ts
+
+        # Record signal timestamp for daily cap
+        self.signal_timestamps.append(now_ts)
 
         self.telegram.fire_signal(
             asset=asset,
@@ -1381,7 +1361,7 @@ class AIOrchestrator:
             win_prob=prob,
             rr=rr
         )
-        logger.info(f"🔥 SIGNAL: {asset} {direction} @ {price} (Score: {score['total_score']:.0f}, Prob: {prob:.1f}%)")
+        logger.info(f"🔥 SIGNAL: {asset} {direction} @ {price} (Score: {score['total_score']:.0f}, Prob: {prob:.1f}%, RR: {rr:.2f})")
 
     def _calculate_rsi(self, closes: List[float], period: int = 14) -> float:
         if len(closes) < period+1:
