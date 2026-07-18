@@ -1,5 +1,5 @@
 import math
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import os
 import sys
 import time
@@ -10,13 +10,10 @@ import queue
 import requests
 import sqlite3
 import statistics
+import gc
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 from datetime import datetime
-
-# ---- NEW INTEGRATION IMPORTS ----
-from db_handler import DatabaseHandler
-from keepalive import KeepAliveEngine
 
 # Optional for health metrics
 try:
@@ -27,72 +24,41 @@ except ImportError:
 
 # ---- Logging Setup ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator")
+logger = logging.getLogger("AI-Orchestrator-v3.2")
 
-class InstitutionalLiquidityEngine:
-    def __init__(self, lookback_candles: int = 200, wick_ratio_threshold: float = 1.5):
-        self.lookback = lookback_candles
-        self.wick_ratio_threshold = wick_ratio_threshold
-        self.proximity_pct = 0.005
-
-    def get_liquidity_pools(self, candles: List[Dict]) -> Dict[str, float]:
-        window = candles[-self.lookback:] if len(candles) >= self.lookback else candles
-        if not window:
-            return {"buy_side_liquidity": 0.0, "sell_side_liquidity": 0.0}
-        highs = [c['high'] for c in window]
-        lows = [c['low'] for c in window]
-        return {"buy_side_liquidity": max(highs), "sell_side_liquidity": min(lows)}
-
-    def get_mtf_confirmation(self, candles_5m: List[Dict], level: float, direction: str) -> bool:
-        complete = [c for c in candles_5m if c.get("complete", False)]
-        if not complete: return False
-        c_curr = complete[-1]
-        body = abs(c_curr["close"] - c_curr["open"])
-        if body == 0: body = 1e-9
-        if direction == "SELL":
-            upper_wick = c_curr["high"] - max(c_curr["open"], c_curr["close"])
-            return c_curr["high"] > level and c_curr["close"] < level and (upper_wick / body) >= self.wick_ratio_threshold
-        elif direction == "BUY":
-            lower_wick = min(c_curr["open"], c_curr["close"]) - c_curr["low"]
-            return c_curr["low"] < level and c_curr["close"] > level and (lower_wick / body) >= self.wick_ratio_threshold
-        return False
-
-    def analyze(self, candles_4h: List[Dict], candles_5m: List[Dict], candle_1m: Dict, ltp: float, atr: float, bsl: float, ssl: float) -> Dict:
-        if bsl == 0.0 or ssl == 0.0 or atr == 0.0: 
-            return {"trigger": "WAIT", "logic": "Insufficient range variables"}
-        m1_high, m1_low, m1_close = candle_1m["high"], candle_1m["low"], candle_1m["close"]
-        short_proximity = (ltp >= bsl * (1 - self.proximity_pct))
-        long_proximity = (ltp <= ssl * (1 + self.proximity_pct))
-        if m1_high >= bsl and m1_close < bsl and short_proximity:
-            if self.get_mtf_confirmation(candles_5m, bsl, "SELL"):
-                return {"trigger": "SELL", "entry": ltp, "sl": m1_high + (1.5 * atr), "tp": ssl - (1.0 * atr), "logic": "Whale Trap Blaster (Wick Confirmed) → Macro SHORT"}
-        if m1_low <= ssl and m1_close > ssl and long_proximity:
-            if self.get_mtf_confirmation(candles_5m, ssl, "BUY"):
-                return {"trigger": "BUY", "entry": ltp, "sl": m1_low - (1.5 * atr), "tp": bsl + (1.0 * atr), "logic": "Whale Accumulation (Wick Confirmed) → Macro LONG"}
-        return {"trigger": "WAIT", "logic": "Waiting for Macro Extremes"}
-
-# ---- Configuration ----
+# =====================================================================
+# CONFIGURATION (v3.2 Updated)
+# =====================================================================
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
-    
-    # --- FIXED: Lowered score threshold & layer requirement to get signals ---
-    MIN_CONFLUENCE_SCORE = 50       # was 55 → now 50
-    MIN_LAYER_PASS = 3              # was 5 → now 3
-    
+
+    # --- SCORING THRESHOLDS (v3.2) ---
+    MIN_CONFLUENCE_SCORE = 60          # पहले 55
+    MIN_LAYER_PASS = 4                 # क्योंकि नई लेयरें आ गईं
+
+    # --- RR MANDATORY (≥ 2.0) ---
+    MIN_RISK_REWARD = 2.0
+
+    # --- COOLDOWN (bypassed in strong trend) ---
     SIGNAL_COOLDOWN = 3600
+
+    # --- DATABASE & CANDLES ---
     DB_PATH = "trades.db"
     MAX_CANDLES = 500
+
+    # --- VOLATILITY MULTIPLIERS for SL/TP ---
     VOLATILITY_MULTIPLIERS = {
         "low": (1.2, 2.0),
         "medium": (1.5, 2.5),
         "high": (1.8, 3.0),
         "extreme": (2.0, 3.5)
     }
+
+    # --- DAILY CAP (bypassed in strong trend) ---
     MAX_SIGNALS_PER_DAY = 3
-    MIN_RISK_REWARD = 1.3
 
 # =====================================================================
 # DATABASE (unchanged)
@@ -285,11 +251,61 @@ class CryptoNewsScanner:
         return max_imp
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (with proper candle‑close detection)
+# INSTITUTIONAL LIQUIDITY ENGINE (modified to accept lookback)
+# =====================================================================
+class InstitutionalLiquidityEngine:
+    def __init__(self, lookback_candles: int = 800, wick_ratio_threshold: float = 1.5):
+        # lookback_candles = 800 (1h) ≈ 200 * 4h (since 800/4 = 200)
+        self.lookback = lookback_candles
+        self.wick_ratio_threshold = wick_ratio_threshold
+        self.proximity_pct = 0.005
+
+    def get_liquidity_pools(self, candles: List[Dict]) -> Dict[str, float]:
+        window = candles[-self.lookback:] if len(candles) >= self.lookback else candles
+        if not window:
+            return {"buy_side_liquidity": 0.0, "sell_side_liquidity": 0.0}
+        highs = [c['high'] for c in window]
+        lows = [c['low'] for c in window]
+        return {"buy_side_liquidity": max(highs), "sell_side_liquidity": min(lows)}
+
+    def get_mtf_confirmation(self, candles_5m: List[Dict], level: float, direction: str) -> bool:
+        complete = [c for c in candles_5m if c.get("complete", False)]
+        if not complete: 
+            return False
+        c_curr = complete[-1]
+        body = abs(c_curr["close"] - c_curr["open"])
+        if body == 0: 
+            body = 1e-9
+        if direction == "SELL":
+            upper_wick = c_curr["high"] - max(c_curr["open"], c_curr["close"])
+            return c_curr["high"] > level and c_curr["close"] < level and (upper_wick / body) >= self.wick_ratio_threshold
+        elif direction == "BUY":
+            lower_wick = min(c_curr["open"], c_curr["close"]) - c_curr["low"]
+            return c_curr["low"] < level and c_curr["close"] > level and (lower_wick / body) >= self.wick_ratio_threshold
+        return False
+
+    def analyze(self, candles_1h: List[Dict], candles_5m: List[Dict], candle_1m: Dict, ltp: float, atr: float, bsl: float, ssl: float) -> Dict:
+        # यहाँ bsl और ssl 1h के पिवट्स से निकालें (या engine के भीतर निकाल सकते हैं)
+        if bsl == 0.0 or ssl == 0.0 or atr == 0.0:
+            return {"trigger": "WAIT", "logic": "Insufficient range variables"}
+        m1_high, m1_low, m1_close = candle_1m["high"], candle_1m["low"], candle_1m["close"]
+        short_proximity = (ltp >= bsl * (1 - self.proximity_pct))
+        long_proximity = (ltp <= ssl * (1 + self.proximity_pct))
+        if m1_high >= bsl and m1_close < bsl and short_proximity:
+            if self.get_mtf_confirmation(candles_5m, bsl, "SELL"):
+                return {"trigger": "SELL", "entry": ltp, "sl": m1_high + (1.5 * atr), "tp": ssl - (1.0 * atr), "logic": "Whale Trap Blaster (Wick Confirmed) → Macro SHORT"}
+        if m1_low <= ssl and m1_close > ssl and long_proximity:
+            if self.get_mtf_confirmation(candles_5m, ssl, "BUY"):
+                return {"trigger": "BUY", "entry": ltp, "sl": m1_low - (1.5 * atr), "tp": bsl + (1.0 * atr), "logic": "Whale Accumulation (Wick Confirmed) → Macro LONG"}
+        return {"trigger": "WAIT", "logic": "Waiting for Macro Extremes"}
+
+# =====================================================================
+# CANDLE TOPOLOGY ENGINE (enhanced with rejection detection)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
         self.history = {asset: deque(maxlen=200) for asset in Config.ASSETS}
+        # Timeframes: 1m, 5m, 15m, 1h (already) – adding 4h not needed; we use 1h for liquidity
         self.candles = {tf: {asset: [] for asset in Config.ASSETS} for tf in [60, 300, 900, 3600]}
         self.support_resistance = {asset: {"support": [], "resistance": []} for asset in Config.ASSETS}
         self.trendlines = {asset: {"up": [], "down": []} for asset in Config.ASSETS}
@@ -299,27 +315,23 @@ class CandleTopologyEngine:
         self.fvgs = {asset: [] for asset in Config.ASSETS}
         self.order_blocks = {asset: {} for asset in Config.ASSETS}
         self.last_tick_time = {asset: 0 for asset in Config.ASSETS}
-        # --- FIX: flag to signal that a 15m candle just closed ---
         self.candle_just_closed = {asset: False for asset in Config.ASSETS}
 
     def process_tick(self, asset: str, price: float, volume: float):
         now = int(time.time())
         self.history[asset].append({"price": price, "volume": volume, "time": now})
-        # reset flag for this asset
         self.candle_just_closed[asset] = False
 
-        # --- Check 15‑minute candle close (900s) ---
+        # 15-minute close detection (for primary signal evaluation)
         tf = 900
         start = (now // tf) * tf
         storage = self.candles[tf][asset]
         if storage and storage[-1].get("timestamp") != start:
             if not storage[-1].get("complete", False):
                 storage[-1]["complete"] = True
-                db = DatabaseHandler()
-                db.save_candle(asset, tf, storage[-1])
-                self.candle_just_closed[asset] = True   # << evaluation trigger
+                self.candle_just_closed[asset] = True   # signal trigger
 
-        # build candles for all timeframes (1m, 5m, 15m, 1h)
+        # Build candles for 1m, 5m, 15m, 1h
         for timeframe in [60, 300, 900, 3600]:
             self._build_candle(asset, price, volume, now, timeframe, self.candles[timeframe][asset])
 
@@ -336,8 +348,6 @@ class CandleTopologyEngine:
         if not storage or storage[-1].get("timestamp") != start:
             if storage and not storage[-1].get("complete", False):
                 storage[-1]["complete"] = True
-                db = DatabaseHandler()
-                db.save_candle(asset, tf, storage[-1])
             storage.append({
                 "timestamp": start, "open": price, "high": price, "low": price,
                 "close": price, "volume": volume, "complete": False
@@ -491,8 +501,10 @@ class CandleTopologyEngine:
     def detect_liquidity_sweep(self, asset: str, price: float) -> str:
         piv_high = self.pivots[asset]["high"]
         piv_low = self.pivots[asset]["low"]
-        if piv_high and price > max(piv_high[-2:]): return "BUY_SWEEP"
-        if piv_low and price < min(piv_low[-2:]): return "SELL_SWEEP"
+        if piv_high and price > max(piv_high[-2:]): 
+            return "BUY_SWEEP"
+        if piv_low and price < min(piv_low[-2:]): 
+            return "SELL_SWEEP"
         return ""
 
     def get_volatility_regime(self, asset: str) -> str:
@@ -522,21 +534,56 @@ class CandleTopologyEngine:
         chart_lines.extend(["├──────────────────────────────────────┤", "│ S=Support  R=Resistance  ●=Entry    │", "│ ▼=SL  ★=Target                      │", "└──────────────────────────────────────┘"])
         return "\n".join(chart_lines)
 
+    # ---------- NEW: 1m rejection check for hunt confirmation ----------
+    def check_1m_rejection(self, asset: str, direction: str) -> bool:
+        """
+        direction: "BUY" or "SELL"
+        Returns True if the last completed 1m candle shows a rejection wick >= 40% of range
+        in the opposite direction of the trade.
+        For BUY: we need bullish rejection (lower wick) – price swept low then bounced.
+        For SELL: we need bearish rejection (upper wick) – price swept high then dropped.
+        """
+        candles = self.candles[60][asset]
+        if len(candles) < 2:
+            return False
+        last = candles[-1]
+        if not last.get("complete", False):
+            # If not complete, maybe use previous? Better to use last completed one.
+            # We'll iterate back until we find a completed candle.
+            for c in reversed(candles):
+                if c.get("complete", False):
+                    last = c
+                    break
+            else:
+                return False
+        range_ = last["high"] - last["low"]
+        if range_ <= 0:
+            return False
+        if direction == "BUY":
+            lower_wick = min(last["open"], last["close"]) - last["low"]
+            return (lower_wick / range_) >= 0.4
+        elif direction == "SELL":
+            upper_wick = last["high"] - max(last["open"], last["close"])
+            return (upper_wick / range_) >= 0.4
+        return False
+
 # =====================================================================
-# LAYERED SIGNAL SCORING ENGINE (adjusted weights for better sensitivity)
+# LAYERED SIGNAL SCORING ENGINE (v3.2: added hunt_confirmation)
 # =====================================================================
 class SignalScoringEngine:
     def __init__(self):
         self.weights = {
-            "htf_trend": 15,       # high weight
-            "market_structure": 15,
+            "htf_trend": 15,
+            "market_structure": 12,
             "liquidity_sweep": 10,
-            "fvg": 10,
-            "order_block": 10,
-            "volume": 10,
-            "rsi": 10,
-            "adx": 10,
-            "news": 10
+            "hunt_confirmation": 15,       # new layer
+            "fvg": 8,
+            "order_block": 8,
+            "volume": 8,
+            "rsi": 8,
+            "adx": 8,
+            "news": 8,
+            "institutional_liquidity": 10  # from earlier integration
         }
         self.min_pass_layers = Config.MIN_LAYER_PASS
 
@@ -545,7 +592,9 @@ class SignalScoringEngine:
                  rsi: float, adx: float, volatility: float,
                  htf_trend: str, bos: Dict, choch: bool,
                  fvgs: List, order_block: Dict, liquidity_sweep: str,
-                 news_importance: float) -> Dict:
+                 news_importance: float,
+                 hunt_confirmed: bool = False,
+                 inst_liquidity_trigger: Optional[str] = None) -> Dict:
         passed_layers = []
         total_score = 0
 
@@ -564,35 +613,51 @@ class SignalScoringEngine:
         if ls_score > 0: passed_layers.append("liquidity_sweep")
         total_score += ls_score
 
-        # 4. FVG
+        # 4. Hunt Confirmation (new)
+        hunt_score = self.weights["hunt_confirmation"] if hunt_confirmed else 0
+        if hunt_score > 0: passed_layers.append("hunt_confirmation")
+        total_score += hunt_score
+
+        # 5. FVG
         fvg_score = next((self.weights["fvg"] for fvg in fvgs if fvg["lower"] < price < fvg["upper"]), 0)
         if fvg_score > 0: passed_layers.append("fvg")
         total_score += fvg_score
 
-        # 5. Order Block
+        # 6. Order Block
         ob_score = self.weights["order_block"] if order_block and order_block.get("type") else 0
         if ob_score > 0: passed_layers.append("order_block")
         total_score += ob_score
 
-        # 6. Volume
+        # 7. Volume
         vol_score = self.weights["volume"] if volume_ratio > 1.2 else self.weights["volume"] * 0.5 if volume_ratio > 0.8 else 0
         if vol_score > 0: passed_layers.append("volume")
         total_score += vol_score
 
-        # 7. RSI
+        # 8. RSI
         rsi_score = self.weights["rsi"] if (adx > 25 or 30 <= rsi <= 70) else self.weights["rsi"] * 0.5 if (20 <= rsi < 30 or 70 < rsi <= 80) else 0
         if rsi_score > 0: passed_layers.append("rsi")
         total_score += rsi_score
 
-        # 8. ADX
+        # 9. ADX
         adx_score = self.weights["adx"] if adx > 25 else self.weights["adx"] * 0.5 if adx > 20 else 0
         if adx_score > 0: passed_layers.append("adx")
         total_score += adx_score
 
-        # 9. News
+        # 10. News
         news_score = self.weights["news"] * news_importance if (news_sentiment != 0 and news_importance > 0.5 and ((trend == "BULLISH" and news_sentiment > 0) or (trend == "BEARISH" and news_sentiment < 0))) else self.weights["news"] * 0.5 if abs(news_sentiment) > 50 else 0
         if news_score > 0: passed_layers.append("news")
         total_score += news_score
+
+        # 11. Institutional Liquidity
+        inst_score = 0
+        if inst_liquidity_trigger in ["BUY", "SELL"]:
+            if (inst_liquidity_trigger == "BUY" and htf_trend == "BULLISH") or (inst_liquidity_trigger == "SELL" and htf_trend == "BEARISH"):
+                inst_score = self.weights["institutional_liquidity"]
+            else:
+                inst_score = self.weights["institutional_liquidity"] * 0.5
+            if inst_score > 0:
+                passed_layers.append("institutional_liquidity")
+        total_score += inst_score
 
         final_score = min(100, total_score)
         return {
@@ -639,7 +704,7 @@ class TelegramPipeline:
             f"\n📊 CHART:\n{topology_chart}\n"
             f"🧠 Logic: {logic}\n"
             f"📰 News: {news}\n"
-            f"📊 Layers Passed: {score['num_passed']}/9\n"
+            f"📊 Layers Passed: {score['num_passed']}/11\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         self.queue.put(msg)
@@ -651,6 +716,16 @@ class TelegramPipeline:
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📰 {title}\n"
             f"🧠 Sentiment: {sentiment} ({score:+.0f}%) | Importance: {importance:.1f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        self.queue.put(msg)
+
+    def fire_continuation_alert(self, asset: str, direction: str, msg_text: str):
+        msg = (
+            f"🧠 <b>Trend Continuation Advice</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 {Config.DISPLAY_NAMES.get(asset, asset)} | {direction}\n"
+            f"{msg_text}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         self.queue.put(msg)
@@ -698,7 +773,8 @@ class BinancePublicStream:
                 symbol = kline.get("s")
                 if symbol in Config.ASSETS:
                     price, volume = float(kline.get("c", 0)), float(kline.get("v", 0))
-                    if price > 0: self.on_price_update(symbol, price, volume)
+                    if price > 0:
+                        self.on_price_update(symbol, price, volume)
         except Exception as e:
             logger.debug(f"Message parse error: {e}")
 
@@ -723,19 +799,24 @@ def start_health_server(orchestrator):
                 if candles and candles[-1].get("complete", False):
                     candle_delay = max(candle_delay, int(time.time()) - candles[-1]["timestamp"] - 60)
             status = {
-                "status": "online", "version": "3.1", "uptime": uptime,
+                "status": "online", "version": "3.2", "uptime": uptime,
                 "cpu_percent": psutil.cpu_percent() if HAS_PSUTIL else 0,
                 "memory_percent": psutil.virtual_memory().percent if HAS_PSUTIL else 0,
-                "queue_size": orchestrator.telegram.queue.qsize(), "db_size_bytes": orchestrator.db.get_db_size(),
-                "last_tick": orchestrator.topology.last_tick_time, "last_signal": orchestrator.last_signal_time,
-                "reconnect_count": orchestrator.stream.reconnect_count, "ws_latency": orchestrator.stream.latency,
-                "candle_delay_seconds": candle_delay, "signal_counts": {"accepted": orchestrator.accepted_signals, "rejected": orchestrator.rejected_signals}
+                "queue_size": orchestrator.telegram.queue.qsize(),
+                "db_size_bytes": orchestrator.db.get_db_size(),
+                "last_tick": orchestrator.topology.last_tick_time,
+                "last_signal": orchestrator.last_signal_time,
+                "reconnect_count": orchestrator.stream.reconnect_count,
+                "ws_latency": orchestrator.stream.latency,
+                "candle_delay_seconds": candle_delay,
+                "signal_counts": {"accepted": orchestrator.accepted_signals, "rejected": orchestrator.rejected_signals},
+                "active_trades": len(orchestrator.active_trades)
             }
             self.wfile.write(json.dumps(status).encode())
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # =====================================================================
-# CORE ORCHESTRATOR – Only evaluates on 15‑minute candle close
+# CORE ORCHESTRATOR (v3.2 – fully upgraded)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -743,6 +824,7 @@ class AIOrchestrator:
         self.topology = CandleTopologyEngine()
         self.news = CryptoNewsScanner()
         self.scoring = SignalScoringEngine()
+        self.liquidity_engine = InstitutionalLiquidityEngine(lookback_candles=800)  # 800 * 1h ≈ 200 * 4h
         self.telegram = TelegramPipeline()
         self.db = TradeDatabase()
         self.stream = None
@@ -751,82 +833,341 @@ class AIOrchestrator:
         self.asset_state = {asset: {
             "trend": "NEUTRAL", "htf_trend": "NEUTRAL", "volume_ratio": 1.0,
             "rsi": 50, "adx": 20, "volatility": 0.01,
-            "news_sentiment": 0, "news_importance": 0
+            "news_sentiment": 0, "news_importance": 0,
+            "bsl": 0.0, "ssl": 0.0   # store latest bsl/ssl for liquidity engine
         } for asset in Config.ASSETS}
         self.rejected_signals = 0
         self.accepted_signals = 0
         self.signal_timestamps = deque(maxlen=100)
+        self.active_trades = {}  # trade_id -> trade dict
+        self.current_prices = {asset: 0.0 for asset in Config.ASSETS}
+        # Separate queue for price ticks to avoid blocking WebSocket
+        self.price_queue = queue.Queue(maxsize=1000)
+        threading.Thread(target=self._process_price_queue, daemon=True).start()
 
+    def _process_price_queue(self):
+        """Worker thread to process price ticks without blocking WebSocket."""
+        while True:
+            try:
+                item = self.price_queue.get(timeout=1)
+                if item is None:
+                    break
+                asset, price, volume = item
+                self._handle_price_tick(asset, price, volume)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Price queue processing error: {e}")
+
+    # ---------- RECOVERY & CANDLE FETCHING ----------
     def _recover_from_db(self):
-        db = DatabaseHandler()
+        # Instead of a separate DB handler, we use the existing topology candles.
+        # We'll load candles from the trades database? Actually we never stored candles in DB before.
+        # We'll fetch missing candles from REST for each asset and timeframe.
         for asset in Config.ASSETS:
             for tf in [60, 300, 900, 3600]:
-                candles = db.load_candles(asset, tf, limit=Config.MAX_CANDLES)
-                if candles:
-                    self.topology.candles[tf][asset] = candles
-                    self.topology.last_tick_time[asset] = candles[-1]["timestamp"]
-                    self._fetch_missing_candles(asset, tf, candles[-1]["timestamp"])
-                else:
-                    self._fetch_missing_candles(asset, tf, int(time.time()) - (90 * 24 * 3600))
+                # try to load from DB? We don't have a candle table. We'll just fetch from REST.
+                # We'll fetch last 500 candles for each timeframe.
+                self._fetch_missing_candles(asset, tf, int(time.time()) - (90 * 24 * 3600))
 
     def _fetch_missing_candles(self, asset, tf, since_ts):
         interval_map = {60: "1m", 300: "5m", 900: "15m", 3600: "1h"}
         try:
             resp = requests.get("https://api.binance.com/api/v3/klines", params={"symbol": asset, "interval": interval_map.get(tf, "1m"), "limit": 1000, "startTime": since_ts * 1000}, timeout=15)
             if resp.status_code == 200:
-                db = DatabaseHandler()
                 for item in resp.json():
                     candle = {"timestamp": item[0] // 1000, "open": float(item[1]), "high": float(item[2]), "low": float(item[3]), "close": float(item[4]), "volume": float(item[5]), "complete": True}
-                    if self.topology.candles[tf][asset] and candle["timestamp"] <= self.topology.candles[tf][asset][-1]["timestamp"]: continue
+                    if self.topology.candles[tf][asset] and candle["timestamp"] <= self.topology.candles[tf][asset][-1]["timestamp"]:
+                        continue
                     self.topology.candles[tf][asset].append(candle)
-                    db.save_candle(asset, tf, candle)
                 if len(self.topology.candles[tf][asset]) > Config.MAX_CANDLES:
                     self.topology.candles[tf][asset] = self.topology.candles[tf][asset][-Config.MAX_CANDLES:]
+                # Also save to DB? Not needed for now.
         except Exception as e:
-            logger.error(f"Error executing REST history sync: {e}")
+            logger.error(f"Error fetching candles: {e}")
 
     def _prune_old_data(self):
-        cutoff = int(time.time()) - (90 * 24 * 3600)
-        db = DatabaseHandler()
-        for asset in Config.ASSETS:
-            for tf in [60, 300, 900, 3600]: db.delete_older_than(asset, tf, cutoff)
+        # Not needed as we don't store candles in DB
+        pass
 
-    def run(self):
-        self._recover_from_db()
-        KeepAliveEngine().start()
-        self.stream = BinancePublicStream(on_price_update=self._handle_price_tick)
-        self.stream.start()
-        self.telegram.fire_news_alert("AI v3.1 Online - Candle‑Close Evaluation Engaged", "BULLISH", 85, 1.0)
-        threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
-        
-        last_prune = time.time()
-        while True:
-            try:
-                time.sleep(15)
-                if time.time() - last_prune > 86400:
-                    self._prune_old_data()
-                    last_prune = time.time()
-                if int(time.time()) - self.last_news_time > 30:
-                    news_data = self.news.fetch_latest()
-                    if news_data.get("fresh") and news_data.get("articles"):
-                        for article in news_data["articles"][:2]:
-                            self.telegram.fire_news_alert(article["title"], article["sentiment"]["label"], article["sentiment"]["score"], article["importance"])
-                            for asset in Config.ASSETS:
-                                self.asset_state[asset]["news_sentiment"] = article["sentiment"]["score"]
-                                self.asset_state[asset]["news_importance"] = article["importance"]
-                        self.last_news_time = int(time.time())
-            except KeyboardInterrupt: break
-            except Exception as e: logger.error(f"Main loop error: {e}")
+    # ---------- STRONG TREND DETECTION ----------
+    def _is_strong_trend(self, asset: str) -> bool:
+        # Check 15m and 1h EMA slopes and distance
+        # Use EMA(9) and EMA(21) on 15m and 1h
+        # Strong if both timeframes have parallel expansion (both EMAs moving same direction and distance widening)
+        candles_15m = self.topology.candles[900][asset]
+        candles_1h = self.topology.candles[3600][asset]
+        if len(candles_15m) < 30 or len(candles_1h) < 30:
+            return False
+        closes_15 = [c["close"] for c in candles_15m[-30:] if c.get("complete", False)]
+        closes_1h = [c["close"] for c in candles_1h[-30:] if c.get("complete", False)]
+        if len(closes_15) < 20 or len(closes_1h) < 20:
+            return False
+        ema9_15 = self.topology._ema(closes_15, 9)
+        ema21_15 = self.topology._ema(closes_15, 21)
+        ema9_1h = self.topology._ema(closes_1h, 9)
+        ema21_1h = self.topology._ema(closes_1h, 21)
+        if len(ema9_15) < 2 or len(ema21_15) < 2 or len(ema9_1h) < 2 or len(ema21_1h) < 2:
+            return False
+        # Check slopes (difference between last two)
+        slope_15_9 = ema9_15[-1] - ema9_15[-2]
+        slope_15_21 = ema21_15[-1] - ema21_15[-2]
+        slope_1h_9 = ema9_1h[-1] - ema9_1h[-2]
+        slope_1h_21 = ema21_1h[-1] - ema21_1h[-2]
+        # Check that both EMAs are moving in same direction and distance is increasing
+        # Direction: both positive or both negative
+        if (slope_15_9 > 0 and slope_15_21 > 0 and slope_1h_9 > 0 and slope_1h_21 > 0):
+            # Bullish strong
+            # Check distance widening: current distance > previous distance
+            dist_15_cur = ema9_15[-1] - ema21_15[-1]
+            dist_15_prev = ema9_15[-2] - ema21_15[-2]
+            dist_1h_cur = ema9_1h[-1] - ema21_1h[-1]
+            dist_1h_prev = ema9_1h[-2] - ema21_1h[-2]
+            if dist_15_cur > dist_15_prev and dist_1h_cur > dist_1h_prev:
+                return True
+        elif (slope_15_9 < 0 and slope_15_21 < 0 and slope_1h_9 < 0 and slope_1h_21 < 0):
+            dist_15_cur = ema21_15[-1] - ema9_15[-1]  # absolute distance
+            dist_15_prev = ema21_15[-2] - ema9_15[-2]
+            dist_1h_cur = ema21_1h[-1] - ema9_1h[-1]
+            dist_1h_prev = ema21_1h[-2] - ema9_1h[-2]
+            if dist_15_cur > dist_15_prev and dist_1h_cur > dist_1h_prev:
+                return True
+        return False
 
+    # ---------- ACTIVE TRADE MANAGEMENT ----------
+    def _update_active_trades(self, asset: str, price: float):
+        to_remove = []
+        for tid, trade in list(self.active_trades.items()):
+            if trade['asset'] != asset:
+                continue
+            # Check breakeven lock if not already locked and price has reached 50% of target
+            if not trade.get('breakeven_locked', False):
+                self._check_breakeven(trade, price)
+            # Check SL/TP hits
+            if trade['direction'] == 'BUY':
+                if price <= trade['sl']:
+                    # SL hit (loss)
+                    pnl = price - trade['entry']
+                    self._close_trade(tid, price, pnl)
+                    to_remove.append(tid)
+                elif price >= trade['tp']:
+                    pnl = price - trade['entry']
+                    self._close_trade(tid, price, pnl)
+                    to_remove.append(tid)
+            else:  # SELL
+                if price >= trade['sl']:
+                    pnl = trade['entry'] - price
+                    self._close_trade(tid, price, pnl)
+                    to_remove.append(tid)
+                elif price <= trade['tp']:
+                    pnl = trade['entry'] - price
+                    self._close_trade(tid, price, pnl)
+                    to_remove.append(tid)
+        for tid in to_remove:
+            del self.active_trades[tid]
+            gc.collect()  # force garbage collection
+
+    def _check_breakeven(self, trade: dict, current_price: float):
+        # Check if price reached 50% of target distance
+        target_distance = abs(trade['tp'] - trade['entry'])
+        half_target = trade['entry'] + (0.5 * target_distance) if trade['direction'] == 'BUY' else trade['entry'] - (0.5 * target_distance)
+        if (trade['direction'] == 'BUY' and current_price >= half_target) or (trade['direction'] == 'SELL' and current_price <= half_target):
+            # Get last completed 1m candle for rejection wick check
+            if self.topology.check_1m_rejection(trade['asset'], trade['direction']):
+                # Lock breakeven: move SL to entry
+                trade['sl'] = trade['entry']
+                trade['breakeven_locked'] = True
+                logger.info(f"Breakeven locked for trade {trade['id']} ({trade['asset']})")
+                # Optionally send Telegram notification? Could be a separate alert.
+
+    def _close_trade(self, trade_id: int, exit_price: float, pnl: float):
+        self.db.close_trade(trade_id, exit_price, pnl)
+        logger.info(f"Trade {trade_id} closed at {exit_price} with PnL {pnl:.2f}")
+        # If trade closed and we have a strong trend, we might allow re-entry later.
+
+    # ---------- MAIN PRICE TICK HANDLER ----------
     def _handle_price_tick(self, asset: str, price: float, volume: float):
+        self.current_prices[asset] = price
+        # Update topology
         self.topology.process_tick(asset, price, volume)
+        # Update active trades (SL/TP checks)
+        self._update_active_trades(asset, price)
 
-        # --- CRITICAL FIX: only evaluate when a 15‑minute candle has just closed ---
+        # Check for continuation alert if active trade exists and strong trend
+        if asset in self.active_trades and self._is_strong_trend(asset):
+            # Fire continuation advice (once per trade maybe)
+            # We'll do it only if not already sent for this trade
+            for tid, trade in self.active_trades.items():
+                if trade['asset'] == asset and not trade.get('continuation_sent', False):
+                    self.telegram.fire_continuation_alert(
+                        asset, trade['direction'],
+                        f"Strong momentum detected! Hold current position. Entry: {trade['entry']:.2f}, SL: {trade['sl']:.2f}, TP: {trade['tp']:.2f}"
+                    )
+                    trade['continuation_sent'] = True
+
+        # Only evaluate new signals on 15m candle close
         if not self.topology.candle_just_closed[asset]:
             return
 
-        # --- Now we run the full analysis once per candle close ---
-        # update indicators using the completed 15m candles
+        # --- NEW SIGNAL GENERATION ---
+        # 1. Update indicators
+        self._update_indicators(asset, price)
+        # 2. Get BSL/SSL from pivots (for liquidity engine)
+        bsl = max(self.topology.pivots[asset]["high"]) if self.topology.pivots[asset]["high"] else price * 1.02
+        ssl = min(self.topology.pivots[asset]["low"]) if self.topology.pivots[asset]["low"] else price * 0.98
+        self.asset_state[asset]["bsl"] = bsl
+        self.asset_state[asset]["ssl"] = ssl
+        # 3. Run Institutional Liquidity Engine
+        candles_1h = self.topology.candles[3600][asset]
+        candles_5m = self.topology.candles[300][asset]
+        candle_1m = self.topology.candles[60][asset][-1] if self.topology.candles[60][asset] else None
+        atr = self.topology.get_atr(asset)
+        inst_result = {"trigger": "WAIT"}
+        if candle_1m and atr > 0:
+            inst_result = self.liquidity_engine.analyze(
+                candles_1h, candles_5m, candle_1m, price, atr, bsl, ssl
+            )
+        inst_trigger = inst_result.get("trigger")  # "BUY", "SELL", or "WAIT"
+
+        # 4. Detect liquidity sweep and hunt confirmation
+        sweep = self.topology.detect_liquidity_sweep(asset, price)
+        hunt_confirmed = False
+        # For BUY: need SELL_SWEEP + bullish 1m rejection
+        if sweep == "SELL_SWEEP" and self.topology.check_1m_rejection(asset, "BUY"):
+            hunt_confirmed = True
+        # For SELL: need BUY_SWEEP + bearish 1m rejection
+        elif sweep == "BUY_SWEEP" and self.topology.check_1m_rejection(asset, "SELL"):
+            hunt_confirmed = True
+
+        # 5. Scoring
+        patterns = self.topology.detect_candle_patterns(asset)
+        score = self.scoring.evaluate(
+            asset=asset, price=price, patterns=patterns,
+            sr_data=self.topology.support_resistance[asset],
+            trend=self.asset_state[asset]["trend"],
+            news_sentiment=self.asset_state[asset]["news_sentiment"],
+            volume_ratio=self.asset_state[asset]["volume_ratio"],
+            rsi=self.asset_state[asset]["rsi"],
+            adx=self.asset_state[asset]["adx"],
+            volatility=self.asset_state[asset]["volatility"],
+            htf_trend=self.asset_state[asset]["htf_trend"],
+            bos=self.topology.bos[asset],
+            choch=self.topology.choch[asset],
+            fvgs=self.topology.detect_fvg(asset),
+            order_block=self.topology.detect_order_block(asset),
+            liquidity_sweep=sweep,
+            news_importance=self.asset_state[asset]["news_importance"],
+            hunt_confirmed=hunt_confirmed,
+            inst_liquidity_trigger=inst_trigger
+        )
+
+        # 6. Check if enough layers and score threshold
+        if not score["enough"] or score["total_score"] < Config.MIN_CONFLUENCE_SCORE:
+            reason = f"Confluence failure ({score['num_passed']}/11) or low score ({score['total_score']:.0f})"
+            self.db.log_rejected(asset, price, score["total_score"], reason, self.asset_state[asset]["volatility"], self.topology.get_volatility_regime(asset))
+            self.rejected_signals += 1
+            return
+
+        # 7. Determine direction: must match HTF trend and inst_trigger
+        if inst_trigger == "BUY" and self.asset_state[asset]["htf_trend"] == "BULLISH" and self.asset_state[asset]["trend"] == "BULLISH":
+            direction = "BUY"
+        elif inst_trigger == "SELL" and self.asset_state[asset]["htf_trend"] == "BEARISH" and self.asset_state[asset]["trend"] == "BEARISH":
+            direction = "SELL"
+        else:
+            # If no inst_trigger, fallback to trend alignment (but we want to be strict)
+            if self.asset_state[asset]["htf_trend"] == "BULLISH" and self.asset_state[asset]["trend"] == "BULLISH" and hunt_confirmed:
+                direction = "BUY"
+            elif self.asset_state[asset]["htf_trend"] == "BEARISH" and self.asset_state[asset]["trend"] == "BEARISH" and hunt_confirmed:
+                direction = "SELL"
+            else:
+                return
+
+        # 8. Compute SL/TP with volatility multipliers
+        regime = self.topology.get_volatility_regime(asset)
+        sl_mult, tp_mult = Config.VOLATILITY_MULTIPLIERS.get(regime, (1.5, 2.5))
+        if direction == "BUY":
+            sl = price - sl_mult * atr
+            tp = price + tp_mult * atr
+        else:
+            sl = price + sl_mult * atr
+            tp = price - tp_mult * atr
+
+        # 9. Enforce minimum RR >= 2.0
+        rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
+        if rr < Config.MIN_RISK_REWARD:
+            # Adjust TP to meet minimum RR
+            if direction == "BUY":
+                tp = price + abs(price - sl) * Config.MIN_RISK_REWARD
+            else:
+                tp = price - abs(price - sl) * Config.MIN_RISK_REWARD
+            rr = abs(tp - price) / abs(price - sl)
+            if rr < Config.MIN_RISK_REWARD - 0.01:  # if still below, reject
+                reason = f"RR {rr:.2f} below minimum {Config.MIN_RISK_REWARD} even after adjustment"
+                self.db.log_rejected(asset, price, score["total_score"], reason, self.asset_state[asset]["volatility"], regime)
+                self.rejected_signals += 1
+                return
+
+        # 10. Check cooldown and daily cap, but bypass if strong trend
+        now_ts = time.time()
+        strong_trend = self._is_strong_trend(asset)
+        if not strong_trend:
+            if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN:
+                reason = f"Cooldown active ({int(Config.SIGNAL_COOLDOWN - (now_ts - self.last_signal_time[asset]))}s remaining)"
+                self.db.log_rejected(asset, price, score["total_score"], reason, self.asset_state[asset]["volatility"], regime)
+                self.rejected_signals += 1
+                return
+            recent_signals = [t for t in self.signal_timestamps if now_ts - t < 86400]
+            if len(recent_signals) >= Config.MAX_SIGNALS_PER_DAY:
+                reason = f"Daily max cap reached ({Config.MAX_SIGNALS_PER_DAY} per 24h)"
+                self.db.log_rejected(asset, price, score["total_score"], reason, self.asset_state[asset]["volatility"], regime)
+                self.rejected_signals += 1
+                return
+
+        # 11. Log trade
+        logic_parts = [f"HTF {self.asset_state[asset]['htf_trend']}"]
+        if self.topology.bos[asset]["direction"]: logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
+        if self.topology.choch[asset]: logic_parts.append("CHOCH")
+        if hunt_confirmed: logic_parts.append("HUNT_CONFIRMED")
+        if inst_trigger != "WAIT": logic_parts.append(f"INST_LIQ_{inst_trigger}")
+        logic = " + ".join(logic_parts)
+
+        trade_id = self.db.log_trade(
+            asset, direction, price, sl, tp, score["total_score"], score["confidence"],
+            list(patterns.keys()), logic, self.asset_state[asset]["volatility"],
+            regime, self.asset_state[asset]["htf_trend"], self.asset_state[asset]["news_sentiment"]
+        )
+
+        # 12. Store in RAM active trades
+        self.active_trades[trade_id] = {
+            'id': trade_id,
+            'asset': asset,
+            'direction': direction,
+            'entry': price,
+            'sl': sl,
+            'tp': tp,
+            'breakeven_locked': False,
+            'continuation_sent': False
+        }
+
+        self.accepted_signals += 1
+        self.last_signal_time[asset] = now_ts
+        self.signal_timestamps.append(now_ts)
+
+        # 13. Send Telegram signal
+        win_prob = min(95, max(5, (self.db.get_rolling_win_rate(asset) * 50 + score["probability"] * 0.5)))
+        self.telegram.fire_signal(
+            asset=asset, direction=direction, price=price, sl=sl, tp=tp,
+            topology_chart=self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns),
+            logic=logic, news=self.news.last_news.get("title", "No news")[:100] if self.news.last_news else "No news",
+            score=score, patterns=patterns, trade_id=trade_id, session=datetime.now().strftime("%H:%M"),
+            entry_zone=f"{price - atr*0.5:.2f} - {price + atr*0.5:.2f}",
+            exit_zone=f"{tp - atr*0.5:.2f} - {tp + atr*0.5:.2f}",
+            win_prob=win_prob, rr=rr
+        )
+        logger.info(f"🔥 SIGNAL: {asset} {direction} @ {price} (Score: {score['total_score']:.0f}, RR: {rr:.2f})")
+
+    # ---------- INDICATORS UPDATE ----------
+    def _update_indicators(self, asset: str, price: float):
         candles_15m = self.topology.candles[900][asset]
         if len(candles_15m) > 10:
             closes = [c["close"] for c in candles_15m if c.get("complete", False)]
@@ -852,94 +1193,10 @@ class AIOrchestrator:
             self.asset_state[asset]["volume_ratio"] = vols[-1] / avg_vol if avg_vol > 0 else 1.0
 
         atr = self.topology.get_atr(asset)
-        if atr > 0 and price > 0: self.asset_state[asset]["volatility"] = atr / price
+        if atr > 0 and price > 0:
+            self.asset_state[asset]["volatility"] = atr / price
 
-        now_ts = time.time()
-        if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN:
-            return
-
-        patterns = self.topology.detect_candle_patterns(asset)
-        score = self.scoring.evaluate(
-            asset=asset, price=price, patterns=patterns, sr_data=self.topology.support_resistance[asset],
-            trend=self.asset_state[asset]["trend"], news_sentiment=self.asset_state[asset]["news_sentiment"], volume_ratio=self.asset_state[asset]["volume_ratio"],
-            rsi=self.asset_state[asset]["rsi"], adx=self.asset_state[asset]["adx"], volatility=self.asset_state[asset]["volatility"],
-            htf_trend=self.asset_state[asset]["htf_trend"], bos=self.topology.bos[asset], choch=self.topology.choch[asset],
-            fvgs=self.topology.detect_fvg(asset), order_block=self.topology.detect_order_block(asset), liquidity_sweep=self.topology.detect_liquidity_sweep(asset, price),
-            news_importance=self.asset_state[asset]["news_importance"]
-        )
-
-        # Reject if not enough layers or score below threshold
-        if not score["enough"] or score["total_score"] < Config.MIN_CONFLUENCE_SCORE:
-            reason = f"Confluence failure ({score['num_passed']}/9) or low score ({score['total_score']:.0f})"
-            self.db.log_rejected(asset, price, score["total_score"], reason, self.asset_state[asset]["volatility"], self.topology.get_volatility_regime(asset))
-            self.rejected_signals += 1
-            return
-
-        direction = None
-        if self.asset_state[asset]["htf_trend"] == "BULLISH" and self.asset_state[asset]["trend"] == "BULLISH":
-            direction = "BUY"
-        elif self.asset_state[asset]["htf_trend"] == "BEARISH" and self.asset_state[asset]["trend"] == "BEARISH":
-            direction = "SELL"
-
-        if direction is None:
-            return
-
-        regime = self.topology.get_volatility_regime(asset)
-        sl_mult, tp_mult = Config.VOLATILITY_MULTIPLIERS.get(regime, (1.5, 2.5))
-        if direction == "BUY":
-            sl = price - sl_mult * atr
-            tp = price + tp_mult * atr
-        else:
-            sl = price + sl_mult * atr
-            tp = price - tp_mult * atr
-
-        # Enforce minimum RR
-        rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
-        if rr < Config.MIN_RISK_REWARD:
-            if direction == "BUY":
-                tp = price + abs(price - sl) * Config.MIN_RISK_REWARD
-            else:
-                tp = price - abs(price - sl) * Config.MIN_RISK_REWARD
-            rr = abs(tp - price) / abs(price - sl)
-
-        # Daily cap check
-        recent_signals = [t for t in self.signal_timestamps if now_ts - t < 86400]
-        if len(recent_signals) >= Config.MAX_SIGNALS_PER_DAY:
-            reason = f"Daily max cap reached ({Config.MAX_SIGNALS_PER_DAY} per 24h)"
-            self.db.log_rejected(asset, price, score["total_score"], reason, self.asset_state[asset]["volatility"], regime)
-            self.rejected_signals += 1
-            return
-
-        # Build logic string
-        logic_parts = [f"HTF {self.asset_state[asset]['htf_trend']}"]
-        if self.topology.bos[asset]["direction"]: logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
-        if self.topology.choch[asset]: logic_parts.append("CHOCH")
-        logic = " + ".join(logic_parts)
-
-        # Log trade
-        trade_id = self.db.log_trade(
-            asset, direction, price, sl, tp, score["total_score"], score["confidence"],
-            list(patterns.keys()), logic, self.asset_state[asset]["volatility"],
-            regime, self.asset_state[asset]["htf_trend"], self.asset_state[asset]["news_sentiment"]
-        )
-
-        self.accepted_signals += 1
-        self.last_signal_time[asset] = now_ts
-        self.signal_timestamps.append(now_ts)
-
-        # Fire Telegram signal
-        self.telegram.fire_signal(
-            asset=asset, direction=direction, price=price, sl=sl, tp=tp,
-            topology_chart=self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns),
-            logic=logic, news=self.news.last_news.get("title", "No news")[:100] if self.news.last_news else "No news",
-            score=score, patterns=patterns, trade_id=trade_id, session=datetime.now().strftime("%H:%M"),
-            entry_zone=f"{price - atr*0.5:.2f} - {price + atr*0.5:.2f}",
-            exit_zone=f"{tp - atr*0.5:.2f} - {tp + atr*0.5:.2f}",
-            win_prob=min(95, max(5, (self.db.get_rolling_win_rate(asset) * 50 + score["probability"] * 0.5))),
-            rr=rr
-        )
-        logger.info(f"🔥 SIGNAL: {asset} {direction} @ {price} (Score: {score['total_score']:.0f}, RR: {rr:.2f})")
-
+    # ---------- TECHNICAL INDICATORS (RSI, ADX) ----------
     def _calculate_rsi(self, closes: List[float], period: int = 14) -> float:
         if len(closes) < period+1: return 50
         gains, losses = 0, 0
@@ -964,6 +1221,43 @@ class AIOrchestrator:
         dx = (abs((dm_p_smooth / atr) * 100 - (dm_m_smooth / atr) * 100) / ((dm_p_smooth / atr) * 100 + (dm_m_smooth / atr) * 100)) * 100 if ((dm_p_smooth / atr) * 100 + (dm_m_smooth / atr) * 100) > 0 else 0
         return min(100, dx)
 
+    # ---------- MAIN RUN LOOP ----------
+    def run(self):
+        self._recover_from_db()
+        self.stream = BinancePublicStream(on_price_update=self._on_price_update)
+        self.stream.start()
+        self.telegram.fire_news_alert("AI v3.2 Online - Hunt Confirmation & Re-Entry Engine Active", "BULLISH", 90, 1.0)
+        threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
+
+        last_news_fetch = 0
+        while True:
+            try:
+                time.sleep(15)
+                # Fetch news every 30 seconds
+                if int(time.time()) - last_news_fetch > 30:
+                    news_data = self.news.fetch_latest()
+                    if news_data.get("fresh") and news_data.get("articles"):
+                        for article in news_data["articles"][:2]:
+                            self.telegram.fire_news_alert(article["title"], article["sentiment"]["label"], article["sentiment"]["score"], article["importance"])
+                            for asset in Config.ASSETS:
+                                self.asset_state[asset]["news_sentiment"] = article["sentiment"]["score"]
+                                self.asset_state[asset]["news_importance"] = article["importance"]
+                        last_news_fetch = int(time.time())
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+
+    def _on_price_update(self, asset: str, price: float, volume: float):
+        # Non-blocking: put into queue
+        try:
+            self.price_queue.put_nowait((asset, price, volume))
+        except queue.Full:
+            logger.warning(f"Price queue full, dropping tick for {asset}")
+
+# =====================================================================
+# ENTRY POINT
+# =====================================================================
 if __name__ == "__main__":
     orchestrator = AIOrchestrator()
     orchestrator.run()
