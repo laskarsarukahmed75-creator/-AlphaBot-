@@ -31,10 +31,10 @@ except ImportError:
 
 # ---- Logging Setup ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v5.2.3-MongoStats")
+logger = logging.getLogger("AI-Orchestrator-v5.2.5-Final")
 
 # =====================================================================
-# CONFIGURATION
+# CONFIGURATION (v5.2.5 - Added RENDER_URL for Self-Ping)
 # =====================================================================
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -42,20 +42,28 @@ class Config:
     ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
 
-    MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    # MONGO DB SETTINGS
+    MONGO_URI = os.getenv("MONGO_URI", "")
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v5")
 
+    # --- RENDER SELF-PING URL (To prevent spin-down) ---
+    RENDER_URL = os.getenv("RENDER_URL", "https://alphabot-76tj.onrender.com")
+
+    # --- SCORING THRESHOLDS ---
     MIN_CONFLUENCE_SCORE = 55
     MIN_LAYER_PASS = 3
     MIN_RISK_REWARD = 1.8
     MIN_SL_DISTANCE_MULTIPLIER = 0.6
 
+    # --- COOLDOWN & CAPS ---
     SIGNAL_COOLDOWN = 1800
     MAX_SIGNALS_PER_DAY = 5
 
+    # --- DATABASE & CANDLES ---
     DB_PATH = "trades_v5.db"
     MAX_CANDLES = 500
 
+    # --- VOLATILITY ---
     VOLATILITY_MULTIPLIERS = {
         "low": (1.2, 2.0),
         "medium": (1.5, 2.5),
@@ -63,47 +71,60 @@ class Config:
         "extreme": (2.0, 3.5)
     }
 
-    TIME_DECAY_SECONDS = 1500
-    TIME_DECAY_THRESHOLD_PCT = 0.002
+    # --- LIFECYCLE PARAMETERS ---
+    TIME_DECAY_SECONDS = 1500          # 25 min
+    TIME_DECAY_THRESHOLD_PCT = 0.002   # 0.2%
     HEALTH_EMERGENCY_THRESHOLD = 55
-    CONFIDENCE_UPDATE_INTERVAL = 300
+    CONFIDENCE_UPDATE_INTERVAL = 300   # 5 min
 
 # =====================================================================
-# MONGODB DATABASE MANAGER (with retry and stats)
+# MONGODB DATABASE MANAGER (FIX: Explicit None checks)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
         if not HAS_PYMONGO:
-            logger.error("pymongo not available.")
+            logger.warning("pymongo not installed. MongoDB disabled.")
             self.client = None
             self.db = None
             return
-        self.retry_count = 3
+        if not Config.MONGO_URI:
+            logger.warning("MONGO_URI not set. MongoDB disabled.")
+            self.client = None
+            self.db = None
+            return
+        self.retry_count = 5
         self.connect()
 
     def connect(self):
         for attempt in range(self.retry_count):
             try:
-                self.client = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=5000)
+                self.client = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000)
                 self.db = self.client[Config.MONGO_DB_NAME]
                 self._create_indexes()
-                logger.info(f"MongoDB connected (attempt {attempt+1})")
+                logger.info(f"MongoDB connected successfully (attempt {attempt+1})")
                 return
             except Exception as e:
-                logger.warning(f"MongoDB connection attempt {attempt+1} failed: {e}")
-                time.sleep(2)
-        logger.error("MongoDB connection failed after retries.")
+                logger.warning(f"MongoDB connection attempt {attempt+1}/{self.retry_count} failed: {e}")
+                time.sleep(3)
+        logger.error("MongoDB connection failed after all retries. Running without MongoDB.")
         self.client = None
         self.db = None
 
     def _create_indexes(self):
-        if not self.db: return
-        self.db.candles.create_index([("asset", ASCENDING), ("timeframe", ASCENDING), ("timestamp", ASCENDING)], unique=True)
-        self.db.trades.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
-        self.db.rejected.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
+        # FIX: Explicit None check
+        if self.db is None:
+            return
+        try:
+            self.db.candles.create_index([("asset", ASCENDING), ("timeframe", ASCENDING), ("timestamp", ASCENDING)], unique=True)
+            self.db.trades.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
+            self.db.rejected.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
+        except Exception as e:
+            logger.debug(f"Index creation error: {e}")
 
     def save_candle(self, asset, timeframe, candle):
-        if not self.db: return
+        # FIX: Explicit None check
+        if self.db is None:
+            return
         try:
             doc = {**candle, "asset": asset, "timeframe": timeframe}
             self.db.candles.update_one(
@@ -115,7 +136,9 @@ class MongoDatabase:
             logger.debug(f"Mongo save_candle error: {e}")
 
     def load_candles(self, asset, timeframe, limit=500, since=None):
-        if not self.db: return []
+        # FIX: Explicit None check
+        if self.db is None:
+            return []
         try:
             query = {"asset": asset, "timeframe": timeframe}
             if since:
@@ -127,18 +150,13 @@ class MongoDatabase:
             return []
 
     def get_candle_stats(self):
-        """Return counts per timeframe and oldest timestamp across all assets."""
-        if not self.db:
+        # FIX: Explicit None check
+        if self.db is None:
             return {"counts": {}, "oldest": 0}
         try:
-            # Aggregate pipeline to get counts per timeframe
-            pipeline = [
-                {"$group": {"_id": "$timeframe", "count": {"$sum": 1}}},
-                {"$sort": {"_id": 1}}
-            ]
+            pipeline = [{"$group": {"_id": "$timeframe", "count": {"$sum": 1}}}, {"$sort": {"_id": 1}}]
             counts_result = list(self.db.candles.aggregate(pipeline))
             counts = {str(item["_id"]) + "s": item["count"] for item in counts_result}
-            # Also get the oldest timestamp overall (for 1h timeframe, as a proxy)
             oldest_doc = self.db.candles.find_one(sort=[("timestamp", ASCENDING)])
             oldest_ts = oldest_doc["timestamp"] if oldest_doc else 0
             return {"counts": counts, "oldest": oldest_ts}
@@ -147,32 +165,27 @@ class MongoDatabase:
             return {"counts": {}, "oldest": 0}
 
     def get_trades_count(self):
-        if not self.db: return 0
+        # FIX: Explicit None check
+        if self.db is None:
+            return 0
         try:
             return self.db.trades.count_documents({})
         except Exception:
             return 0
 
-    def get_latest_timestamp(self, asset, timeframe):
-        if not self.db: return 0
-        try:
-            doc = self.db.candles.find_one(
-                {"asset": asset, "timeframe": timeframe},
-                sort=[("timestamp", DESCENDING)]
-            )
-            return doc["timestamp"] if doc else 0
-        except Exception:
-            return 0
-
     def save_trade_backup(self, trade_data):
-        if not self.db: return
+        # FIX: Explicit None check
+        if self.db is None:
+            return
         try:
             self.db.trades.update_one({"id": trade_data["id"]}, {"$set": trade_data}, upsert=True)
         except Exception as e:
             logger.debug(f"Mongo save_trade error: {e}")
 
     def save_rejected_backup(self, rejected_data):
-        if not self.db: return
+        # FIX: Explicit None check
+        if self.db is None:
+            return
         try:
             self.db.rejected.insert_one(rejected_data)
         except Exception as e:
@@ -333,7 +346,7 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 20))
 
 # =====================================================================
-# INSTITUTIONAL LIQUIDITY ENGINE
+# INSTITUTIONAL LIQUIDITY ENGINE (NOT TOUCHED)
 # =====================================================================
 class InstitutionalLiquidityEngine:
     def __init__(self, lookback=800):
@@ -351,7 +364,7 @@ class InstitutionalLiquidityEngine:
         return {"trigger": "WAIT"}
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE
+# CANDLE TOPOLOGY ENGINE (NOT TOUCHED)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -523,7 +536,7 @@ class CandleTopologyEngine:
         return "\n".join(chart_lines)
 
 # =====================================================================
-# SIGNAL SCORING ENGINE
+# SIGNAL SCORING ENGINE (NOT TOUCHED)
 # =====================================================================
 class SignalScoringEngine:
     def __init__(self):
@@ -615,7 +628,7 @@ class BinancePublicStream:
         except: pass
 
 # =====================================================================
-# RICH HEALTH SERVER (with MongoDB stats)
+# RICH HEALTH SERVER
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -625,11 +638,9 @@ def start_health_server(orchestrator):
             self.send_header("Content-type", "application/json")
             self.end_headers()
             
-            # --- सिस्टम स्टैट्स ---
             cpu = psutil.cpu_percent() if HAS_PSUTIL else 0
             mem = psutil.virtual_memory().percent if HAS_PSUTIL else 0
             
-            # --- एक्टिव ट्रेड्स की डिटेल ---
             active_trades_list = []
             with orchestrator.trade_lock:
                 for tid, trade in orchestrator.active_trades.items():
@@ -649,12 +660,10 @@ def start_health_server(orchestrator):
                         "confidence": trade.get('current_score', 0)
                     })
             
-            # --- परफॉर्मेंस मेट्रिक्स (SQLite से) ---
             perf = orchestrator.db.get_performance_metrics()
             
-            # --- MongoDB Stats ---
             mongo_stats = {}
-            if orchestrator.mongo.db:
+            if orchestrator.mongo.db is not None:  # FIX: Explicit None check
                 try:
                     candle_stats = orchestrator.mongo.get_candle_stats()
                     trades_backup = orchestrator.mongo.get_trades_count()
@@ -665,7 +674,6 @@ def start_health_server(orchestrator):
                         "oldest_date": datetime.fromtimestamp(candle_stats["oldest"]).strftime('%Y-%m-%d %H:%M:%S') if candle_stats["oldest"] else None,
                         "trades_backup_count": trades_backup
                     }
-                    # calculate approximate days of data
                     if candle_stats["oldest"]:
                         days = (time.time() - candle_stats["oldest"]) / 86400
                         mongo_stats["data_days"] = round(days, 1)
@@ -674,12 +682,10 @@ def start_health_server(orchestrator):
                 except Exception as e:
                     mongo_stats = {"connected": True, "error": str(e)}
             else:
-                mongo_stats = {"connected": False}
+                mongo_stats = {"connected": False, "reason": "MONGO_URI not set or connection failed"}
             
-            # --- लास्ट सिग्नल टाइम ---
             last_signal = {asset: time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(orchestrator.last_signal_time[asset])) if orchestrator.last_signal_time[asset] > 0 else "Never" for asset in Config.ASSETS}
             
-            # --- कैंडल डिले ---
             candle_delay = 0
             for asset in Config.ASSETS:
                 candles = orchestrator.topology.candles[60][asset]
@@ -688,7 +694,7 @@ def start_health_server(orchestrator):
             
             response = {
                 "status": "online",
-                "version": "5.2.3-MongoStats",
+                "version": "5.2.5-Final",
                 "uptime_seconds": int(time.time() - orchestrator.start_time) if hasattr(orchestrator, 'start_time') else 0,
                 "cpu_percent": cpu,
                 "memory_percent": mem,
@@ -702,7 +708,6 @@ def start_health_server(orchestrator):
                 "reconnect_count": orchestrator.stream.reconnect_count if hasattr(orchestrator, 'stream') else 0,
                 "news_sentiment": orchestrator.news.last_news.get('sentiment', {}).get('label', 'NEUTRAL') if hasattr(orchestrator, 'news') else 'N/A',
                 "fear_greed": orchestrator.news.fear_greed if hasattr(orchestrator, 'news') else 50,
-                # NEW: MongoDB persistence details
                 "mongodb": mongo_stats
             }
             
@@ -713,7 +718,7 @@ def start_health_server(orchestrator):
     httpd.serve_forever()
 
 # =====================================================================
-# LIFECYCLE CONTROLLER
+# LIFECYCLE CONTROLLER (NOT TOUCHED)
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -780,7 +785,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# TRADE JOURNAL AI
+# TRADE JOURNAL AI (NOT TOUCHED)
 # =====================================================================
 class TradeJournalAI:
     def __init__(self, db_connection):
@@ -819,7 +824,7 @@ class TradeJournalAI:
             cur.close()
 
 # =====================================================================
-# CORE ORCHESTRATOR
+# CORE ORCHESTRATOR (with Self-Ping Mechanism)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -852,6 +857,17 @@ class AIOrchestrator:
                 item = self.price_queue.get(timeout=1)
                 if item: self._handle_price_tick(*item)
             except: pass
+
+    # --- SELF-PING MECHANISM (FIX for Render Spin-Down) ---
+    def _ping_self_loop(self):
+        """Background thread to ping the Render URL every 5 minutes to prevent sleep."""
+        while True:
+            try:
+                response = requests.get(Config.RENDER_URL, timeout=10)
+                logger.info(f"✨ Self-ping sent to {Config.RENDER_URL} (Status: {response.status_code})")
+            except Exception as e:
+                logger.warning(f"⚠️ Self-ping failed: {e}")
+            time.sleep(300)  # 5 minutes
 
     # --- Data Loading with Parallel Execution ---
     def _load_and_backfill(self, asset, tf):
@@ -932,7 +948,7 @@ class AIOrchestrator:
         self.db.close_trade(tid, price, pnl, reason)
         self.telegram.send_message(f"🔒 Trade #{tid} closed at {price:.2f} | PnL: {pnl:+.2f} | Reason: {reason}")
         logger.info(f"Trade {tid} closed. PnL: {pnl:.2f}, Reason: {reason}")
-        if self.mongo.db:
+        if self.mongo.db is not None:  # FIX: Explicit None check
             try:
                 self.mongo.db.trades.update_one(
                     {"id": tid},
@@ -973,7 +989,7 @@ class AIOrchestrator:
                 if tid in self.active_trades: del self.active_trades[tid]
             if to_remove: gc.collect()
 
-    # ---- MAIN PRICE TICK HANDLER ----
+    # ---- MAIN PRICE TICK HANDLER (NOT TOUCHED) ----
     def _handle_price_tick(self, asset, price, volume):
         self.topology.process_tick(asset, price, volume)
         self._update_active_trades(asset, price)
@@ -1023,7 +1039,7 @@ class AIOrchestrator:
         if not score["enough"] or score["total_score"] < Config.MIN_CONFLUENCE_SCORE:
             self.db.log_rejected(asset, price, score["total_score"], "Low score", self.asset_state[asset]["volatility"], "medium")
             self.rejected+=1
-            if self.mongo.db:
+            if self.mongo.db is not None:  # FIX: Explicit None check
                 try:
                     self.mongo.db.rejected.insert_one({"asset": asset, "price": price, "score": score["total_score"], "reason": "Low score", "timestamp": int(time.time())})
                 except: pass
@@ -1074,7 +1090,7 @@ class AIOrchestrator:
                                 list(patterns.keys()), logic, self.asset_state[asset]["volatility"],
                                 regime, self.asset_state[asset]["htf_trend"], self.asset_state[asset]["news_sentiment"])
         
-        if self.mongo.db:
+        if self.mongo.db is not None:  # FIX: Explicit None check
             try:
                 trade_doc = {
                     "id": tid, "asset": asset, "direction": direction, "entry": price, "stop_loss": sl, "take_profit": tp,
@@ -1108,10 +1124,14 @@ class AIOrchestrator:
 
     # ---- RUN ----
     def run(self):
-        # CRITICAL FIX: Start health server IMMEDIATELY (before heavy loading)
+        # 1. Start Health Server (for Render monitoring)
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
 
-        # Parallel data loading to speed up startup
+        # 2. Start Self-Ping Thread (FIX for Render Spin-Down)
+        threading.Thread(target=self._ping_self_loop, daemon=True).start()
+        logger.info(f"Self-ping engine started for {Config.RENDER_URL}")
+
+        # 3. Load Data
         logger.info("Loading historical data from MongoDB/Binance in parallel...")
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
@@ -1122,11 +1142,12 @@ class AIOrchestrator:
                 pass
         logger.info("Data loading complete.")
 
-        # Start WebSocket
+        # 4. Start WebSocket
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v5.2.3 Final - MongoDB Stats on Health Server")
-        
+        self.telegram.send_message("🚀 AI v5.2.5 Final - MongoDB Fix + Self-Ping Active. Bot will not sleep now!")
+
+        # 5. Main Loop (News Fetch)
         last_news = 0
         while True:
             try:
