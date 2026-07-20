@@ -57,7 +57,7 @@ class Config:
 
     # --- MONGODB ---
     MONGO_URI = os.getenv("MONGO_URI", "")
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v6")
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v5")
 
     # --- RENDER SELF-PING ---
     RENDER_URL = os.getenv("RENDER_URL", "https://alphabot-76tj.onrender.com")
