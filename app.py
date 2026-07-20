@@ -31,7 +31,7 @@ except ImportError:
 
 # ---- Logging Setup ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v5.2.1-Final")
+logger = logging.getLogger("AI-Orchestrator-v5.2.2-Final")
 
 # =====================================================================
 # CONFIGURATION
@@ -152,7 +152,7 @@ class MongoDatabase:
             logger.debug(f"Mongo save_rejected error: {e}")
 
 # =====================================================================
-# SQLite DATABASE (with context manager for cursor safety)
+# SQLite DATABASE (with try...finally for Cursor)
 # =====================================================================
 class TradeDatabase:
     def __init__(self):
@@ -160,7 +160,8 @@ class TradeDatabase:
         self._create_tables()
 
     def _create_tables(self):
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute('''CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset TEXT, direction TEXT,
@@ -177,10 +178,13 @@ class TradeDatabase:
                 timestamp INTEGER, volatility REAL, market_regime TEXT
             )''')
             self.conn.commit()
+        finally:
+            cur.close()
 
     def log_trade(self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
                   volatility, regime, htf_trend, news_score):
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute('''INSERT INTO trades 
                 (asset, direction, entry, stop_loss, take_profit, score, confidence, patterns, logic,
                  timestamp, volatility, market_regime, htf_trend, news_score, entry_time, status)
@@ -189,35 +193,50 @@ class TradeDatabase:
                  int(time.time()), volatility, regime, htf_trend, news_score, int(time.time()), 'open'))
             self.conn.commit()
             return cur.lastrowid
+        finally:
+            cur.close()
 
     def log_rejected(self, asset, price, score, reason, volatility, regime):
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute('''INSERT INTO rejected_signals (asset, price, score, reason, timestamp, volatility, market_regime)
                 VALUES (?,?,?,?,?,?,?)''', (asset, price, score, reason, int(time.time()), volatility, regime))
             self.conn.commit()
+        finally:
+            cur.close()
 
     def close_trade(self, trade_id, exit_price, pnl, exit_reason=""):
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute('''UPDATE trades SET status='closed', exit_price=?, pnl=?, close_time=?, exit_reason=?
                 WHERE id=?''', (exit_price, pnl, int(time.time()), exit_reason, trade_id))
             self.conn.commit()
+        finally:
+            cur.close()
 
     def get_rolling_win_rate(self, asset: str, lookback: int = 50) -> float:
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute('''SELECT pnl FROM trades WHERE asset=? AND status='closed' AND pnl IS NOT NULL ORDER BY close_time DESC LIMIT ?''', (asset, lookback))
             rows = cur.fetchall()
-        if not rows: return 0.5
-        wins = sum(1 for r in rows if r[0] > 0)
-        return wins / len(rows)
+            if not rows:
+                return 0.5
+            wins = sum(1 for r in rows if r[0] > 0)
+            return wins / len(rows)
+        finally:
+            cur.close()
 
     def get_db_size(self):
         try: return os.path.getsize(Config.DB_PATH)
         except: return 0
 
     def get_closed_trades(self, limit=50):
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute("SELECT asset, direction, score, pnl, logic FROM trades WHERE status='closed' ORDER BY id DESC LIMIT ?", (limit,))
             return cur.fetchall()
+        finally:
+            cur.close()
 
 # =====================================================================
 # NEWS SCANNER
@@ -553,7 +572,7 @@ def start_health_server(orchestrator):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "status":"online",
-                "version":"5.2.1-Final",
+                "version":"5.2.2-Final",
                 "active_trades":len(orchestrator.active_trades)
             }).encode())
     httpd = HTTPServer(("0.0.0.0", port), H)
@@ -635,7 +654,8 @@ class TradeJournalAI:
         self.conn = db_connection
 
     def log_and_learn(self):
-        with self.conn.cursor() as cur:
+        cur = self.conn.cursor()
+        try:
             cur.execute("SELECT asset, direction, score, pnl, logic FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 50")
             rows = cur.fetchall()
             if len(rows) < 10:
@@ -662,6 +682,8 @@ class TradeJournalAI:
                     f"• Win Rate: {win_rate:.1f}%\n"
                     f"• Best Logic: {best_logic} (Success: {logic_performance[best_logic]['wins']}/{logic_performance[best_logic]['confluences']})\n"
                     f"• Worst Logic: {worst_logic} (Success: {logic_performance[worst_logic]['wins']}/{logic_performance[worst_logic]['confluences']})")
+        finally:
+            cur.close()
 
 # =====================================================================
 # CORE ORCHESTRATOR
@@ -972,7 +994,7 @@ class AIOrchestrator:
         # Start WebSocket
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v5.2.1 Final Online - All Fixes Applied")
+        self.telegram.send_message("🚀 AI v5.2.2 Final Online - All Cursor Fixes Applied")
         
         last_news = 0
         while True:
