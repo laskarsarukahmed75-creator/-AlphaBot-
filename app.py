@@ -31,7 +31,7 @@ except ImportError:
 
 # ---- Logging Setup ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v5.2.2-Final")
+logger = logging.getLogger("AI-Orchestrator-v5.2.3-MongoStats")
 
 # =====================================================================
 # CONFIGURATION
@@ -69,7 +69,7 @@ class Config:
     CONFIDENCE_UPDATE_INTERVAL = 300
 
 # =====================================================================
-# MONGODB DATABASE MANAGER (with retry)
+# MONGODB DATABASE MANAGER (with retry and stats)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -125,6 +125,33 @@ class MongoDatabase:
         except Exception as e:
             logger.error(f"Mongo load_candles error: {e}")
             return []
+
+    def get_candle_stats(self):
+        """Return counts per timeframe and oldest timestamp across all assets."""
+        if not self.db:
+            return {"counts": {}, "oldest": 0}
+        try:
+            # Aggregate pipeline to get counts per timeframe
+            pipeline = [
+                {"$group": {"_id": "$timeframe", "count": {"$sum": 1}}},
+                {"$sort": {"_id": 1}}
+            ]
+            counts_result = list(self.db.candles.aggregate(pipeline))
+            counts = {str(item["_id"]) + "s": item["count"] for item in counts_result}
+            # Also get the oldest timestamp overall (for 1h timeframe, as a proxy)
+            oldest_doc = self.db.candles.find_one(sort=[("timestamp", ASCENDING)])
+            oldest_ts = oldest_doc["timestamp"] if oldest_doc else 0
+            return {"counts": counts, "oldest": oldest_ts}
+        except Exception as e:
+            logger.error(f"Mongo get_candle_stats error: {e}")
+            return {"counts": {}, "oldest": 0}
+
+    def get_trades_count(self):
+        if not self.db: return 0
+        try:
+            return self.db.trades.count_documents({})
+        except Exception:
+            return 0
 
     def get_latest_timestamp(self, asset, timeframe):
         if not self.db: return 0
@@ -235,6 +262,33 @@ class TradeDatabase:
         try:
             cur.execute("SELECT asset, direction, score, pnl, logic FROM trades WHERE status='closed' ORDER BY id DESC LIMIT ?", (limit,))
             return cur.fetchall()
+        finally:
+            cur.close()
+
+    def get_performance_metrics(self):
+        cur = self.conn.cursor()
+        try:
+            cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl IS NOT NULL")
+            total = cur.fetchone()[0] or 0
+            cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0")
+            wins = cur.fetchone()[0] or 0
+            cur.execute("SELECT SUM(pnl) FROM trades WHERE status='closed' AND pnl > 0")
+            gross_profit = cur.fetchone()[0] or 0.0
+            cur.execute("SELECT SUM(pnl) FROM trades WHERE status='closed' AND pnl < 0")
+            gross_loss = cur.fetchone()[0] or 0.0
+            gross_loss = abs(gross_loss)
+            total_pnl = gross_profit - gross_loss
+            win_rate = wins / total if total else 0.0
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+            return {
+                "total_trades": total,
+                "winning_trades": wins,
+                "losing_trades": total - wins,
+                "win_rate": win_rate,
+                "profit_factor": profit_factor,
+                "total_pnl": total_pnl,
+                "avg_pnl": total_pnl / total if total else 0.0
+            }
         finally:
             cur.close()
 
@@ -561,20 +615,99 @@ class BinancePublicStream:
         except: pass
 
 # =====================================================================
-# HEALTH SERVER (started early)
+# RICH HEALTH SERVER (with MongoDB stats)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
-            self.send_header("Content-type","application/json")
+            self.send_header("Content-type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({
-                "status":"online",
-                "version":"5.2.2-Final",
-                "active_trades":len(orchestrator.active_trades)
-            }).encode())
+            
+            # --- सिस्टम स्टैट्स ---
+            cpu = psutil.cpu_percent() if HAS_PSUTIL else 0
+            mem = psutil.virtual_memory().percent if HAS_PSUTIL else 0
+            
+            # --- एक्टिव ट्रेड्स की डिटेल ---
+            active_trades_list = []
+            with orchestrator.trade_lock:
+                for tid, trade in orchestrator.active_trades.items():
+                    current_price = orchestrator.topology.history[trade['asset']][-1]['price'] if orchestrator.topology.history[trade['asset']] else trade['entry']
+                    pnl = round(current_price - trade['entry'] if trade['direction']=='BUY' else trade['entry'] - current_price, 2)
+                    active_trades_list.append({
+                        "id": tid,
+                        "asset": trade['asset'],
+                        "direction": trade['direction'],
+                        "entry": round(trade['entry'], 2),
+                        "stop_loss": round(trade['sl'], 2),
+                        "take_profit": round(trade['tp'], 2),
+                        "current_pnl": pnl,
+                        "breakeven_locked": trade.get('breakeven_locked', False),
+                        "trailing_activated": trade.get('trailing_activated', False),
+                        "health": trade.get('health', 100),
+                        "confidence": trade.get('current_score', 0)
+                    })
+            
+            # --- परफॉर्मेंस मेट्रिक्स (SQLite से) ---
+            perf = orchestrator.db.get_performance_metrics()
+            
+            # --- MongoDB Stats ---
+            mongo_stats = {}
+            if orchestrator.mongo.db:
+                try:
+                    candle_stats = orchestrator.mongo.get_candle_stats()
+                    trades_backup = orchestrator.mongo.get_trades_count()
+                    mongo_stats = {
+                        "connected": True,
+                        "candle_counts": candle_stats["counts"],
+                        "oldest_timestamp": candle_stats["oldest"],
+                        "oldest_date": datetime.fromtimestamp(candle_stats["oldest"]).strftime('%Y-%m-%d %H:%M:%S') if candle_stats["oldest"] else None,
+                        "trades_backup_count": trades_backup
+                    }
+                    # calculate approximate days of data
+                    if candle_stats["oldest"]:
+                        days = (time.time() - candle_stats["oldest"]) / 86400
+                        mongo_stats["data_days"] = round(days, 1)
+                    else:
+                        mongo_stats["data_days"] = 0
+                except Exception as e:
+                    mongo_stats = {"connected": True, "error": str(e)}
+            else:
+                mongo_stats = {"connected": False}
+            
+            # --- लास्ट सिग्नल टाइम ---
+            last_signal = {asset: time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(orchestrator.last_signal_time[asset])) if orchestrator.last_signal_time[asset] > 0 else "Never" for asset in Config.ASSETS}
+            
+            # --- कैंडल डिले ---
+            candle_delay = 0
+            for asset in Config.ASSETS:
+                candles = orchestrator.topology.candles[60][asset]
+                if candles and candles[-1].get("complete", False):
+                    candle_delay = max(candle_delay, int(time.time()) - candles[-1]["timestamp"] - 60)
+            
+            response = {
+                "status": "online",
+                "version": "5.2.3-MongoStats",
+                "uptime_seconds": int(time.time() - orchestrator.start_time) if hasattr(orchestrator, 'start_time') else 0,
+                "cpu_percent": cpu,
+                "memory_percent": mem,
+                "active_trades_count": len(orchestrator.active_trades),
+                "active_trades": active_trades_list,
+                "accepted_signals": orchestrator.accepted,
+                "rejected_signals": orchestrator.rejected,
+                "last_signal_time": last_signal,
+                "performance": perf,
+                "candle_delay_seconds": candle_delay,
+                "reconnect_count": orchestrator.stream.reconnect_count if hasattr(orchestrator, 'stream') else 0,
+                "news_sentiment": orchestrator.news.last_news.get('sentiment', {}).get('label', 'NEUTRAL') if hasattr(orchestrator, 'news') else 'N/A',
+                "fear_greed": orchestrator.news.fear_greed if hasattr(orchestrator, 'news') else 50,
+                # NEW: MongoDB persistence details
+                "mongodb": mongo_stats
+            }
+            
+            self.wfile.write(json.dumps(response, indent=2).encode())
+    
     httpd = HTTPServer(("0.0.0.0", port), H)
     logger.info(f"Health server started on port {port}")
     httpd.serve_forever()
@@ -759,7 +892,6 @@ class AIOrchestrator:
         e15_9, e15_21 = self.topology._ema(c15, 9), self.topology._ema(c15, 21)
         e1h_9, e1h_21 = self.topology._ema(c1h, 9), self.topology._ema(c1h, 21)
 
-        # CRITICAL FIX: Check if any list is empty
         if not e15_9 or not e15_21 or not e1h_9 or not e1h_21:
             return False
         if len(e15_9) < 2 or len(e15_21) < 2 or len(e1h_9) < 2 or len(e1h_21) < 2:
@@ -847,7 +979,6 @@ class AIOrchestrator:
         self._update_active_trades(asset, price)
 
         if self.topology.candle_just_closed[asset]:
-            # Save completed 15m candle to MongoDB
             candles_15m = self.topology.candles[900][asset]
             if candles_15m and candles_15m[-1].get("complete", False):
                 self.mongo.save_candle(asset, 900, candles_15m[-1])
@@ -988,13 +1119,13 @@ class AIOrchestrator:
                 for tf in [60, 300, 900, 3600]:
                     futures.append(executor.submit(self._load_and_backfill, asset, tf))
             for future in as_completed(futures):
-                pass  # exceptions are logged inside
+                pass
         logger.info("Data loading complete.")
 
         # Start WebSocket
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v5.2.2 Final Online - All Cursor Fixes Applied")
+        self.telegram.send_message("🚀 AI v5.2.3 Final - MongoDB Stats on Health Server")
         
         last_news = 0
         while True:
