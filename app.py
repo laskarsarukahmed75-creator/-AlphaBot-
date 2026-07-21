@@ -1261,7 +1261,7 @@ class BinancePublicStream:
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
-     class H(BaseHTTPRequestHandler):
+    class H(BaseHTTPRequestHandler):
         def do_HEAD(self):
             self.send_response(200)
             self.send_header("Content-type", "application/json")
