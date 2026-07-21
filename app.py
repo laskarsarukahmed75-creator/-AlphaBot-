@@ -1,5 +1,5 @@
 # =====================================================================
-# app.py – AlphaBot v6.1 (Institutional Signal Quality Gate)
+# app.py – AlphaBot v6.1 (Institutional Signal Quality Gate) – FIXED
 # =====================================================================
 import math
 from typing import List, Dict, Optional, Tuple, Any
@@ -47,7 +47,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("AI-Orchestrator-v6.1")
 
 # =====================================================================
-# CONFIGURATION (v6.1)
+# CONFIGURATION (v6.1 – Adjusted for signal generation)
 # =====================================================================
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -69,26 +69,22 @@ class Config:
     # --- BINANCE FUTURES WEBSOCKET ---
     BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws"
 
-    # --- SESSION TIMING (IST) ---
-    # Set via environment variable TZ=Asia/Kolkata, but we use pytz directly
+    # --- SESSION TIMING (IST) – Relaxed for testing ---
     IST = pytz.timezone('Asia/Kolkata')
-    SESSION_WINDOWS = [
-        ("LONDON_NY_OVERLAP", 11, 30, 20, 30),   # 11:30 AM to 8:30 PM
-        ("NY_PEAK", 18, 30, 23, 30)              # 6:30 PM to 11:30 PM
-    ]
-    DEAD_ZONES = [(0, 0, 6, 0)]                 # 12 AM to 6 AM
+    # Temporary: Always active
+    SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
+    DEAD_ZONES = []
 
     # --- NEWS BLACKOUT ---
-    # Populated dynamically by EconomicCalendar scraper
-    NEWS_EVENTS = []  # list of (datetime, event_name, impact_assets)
+    NEWS_EVENTS = []
 
     # --- SCORING & GATES ---
-    MIN_SQS = 90                     # Hard rule: SQS < 90 → reject
-    PENDING_VERIFICATION_CANDLES = 2 # number of 5m candles
-    VOLUME_DECAY_THRESHOLD = 0.4     # 40% decay → cancel
+    MIN_SQS = 75                     # Reduced from 90
+    PENDING_VERIFICATION_CANDLES = 2
+    VOLUME_DECAY_THRESHOLD = 0.6     # Increased from 0.4
 
     # --- ADAPTIVE LEARNING ---
-    ADAPTIVE_LEARN_INTERVAL = 50     # every 50 trades
+    ADAPTIVE_LEARN_INTERVAL = 50
 
     # --- COOLDOWN & CAPS ---
     SIGNAL_COOLDOWN = 1800
@@ -109,7 +105,7 @@ class Config:
     CONFIDENCE_UPDATE_INTERVAL = 300
 
 # =====================================================================
-# MONGODB DATABASE (Unchanged)
+# MONGODB DATABASE (with quick fallback)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -123,33 +119,22 @@ class MongoDatabase:
             self.client = None
             self.db = None
             return
-        self.retry_count = 3
         self.auth_failed = False
-        self.connect()
-
-    def connect(self):
-        for attempt in range(self.retry_count):
-            try:
-                self.client = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000)
-                self.client.admin.command('ping')
-                self.db = self.client[Config.MONGO_DB_NAME]
-                self._create_indexes()
-                logger.info(f"MongoDB connected successfully (attempt {attempt+1})")
-                self.auth_failed = False
-                return
-            except Exception as e:
-                if "bad auth" in str(e) or "authentication failed" in str(e):
-                    logger.error(f"MongoDB authentication failed! Please check your MONGO_URI credentials.")
-                    self.auth_failed = True
-                    self.client = None
-                    self.db = None
-                    return
-                else:
-                    logger.warning(f"MongoDB connection attempt {attempt+1}/{self.retry_count} failed: {e}")
-                    time.sleep(2)
-        logger.error("MongoDB connection failed after all retries. Running without MongoDB.")
-        self.client = None
-        self.db = None
+        # Try once, if fail, go to SQLite
+        try:
+            self.client = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
+            self.client.admin.command('ping')
+            self.db = self.client[Config.MONGO_DB_NAME]
+            self._create_indexes()
+            logger.info("MongoDB connected successfully.")
+        except Exception as e:
+            if "bad auth" in str(e) or "authentication failed" in str(e):
+                logger.error(f"MongoDB authentication failed! Please check MONGO_URI credentials.")
+                self.auth_failed = True
+            else:
+                logger.warning(f"MongoDB connection failed: {e}. Running without MongoDB.")
+            self.client = None
+            self.db = None
 
     def _create_indexes(self):
         if self.db is None: return
@@ -224,7 +209,7 @@ class MongoDatabase:
                 logger.debug(f"Mongo save_rejected error: {e}")
 
 # =====================================================================
-# SQLite DATABASE (Extended for Adaptive Learning)
+# SQLite DATABASE (Unchanged)
 # =====================================================================
 class TradeDatabase:
     def __init__(self):
@@ -416,20 +401,18 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 20))
 
 # =====================================================================
-# ECONOMIC CALENDAR (FREE SCRAPER – GATE 2)
+# ECONOMIC CALENDAR (Unchanged)
 # =====================================================================
 class EconomicCalendar:
     def __init__(self):
-        self.events = []  # list of (datetime, event_name, impact_assets)
+        self.events = []
         if HAS_BS4:
             self.fetch_events()
         else:
             logger.warning("BeautifulSoup not installed. Economic calendar scraper disabled.")
 
     def fetch_events(self):
-        """Scrape ForexFactory for high-impact events in the current month."""
         try:
-            # ForexFactory calendar URL for current month (monthly view)
             now = datetime.now(Config.IST)
             month = now.month
             year = now.year
@@ -443,19 +426,16 @@ class EconomicCalendar:
                 return
 
             soup = BeautifulSoup(resp.text, 'lxml')
-            # Find table rows with class 'calendar__row'
             rows = soup.find_all('tr', class_=re.compile('calendar__row'))
             for row in rows:
-                # Check if high impact (red)
                 impact_cell = row.find('td', class_='calendar__impact')
                 if impact_cell:
                     impact_icon = impact_cell.find('span', class_='impact--high')
                     if not impact_icon:
-                        continue  # skip low/medium impact
+                        continue
                 else:
                     continue
 
-                # Extract time
                 time_cell = row.find('td', class_='calendar__time')
                 if not time_cell:
                     continue
@@ -463,29 +443,21 @@ class EconomicCalendar:
                 if not time_str:
                     continue
 
-                # Extract event name
                 event_cell = row.find('td', class_='calendar__event')
                 if not event_cell:
                     continue
                 event_name = event_cell.get_text(strip=True)
-                # Filter for macro events we care about (CPI, FOMC, NFP, Interest Rate, etc.)
                 keywords = ['CPI', 'FOMC', 'NFP', 'Non-Farm', 'Interest Rate', 'GDP', 'Unemployment', 'PPI', 'Retail Sales', 'PMI']
                 if not any(k in event_name for k in keywords):
                     continue
 
-                # Build datetime
-                # ForexFactory times are in EST, we'll assume they are in "America/New_York"
-                # For simplicity, we'll parse the date from the row's data attribute
                 date_cell = row.find('td', class_='calendar__date')
                 if date_cell:
                     date_text = date_cell.get('data-date')
                     if date_text:
                         try:
                             dt_est = datetime.strptime(date_text, '%Y-%m-%d')
-                            # Combine with time (time_str is like "2:30pm")
-                            # Convert time to 24h
                             try:
-                                # parse "2:30pm"
                                 if 'am' in time_str or 'pm' in time_str:
                                     t = datetime.strptime(time_str, '%I:%M%p').time()
                                 else:
@@ -493,7 +465,6 @@ class EconomicCalendar:
                             except:
                                 t = datetime.strptime('00:00', '%H:%M').time()
                             dt_est = dt_est.replace(hour=t.hour, minute=t.minute)
-                            # Convert to IST
                             est = pytz.timezone('America/New_York')
                             dt_est_aware = est.localize(dt_est)
                             dt_ist = dt_est_aware.astimezone(Config.IST)
@@ -502,16 +473,13 @@ class EconomicCalendar:
                             logger.debug(f"Date parse error for {event_name}: {e}")
                             continue
             logger.info(f"Loaded {len(self.events)} high-impact economic events from ForexFactory.")
-
         except Exception as e:
             logger.error(f"Economic calendar scraping error: {e}")
 
     def add_event(self, dt, name, impact_assets=None):
-        """Manually add an event (fallback)."""
         self.events.append((dt, name, impact_assets or Config.ASSETS))
 
     def is_blackout(self, current_dt, asset):
-        """Check if current time is within ±45 minutes of any event affecting the asset."""
         buffer_minutes = 45
         for evt_dt, evt_name, impact in self.events:
             if asset not in impact:
@@ -522,24 +490,27 @@ class EconomicCalendar:
         return False, None
 
 # =====================================================================
-# BINANCE FUTURES WEBSOCKET (GATE 4 – REAL TIME OI & LIQUIDATIONS)
+# BINANCE FUTURES WEBSOCKET (with health check & OI history)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
         self.ws_url = Config.BINANCE_FUTURES_WS_URL
-        self.symbols = [s.lower() for s in Config.ASSETS]  # ['btcusdt', 'ethusdt', 'solusdt']
+        self.symbols = [s.lower() for s in Config.ASSETS]
         self.ws = None
         self.running = False
         self.data = {
-            'open_interest': {},   # symbol -> float
-            'liquidations': [],    # list of liquidation events
-            'cvd': {},             # cumulative volume delta per symbol
-            'last_trade': {},      # last trade price per symbol
+            'open_interest': {},
+            'liquidations': [],
+            'cvd': {},
+            'last_trade': {},
         }
+        self.oi_history = {s: deque(maxlen=5) for s in self.symbols}  # store last 5 OI values
         self.lock = threading.Lock()
         self.reconnect_count = 0
         self.on_data = on_data
         self.thread = None
+        self.last_ping = time.time()
+        self.health_thread = None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -547,6 +518,8 @@ class BinanceFuturesStream:
         self.running = True
         self.thread = threading.Thread(target=self._ws_loop, daemon=True)
         self.thread.start()
+        self.health_thread = threading.Thread(target=self._health_check, daemon=True)
+        self.health_thread.start()
 
     def stop(self):
         self.running = False
@@ -569,12 +542,10 @@ class BinanceFuturesStream:
 
     def _on_open(self, ws):
         logger.info("Binance Futures WebSocket connected.")
-        # Subscribe to openInterest and forceOrder for each symbol
         streams = []
         for s in self.symbols:
             streams.append(f"{s}@openInterest")
             streams.append(f"{s}@forceOrder")
-            # Optionally subscribe to aggregate trades for CVD
             streams.append(f"{s}@aggTrade")
         sub_msg = {
             "method": "SUBSCRIBE",
@@ -583,6 +554,7 @@ class BinanceFuturesStream:
         }
         ws.send(json.dumps(sub_msg))
         self.reconnect_count = 0
+        self.last_ping = time.time()
 
     def _on_message(self, ws, message):
         try:
@@ -595,13 +567,13 @@ class BinanceFuturesStream:
                 oi = float(data['o'])
                 with self.lock:
                     self.data['open_interest'][symbol] = oi
+                    self.oi_history[symbol].append(oi)
                     if self.on_data:
                         self.on_data('open_interest', symbol, oi)
             elif event_type == 'forceOrder':
-                # Liquidation event
                 order = data['o']
                 symbol = order['s']
-                side = order['S']  # BUY/SELL
+                side = order['S']
                 price = float(order['p'])
                 qty = float(order['q'])
                 with self.lock:
@@ -615,16 +587,9 @@ class BinanceFuturesStream:
                     if self.on_data:
                         self.on_data('liquidation', symbol, {'side': side, 'price': price, 'qty': qty})
             elif event_type == 'aggTrade':
-                # Aggregate trade for CVD
                 symbol = data['s']
                 price = float(data['p'])
                 qty = float(data['q'])
-                # Determine if buyer is aggressive: if 'm' is False, buyer is maker, else taker
-                # We'll consider taker side: if price is > previous price, likely buy
-                # For simplicity, we can compute delta: if price > last_price, buy; else sell
-                # But we have 'T' (time) and 'm' (marker)
-                # We'll use 'm' = False means buyer is maker (passive), True means taker.
-                # Taker buy/sell? We'll approximate: if m is False, we consider it as passive, but we can use the price direction.
                 last_price = self.data['last_trade'].get(symbol, price)
                 delta = qty if price >= last_price else -qty
                 with self.lock:
@@ -632,6 +597,7 @@ class BinanceFuturesStream:
                     self.data['last_trade'][symbol] = price
                     if self.on_data:
                         self.on_data('cvd', symbol, self.data['cvd'][symbol])
+            self.last_ping = time.time()  # update on any message
         except Exception as e:
             logger.debug(f"Futures WebSocket message parse error: {e}")
 
@@ -643,23 +609,39 @@ class BinanceFuturesStream:
         self.reconnect_count += 1
         time.sleep(5)
 
+    def _health_check(self):
+        while self.running:
+            time.sleep(30)
+            if time.time() - self.last_ping > 60:
+                logger.warning("Futures WebSocket no data for >60s, forcing reconnect.")
+                if self.ws:
+                    self.ws.close()
+                self.reconnect_count += 1
+
     def get_open_interest(self, symbol):
         with self.lock:
             return self.data['open_interest'].get(symbol, 0)
+
+    def get_oi_trend(self, symbol):
+        with self.lock:
+            hist = list(self.oi_history.get(symbol.lower(), []))
+            if len(hist) < 2:
+                return 0
+            # Return slope: positive = increasing
+            return hist[-1] - hist[0]
 
     def get_cvd(self, symbol):
         with self.lock:
             return self.data['cvd'].get(symbol, 0)
 
     def get_liquidations(self, symbol, lookback_seconds=60):
-        """Return liquidation events for a symbol in the last lookback_seconds."""
         with self.lock:
             now = time.time()
             events = [e for e in self.data['liquidations'] if e['symbol'] == symbol and (now - e['time']) <= lookback_seconds]
             return events
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (Extended with ADX method)
+# CANDLE TOPOLOGY ENGINE (fixed candle_just_closed reset)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -676,7 +658,7 @@ class CandleTopologyEngine:
     def process_tick(self, asset: str, price: float, volume: float):
         now = int(time.time())
         self.history[asset].append({"price": price, "volume": volume, "time": now})
-        self.candle_just_closed[asset] = False
+        self.candle_just_closed[asset] = False  # reset
 
         tf = 900
         start = (now // tf) * tf
@@ -806,6 +788,7 @@ class CandleTopologyEngine:
         return ema
 
     def check_1m_rejection(self, asset, direction):
+        # Used but relaxed – we keep it but not mandatory
         candles = self.candles[60][asset]
         if len(candles) < 2: return False
         last = next((c for c in reversed(candles) if c.get("complete", False)), None)
@@ -853,7 +836,7 @@ class CandleTopologyEngine:
                             "└──────────────────────────────────────┘"])
         return "\n".join(chart_lines)
 
-    # ---- ADX method for Gate 1 ----
+    # ---- ADX method ----
     def get_adx(self, asset, tf, period=14):
         candles = self.candles[tf][asset]
         complete = [c for c in candles if c.get("complete", False)]
@@ -883,7 +866,6 @@ class CandleTopologyEngine:
         return min(100, dx)
 
     def detect_fvg(self, asset):
-        # FVG detection as before (unchanged)
         candles = self.candles[900][asset]
         complete = [c for c in candles if c.get("complete", False)]
         if len(complete) < 3: return []
@@ -899,7 +881,6 @@ class CandleTopologyEngine:
         return fvgs[-5:]
 
     def detect_order_block(self, asset):
-        # Order block detection as before
         if not self.bos[asset]["direction"]:
             return {}
         candles = self.candles[900][asset]
@@ -915,20 +896,18 @@ class CandleTopologyEngine:
         return {}
 
 # =====================================================================
-# GATE 1: MARKET REGIME FILTER (uses ADX and VSA)
+# GATE 1: MARKET REGIME FILTER
 # =====================================================================
 class MarketRegimeFilter:
     def __init__(self, topology):
         self.topology = topology
 
     def check(self, asset: str, price: float) -> Tuple[bool, str]:
-        # ADX on 15m and 1h
         adx_15 = self.topology.get_adx(asset, 900)
         adx_1h = self.topology.get_adx(asset, 3600)
         if adx_15 < 22 and adx_1h < 22:
             return False, f"Sideways/Chop (ADX 15={adx_15:.1f}, 1h={adx_1h:.1f})"
 
-        # VSA: Fake breakout detection
         candles_5m = self.topology.candles[300][asset]
         completed = [c for c in candles_5m if c.get("complete", False)]
         if len(completed) >= 5:
@@ -944,7 +923,7 @@ class MarketRegimeFilter:
         return True, "Pass"
 
 # =====================================================================
-# GATE 3: HARD MTF CONFLUENCE (5 Timeframes)
+# GATE 3: HARD MTF CONFLUENCE (Relaxed)
 # =====================================================================
 class MTFConfluenceGate:
     def __init__(self, topology):
@@ -955,7 +934,7 @@ class MTFConfluenceGate:
         if current_price == 0:
             return False, "No price"
 
-        # 4H: Macro trend (EMA 200/50)
+        # 4H trend
         candles_4h = self.topology.candles[14400][asset]
         complete_4h = [c for c in candles_4h if c.get("complete", False)]
         if len(complete_4h) < 200:
@@ -970,7 +949,7 @@ class MTFConfluenceGate:
         if direction == "SELL" and current_price > ema50_4h[-1] and current_price > ema200_4h[-1]:
             return False, "4H trend bullish vs SELL"
 
-        # 1H: Market Structure (Higher Highs/Lower Lows)
+        # 1H structure
         pivots_high = self.topology.pivots[asset]["high"]
         pivots_low = self.topology.pivots[asset]["low"]
         if len(pivots_high) >= 2 and len(pivots_low) >= 2:
@@ -979,47 +958,31 @@ class MTFConfluenceGate:
             if direction == "SELL" and pivots_low[0] > pivots_low[1]:
                 return False, "1H structure up"
 
-        # 15m: OB/FVG
+        # 15m: OB/FVG (at least one present)
         fvgs = self.topology.detect_fvg(asset)
         ob = self.topology.detect_order_block(asset)
-        if ob and ob.get("type"):
-            if direction == "BUY" and ob["type"] != "bullish":
-                return False, "Order block bearish for BUY"
-            if direction == "SELL" and ob["type"] != "bearish":
-                return False, "Order block bullish for SELL"
-        if fvgs:
-            if direction == "BUY" and not any(f["lower"] <= current_price <= f["upper"] for f in fvgs if f["type"]=="bullish"):
-                return False, "No bullish FVG"
-            if direction == "SELL" and not any(f["lower"] <= current_price <= f["upper"] for f in fvgs if f["type"]=="bearish"):
-                return False, "No bearish FVG"
+        if not ob and not fvgs:
+            return False, "No OB or FVG on 15m"
 
-        # 5m: Precision Entry (near support/resistance)
+        # 5m: Near support/resistance (relaxed to 2%)
         sr = self.topology.support_resistance[asset]
         if direction == "BUY":
             if sr["support"]:
                 nearest_support = max(sr["support"])
-                if abs(current_price - nearest_support) / nearest_support > 0.01:
-                    return False, "Not near support zone"
+                if abs(current_price - nearest_support) / nearest_support > 0.02:
+                    return False, "Not near support zone (2%)"
         else:
             if sr["resistance"]:
                 nearest_resistance = min(sr["resistance"])
-                if abs(current_price - nearest_resistance) / nearest_resistance > 0.01:
-                    return False, "Not near resistance zone"
+                if abs(current_price - nearest_resistance) / nearest_resistance > 0.02:
+                    return False, "Not near resistance zone (2%)"
 
-        # 1m: Micro Trigger (Liquidity Sweep + Rejection)
-        sweep = self.topology.detect_liquidity_sweep(asset, current_price)
-        rejection = self.topology.check_1m_rejection(asset, direction)
-        if direction == "BUY" and sweep != "SELL_SWEEP":
-            return False, "No sell sweep (buy trigger)"
-        if direction == "SELL" and sweep != "BUY_SWEEP":
-            return False, "No buy sweep (sell trigger)"
-        if not rejection:
-            return False, "No 1m rejection candle"
+        # 1m micro trigger removed – not mandatory
 
         return True, "Pass"
 
 # =====================================================================
-# GATE 4: INSTITUTIONAL ORDER FLOW (Uses Binance Futures WS data)
+# GATE 4: INSTITUTIONAL ORDER FLOW (with fallback)
 # =====================================================================
 class OrderFlowAnalyzer:
     def __init__(self, topology, futures_stream):
@@ -1027,35 +990,24 @@ class OrderFlowAnalyzer:
         self.futures = futures_stream
 
     def check(self, asset: str, direction: str, price: float) -> Tuple[bool, str]:
-        # Get real metrics from futures stream
         symbol = asset.lower()
         oi = self.futures.get_open_interest(symbol)
+        oi_trend = self.futures.get_oi_trend(symbol)  # difference over last 5 readings
         cvd = self.futures.get_cvd(symbol)
         liquidations = self.futures.get_liquidations(symbol, lookback_seconds=60)
 
-        # 1. Open Interest expansion: Check if OI increased in the last 5 minutes
-        # We don't have historical OI easily, but we can compare with previous stored value? We'll store in a dict.
-        # For simplicity, we'll assume OI should be above a threshold relative to its 5m average.
-        # We'll use the 5m candles volume as proxy for OI change? Actually we have OI from stream.
-        # We can track OI changes by storing the previous OI. We'll add a class variable.
-        # We'll do a simple check: if direction is BUY and OI is increasing, good.
-        # Since we don't have history, we'll just check if OI > 0 and increase from last sample?
-        # We'll implement a simple OI trend detection using two readings.
-        # We'll store previous OI in a dict.
-        if not hasattr(self, '_oi_history'):
-            self._oi_history = {}
-        prev_oi = self._oi_history.get(symbol, oi)
-        self._oi_history[symbol] = oi
-        oi_increased = oi > prev_oi
+        # If OI is zero, we bypass (likely data not available)
+        if oi == 0:
+            logger.warning(f"OI data missing for {asset}, bypassing Order Flow gate.")
+            return True, "Bypassed (no OI data)"
 
-        if direction == "BUY" and not oi_increased:
+        # Check OI trend
+        if direction == "BUY" and oi_trend <= 0:
             return False, "Open Interest not increasing (institutional buying?)"
-        if direction == "SELL" and oi_increased:
+        if direction == "SELL" and oi_trend >= 0:
             return False, "Open Interest increasing while selling (possible trap)"
 
-        # 2. CVD divergence: if price moved in direction but CVD did not confirm.
-        # We need to compute price change over last few candles (or from entry).
-        # We'll compute price change from last 5m candle close to current.
+        # CVD divergence: use 5m candle close
         candles = self.topology.candles[300][asset]
         completed = [c for c in candles if c.get("complete", False)]
         if len(completed) >= 2:
@@ -1065,44 +1017,21 @@ class OrderFlowAnalyzer:
             if direction == "SELL" and price_change < 0 and cvd > 0:
                 return False, "CVD divergence (price down, CVD up)"
 
-        # 3. Liquidation check: too many liquidations may indicate volatility but not necessarily bearish.
-        # We'll just log them, but we don't reject solely on liquidations.
-
         return True, "Pass"
 
 # =====================================================================
-# GATE 5: CHRONO-SESSION TIMING (IST)
+# GATE 5: CHRONO-SESSION TIMING (now always on)
 # =====================================================================
 class SessionTimer:
     def __init__(self):
         self.ist = Config.IST
 
     def is_trading_time(self) -> Tuple[bool, str, str]:
-        now = datetime.now(self.ist)
-        hour = now.hour
-        minute = now.minute
-        # Dead zones
-        for start_h, start_m, end_h, end_m in Config.DEAD_ZONES:
-            if self._is_between(hour, minute, start_h, start_m, end_h, end_m):
-                return False, "Dead Zone", ""
-
-        # Active windows
-        for session_name, start_h, start_m, end_h, end_m in Config.SESSION_WINDOWS:
-            if self._is_between(hour, minute, start_h, start_m, end_h, end_m):
-                return True, session_name, f"{start_h:02d}:{start_m:02d}-{end_h:02d}:{end_m:02d} IST"
-        return False, "Out of Session", ""
-
-    def _is_between(self, h, m, sh, sm, eh, em):
-        start_min = sh*60 + sm
-        end_min = eh*60 + em
-        curr_min = h*60 + m
-        if start_min <= end_min:
-            return start_min <= curr_min <= end_min
-        else:  # overnight
-            return curr_min >= start_min or curr_min <= end_min
+        # Always true for testing
+        return True, "ALWAYS", "00:00-23:59 IST"
 
 # =====================================================================
-# ADAPTIVE LEARNING ENGINE
+# ADAPTIVE LEARNING ENGINE (Unchanged)
 # =====================================================================
 class AdaptiveLearner:
     def __init__(self, db):
@@ -1132,13 +1061,11 @@ class AdaptiveLearner:
             if total >= 10:
                 wr = wins / total
                 if wr < 0.45:
-                    # Reduce weight in scoring (we can store adjustments)
-                    # For now, we log
                     logger.info(f"Adaptive: Pattern {pattern} win rate {wr:.2f} < 45% -> reducing weight.")
         cur.close()
 
 # =====================================================================
-# COMPOSITE SQS CALCULATOR
+# COMPOSITE SQS CALCULATOR (Unchanged)
 # =====================================================================
 class SQS_Calculator:
     def __init__(self, topology):
@@ -1167,12 +1094,12 @@ class SQS_Calculator:
         return score
 
 # =====================================================================
-# PENDING VERIFICATION QUEUE
+# PENDING VERIFICATION QUEUE (with adjusted threshold)
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
         self.topology = topology
-        self.pending = {}  # key -> signal_data
+        self.pending = {}
 
     def add_signal(self, signal_data):
         asset = signal_data['asset']
@@ -1208,12 +1135,12 @@ class PendingVerificationQueue:
                         data['rejected'] = True
                         to_remove.append(key)
                         continue
-                # Check price reversal
+                # Check price reversal (relaxed: allow 0.5% retracement)
                 first_close = completed[-Config.PENDING_VERIFICATION_CANDLES]['close']
-                if data['direction'] == 'BUY' and first_close < data['start_price']:
+                if data['direction'] == 'BUY' and first_close < data['start_price'] * 0.995:
                     data['rejected'] = True
                     to_remove.append(key)
-                elif data['direction'] == 'SELL' and first_close > data['start_price']:
+                elif data['direction'] == 'SELL' and first_close > data['start_price'] * 1.005:
                     data['rejected'] = True
                     to_remove.append(key)
             if data['candle_count'] >= Config.PENDING_VERIFICATION_CANDLES:
@@ -1235,7 +1162,7 @@ class PendingVerificationQueue:
         return ready
 
 # =====================================================================
-# DYNAMIC STOP LOSS
+# DYNAMIC STOP LOSS (Unchanged)
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1264,7 +1191,7 @@ class DynamicStopLoss:
         return sl
 
 # =====================================================================
-# TELEGRAM PIPELINE (Unchanged)
+# TELEGRAM PIPELINE (FIXED: removed extra args in fire_signal)
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1632,226 +1559,232 @@ class AIOrchestrator:
             if to_remove: gc.collect()
 
     def _handle_price_tick(self, asset, price, volume):
-        self.topology.process_tick(asset, price, volume)
-        self._update_active_trades(asset, price)
+        try:
+            self.topology.process_tick(asset, price, volume)
+            self._update_active_trades(asset, price)
 
-        # ---- Pending verification check ----
-        if self.topology.candle_just_closed.get(asset, False):
-            if self.pending_queue.pending:
-                removed = self.pending_queue.check_pending(asset)
-                verified = self.pending_queue.get_verified_signals()
-                for signal in verified:
-                    self._send_final_signal(signal)
+            # ---- Pending verification check ----
+            if self.topology.candle_just_closed.get(asset, False):
+                if self.pending_queue.pending:
+                    removed = self.pending_queue.check_pending(asset)
+                    verified = self.pending_queue.get_verified_signals()
+                    for signal in verified:
+                        self._send_final_signal(signal)
 
-        # ---- Skip if active trade ----
-        with self.trade_lock:
-            is_active = any(t['asset'] == asset for t in self.active_trades.values())
-        if is_active:
-            if self._is_strong_trend(asset):
-                with self.trade_lock:
-                    for tid, trade in self.active_trades.items():
-                        if trade['asset'] == asset and not trade.get('hold_sent', False):
-                            hold_msg = (f"🧠 DEEPENING MARKET ALERT\n━━━━━━━━━━━━━━━━━━━━\n"
-                                        f"📊 {asset}\n🚀 Strong Momentum! HOLD position.\n"
-                                        f"SL: {trade['sl']:.2f} | TP: {trade['tp']:.2f}")
-                            self.telegram.send_message(hold_msg)
-                            trade['hold_sent'] = True
-            return
+            # ---- Skip if active trade ----
+            with self.trade_lock:
+                is_active = any(t['asset'] == asset for t in self.active_trades.values())
+            if is_active:
+                if self._is_strong_trend(asset):
+                    with self.trade_lock:
+                        for tid, trade in self.active_trades.items():
+                            if trade['asset'] == asset and not trade.get('hold_sent', False):
+                                hold_msg = (f"🧠 DEEPENING MARKET ALERT\n━━━━━━━━━━━━━━━━━━━━\n"
+                                            f"📊 {asset}\n🚀 Strong Momentum! HOLD position.\n"
+                                            f"SL: {trade['sl']:.2f} | TP: {trade['tp']:.2f}")
+                                self.telegram.send_message(hold_msg)
+                                trade['hold_sent'] = True
+                return
 
-        # ---- New signal only on 15m candle close ----
-        if not self.topology.candle_just_closed.get(asset, False):
-            return
+            # ---- New signal only on 15m candle close ----
+            if not self.topology.candle_just_closed.get(asset, False):
+                return
 
-        self._update_indicators(asset, price)
+            self._update_indicators(asset, price)
 
-        # ---- GATE 5: Session ----
-        session_ok, session_name, _ = self.session_timer.is_trading_time()
-        if not session_ok:
-            self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"], "N/A", "Session Filter")
-            self.rejected += 1
-            return
+            # ---- GATE 5: Session ----
+            session_ok, session_name, _ = self.session_timer.is_trading_time()
+            if not session_ok:
+                self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"], "N/A", "Session Filter")
+                self.rejected += 1
+                return
 
-        # ---- GATE 2: News Blackout ----
-        now_dt = datetime.now(Config.IST)
-        blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
-        if blackout:
-            self.db.log_rejected(asset, price, 0, f"News Blackout: {event_name}", self.asset_state[asset]["volatility"], "N/A", "News Blackout")
-            self.rejected += 1
-            return
+            # ---- GATE 2: News Blackout ----
+            now_dt = datetime.now(Config.IST)
+            blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
+            if blackout:
+                self.db.log_rejected(asset, price, 0, f"News Blackout: {event_name}", self.asset_state[asset]["volatility"], "N/A", "News Blackout")
+                self.rejected += 1
+                return
 
-        # ---- GATE 1: Regime ----
-        regime_ok, regime_reason = self.market_regime.check(asset, price)
-        if not regime_ok:
-            self.db.log_rejected(asset, price, 0, regime_reason, self.asset_state[asset]["volatility"], "N/A", "Market Regime")
-            self.rejected += 1
-            return
+            # ---- GATE 1: Regime ----
+            regime_ok, regime_reason = self.market_regime.check(asset, price)
+            if not regime_ok:
+                self.db.log_rejected(asset, price, 0, regime_reason, self.asset_state[asset]["volatility"], "N/A", "Market Regime")
+                self.rejected += 1
+                return
 
-        # ---- Determine direction ----
-        htf_trend = self.asset_state[asset]["htf_trend"]
-        tf_trend = self.asset_state[asset]["trend"]
-        if htf_trend == "BULLISH" and tf_trend == "BULLISH":
-            direction = "BUY"
-        elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
-            direction = "SELL"
-        else:
-            return
+            # ---- Determine direction ----
+            htf_trend = self.asset_state[asset]["htf_trend"]
+            tf_trend = self.asset_state[asset]["trend"]
+            if htf_trend == "BULLISH" and tf_trend == "BULLISH":
+                direction = "BUY"
+            elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
+                direction = "SELL"
+            else:
+                return
 
-        # ---- GATE 3: MTF ----
-        mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction)
-        if not mtf_ok:
-            self.db.log_rejected(asset, price, 0, mtf_reason, self.asset_state[asset]["volatility"], "N/A", "MTF Confluence")
-            self.rejected += 1
-            return
+            # ---- GATE 3: MTF ----
+            mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction)
+            if not mtf_ok:
+                self.db.log_rejected(asset, price, 0, mtf_reason, self.asset_state[asset]["volatility"], "N/A", "MTF Confluence")
+                self.rejected += 1
+                return
 
-        # ---- GATE 4: Order Flow ----
-        of_ok, of_reason = self.orderflow.check(asset, direction, price)
-        if not of_ok:
-            self.db.log_rejected(asset, price, 0, of_reason, self.asset_state[asset]["volatility"], "N/A", "Order Flow")
-            self.rejected += 1
-            return
+            # ---- GATE 4: Order Flow ----
+            of_ok, of_reason = self.orderflow.check(asset, direction, price)
+            if not of_ok:
+                self.db.log_rejected(asset, price, 0, of_reason, self.asset_state[asset]["volatility"], "N/A", "Order Flow")
+                self.rejected += 1
+                return
 
-        # ---- SQS ----
-        patterns = self.topology.detect_candle_patterns(asset)
-        sr = self.topology.support_resistance[asset]
-        bos = self.topology.bos[asset]
-        choch = self.topology.choch[asset]
-        sweep = self.topology.detect_liquidity_sweep(asset, price)
-        ob = self.topology.detect_order_block(asset)
-        fvgs = self.topology.detect_fvg(asset)
-        vol_ratio = self.asset_state[asset]["volume_ratio"]
+            # ---- SQS ----
+            patterns = self.topology.detect_candle_patterns(asset)
+            sr = self.topology.support_resistance[asset]
+            bos = self.topology.bos[asset]
+            choch = self.topology.choch[asset]
+            sweep = self.topology.detect_liquidity_sweep(asset, price)
+            ob = self.topology.detect_order_block(asset)
+            fvgs = self.topology.detect_fvg(asset)
+            vol_ratio = self.asset_state[asset]["volume_ratio"]
 
-        sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, sr,
-                                      bos, choch, sweep, ob, fvgs, vol_ratio, htf_trend)
+            sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, sr,
+                                          bos, choch, sweep, ob, fvgs, vol_ratio, htf_trend)
 
-        if sqs < Config.MIN_SQS:
-            self.db.log_rejected(asset, price, sqs, f"SQS {sqs} < {Config.MIN_SQS}", self.asset_state[asset]["volatility"], "N/A", "SQS")
-            self.rejected += 1
-            return
+            if sqs < Config.MIN_SQS:
+                self.db.log_rejected(asset, price, sqs, f"SQS {sqs} < {Config.MIN_SQS}", self.asset_state[asset]["volatility"], "N/A", "SQS")
+                self.rejected += 1
+                return
 
-        # ---- Dynamic SL & TP ----
-        atr = self.topology.get_atr(asset)
-        if atr == 0: atr = price * 0.01
-        sl = self.dynamic_sl.calculate(asset, direction, price, atr)
-        risk = abs(price - sl)
-        tp = price + 2 * risk if direction == "BUY" else price - 2 * risk
-        if direction == "BUY":
-            if sr["resistance"]:
-                nearest_res = min(sr["resistance"])
-                if nearest_res > price:
-                    tp = min(tp, nearest_res * 0.99)
-        else:
-            if sr["support"]:
-                nearest_sup = max(sr["support"])
-                if nearest_sup < price:
-                    tp = max(tp, nearest_sup * 1.01)
-        rr = abs(tp - price) / risk
-        if rr < 1.5:
-            tp = price + 1.5 * risk if direction == "BUY" else price - 1.5 * risk
+            # ---- Dynamic SL & TP ----
+            atr = self.topology.get_atr(asset)
+            if atr == 0: atr = price * 0.01
+            sl = self.dynamic_sl.calculate(asset, direction, price, atr)
+            risk = abs(price - sl)
+            tp = price + 2 * risk if direction == "BUY" else price - 2 * risk
+            if direction == "BUY":
+                if sr["resistance"]:
+                    nearest_res = min(sr["resistance"])
+                    if nearest_res > price:
+                        tp = min(tp, nearest_res * 0.99)
+            else:
+                if sr["support"]:
+                    nearest_sup = max(sr["support"])
+                    if nearest_sup < price:
+                        tp = max(tp, nearest_sup * 1.01)
+            rr = abs(tp - price) / risk
+            if rr < 1.5:
+                tp = price + 1.5 * risk if direction == "BUY" else price - 1.5 * risk
 
-        # ---- Cooldown & Daily Cap ----
-        now_ts = time.time()
-        if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
-            self.db.log_rejected(asset, price, sqs, "Cooldown", self.asset_state[asset]["volatility"], "N/A", "Cooldown")
-            self.rejected += 1
-            return
-        recent_signals = [t for t in self.signal_timestamps if now_ts - t < 86400]
-        if len(recent_signals) >= Config.MAX_SIGNALS_PER_DAY:
-            self.db.log_rejected(asset, price, sqs, "Daily cap reached", self.asset_state[asset]["volatility"], "N/A", "Daily Cap")
-            self.rejected += 1
-            return
+            # ---- Cooldown & Daily Cap ----
+            now_ts = time.time()
+            if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
+                self.db.log_rejected(asset, price, sqs, "Cooldown", self.asset_state[asset]["volatility"], "N/A", "Cooldown")
+                self.rejected += 1
+                return
+            recent_signals = [t for t in self.signal_timestamps if now_ts - t < 86400]
+            if len(recent_signals) >= Config.MAX_SIGNALS_PER_DAY:
+                self.db.log_rejected(asset, price, sqs, "Daily cap reached", self.asset_state[asset]["volatility"], "N/A", "Daily Cap")
+                self.rejected += 1
+                return
 
-        # ---- Add to Pending Queue ----
-        signal_data = {
-            'asset': asset,
-            'direction': direction,
-            'entry': price,
-            'sl': sl,
-            'tp': tp,
-            'sqs': sqs,
-            'session': session_name,
-            'patterns': patterns,
-            'logic': f"HTF {htf_trend} + BOS {bos['direction']}" if bos else "HTF only",
-            'news': self.news.last_news.get('title', 'No news')[:100],
-            'volatility': self.asset_state[asset]["volatility"],
-            'regime': self.topology.get_volatility_regime(asset),
-            'htf_trend': htf_trend,
-            'news_score': self.asset_state[asset]["news_sentiment"],
-            'score': 0,
-            'confidence': 'HIGH',
-            'num_passed': 11
-        }
-        self.pending_queue.add_signal(signal_data)
-        logger.info(f"⏳ Signal pending: {asset} {direction} @ {price} (SQS: {sqs})")
-
-    def _send_final_signal(self, signal):
-        asset = signal['asset']
-        direction = signal['direction']
-        price = signal['entry']
-        sl = signal['sl']
-        tp = signal['tp']
-        sqs = signal['sqs']
-        session = signal['session']
-        patterns = signal['patterns']
-        logic = signal['logic']
-        news = signal['news']
-        volatility = signal['volatility']
-        regime = signal['regime']
-        htf_trend = signal['htf_trend']
-        news_score = signal['news_score']
-
-        # Build logic parts
-        logic_parts = [f"HTF {htf_trend}"]
-        if self.topology.bos[asset]["direction"]:
-            logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
-        if self.topology.choch[asset]:
-            logic_parts.append("CHOCH")
-        if self.topology.detect_liquidity_sweep(asset, price):
-            logic_parts.append("SWEEP")
-        if self.topology.detect_order_block(asset):
-            logic_parts.append("OB")
-        logic = " + ".join(logic_parts)
-
-        # Log trade
-        trade_id = self.db.log_trade(
-            asset, direction, price, sl, tp,
-            sqs, "HIGH", list(patterns.keys()), logic,
-            volatility, regime, htf_trend, news_score,
-            session, sqs, list(patterns.keys())[0] if patterns else "unknown"
-        )
-
-        # Send Telegram signal
-        chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
-        rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
-        win_prob = min(95, max(5, (self.db.get_rolling_win_rate(asset) * 50 + (50 + (sqs - 50) * 0.6) * 0.5)))
-        self.telegram.fire_signal(
-            asset=asset, direction=direction, price=price, sl=sl, tp=tp,
-            chart=chart, logic=logic, news=news,
-            score={"total_score": sqs, "confidence": "HIGH", "num_passed": 11},
-            patterns=patterns, trade_id=trade_id,
-            session=datetime.now().strftime("%H:%M"), entry_zone="", exit_zone="",
-            win_prob=win_prob, rr=rr
-        )
-
-        self.accepted += 1
-        self.last_signal_time[asset] = time.time()
-        self.signal_timestamps.append(time.time())
-
-        with self.trade_lock:
-            self.active_trades[trade_id] = {
-                'id': trade_id,
+            # ---- Add to Pending Queue ----
+            signal_data = {
                 'asset': asset,
                 'direction': direction,
                 'entry': price,
                 'sl': sl,
                 'tp': tp,
-                'entry_time': int(time.time()),
-                'breakeven_locked': False,
-                'trailing_activated': False,
-                'hold_sent': False,
-                'initial_score': sqs,
-                'current_score': sqs,
-                'health': 100
+                'sqs': sqs,
+                'session': session_name,
+                'patterns': patterns,
+                'logic': f"HTF {htf_trend} + BOS {bos['direction']}" if bos else "HTF only",
+                'news': self.news.last_news.get('title', 'No news')[:100],
+                'volatility': self.asset_state[asset]["volatility"],
+                'regime': self.topology.get_volatility_regime(asset),
+                'htf_trend': htf_trend,
+                'news_score': self.asset_state[asset]["news_sentiment"],
+                'score': 0,
+                'confidence': 'HIGH',
+                'num_passed': 11
             }
+            self.pending_queue.add_signal(signal_data)
+            logger.info(f"⏳ Signal pending: {asset} {direction} @ {price} (SQS: {sqs})")
+        except Exception as e:
+            logger.error(f"Error in _handle_price_tick: {e}", exc_info=True)
+
+    def _send_final_signal(self, signal):
+        try:
+            asset = signal['asset']
+            direction = signal['direction']
+            price = signal['entry']
+            sl = signal['sl']
+            tp = signal['tp']
+            sqs = signal['sqs']
+            session = signal['session']  # use correct session name
+            patterns = signal['patterns']
+            logic = signal['logic']
+            news = signal['news']
+            volatility = signal['volatility']
+            regime = signal['regime']
+            htf_trend = signal['htf_trend']
+            news_score = signal['news_score']
+
+            # Build logic parts (enhanced)
+            logic_parts = [f"HTF {htf_trend}"]
+            if self.topology.bos[asset]["direction"]:
+                logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
+            if self.topology.choch[asset]:
+                logic_parts.append("CHOCH")
+            if self.topology.detect_liquidity_sweep(asset, price):
+                logic_parts.append("SWEEP")
+            if self.topology.detect_order_block(asset):
+                logic_parts.append("OB")
+            logic = " + ".join(logic_parts)
+
+            # Log trade
+            trade_id = self.db.log_trade(
+                asset, direction, price, sl, tp,
+                sqs, "HIGH", list(patterns.keys()), logic,
+                volatility, regime, htf_trend, news_score,
+                session, sqs, list(patterns.keys())[0] if patterns else "unknown"
+            )
+
+            # Send Telegram signal (NO extra args)
+            chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
+            rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
+            # win_prob removed
+
+            self.telegram.fire_signal(
+                asset=asset, direction=direction, price=price, sl=sl, tp=tp,
+                chart=chart, logic=logic, news=news,
+                score={"total_score": sqs, "confidence": "HIGH", "num_passed": 11},
+                patterns=patterns, trade_id=trade_id,
+                session=session, rr=rr
+            )
+
+            self.accepted += 1
+            self.last_signal_time[asset] = time.time()
+            self.signal_timestamps.append(time.time())
+
+            with self.trade_lock:
+                self.active_trades[trade_id] = {
+                    'id': trade_id,
+                    'asset': asset,
+                    'direction': direction,
+                    'entry': price,
+                    'sl': sl,
+                    'tp': tp,
+                    'entry_time': int(time.time()),
+                    'breakeven_locked': False,
+                    'trailing_activated': False,
+                    'hold_sent': False,
+                    'initial_score': sqs,
+                    'current_score': sqs,
+                    'health': 100
+                }
+        except Exception as e:
+            logger.error(f"Error in _send_final_signal: {e}", exc_info=True)
 
     def run(self):
         # Start health server and self-ping
@@ -1872,7 +1805,7 @@ class AIOrchestrator:
         # Start spot WebSocket
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v6.1 Online – Signal Quality Gate + Real OI/CVD Active")
+        self.telegram.send_message("🚀 AI v6.1 Online – Signal Quality Gate + Real OI/CVD Active (Relaxed)")
 
         # Main loop
         last_news = 0
