@@ -1,6 +1,15 @@
 # =====================================================================
-# app.py – AlphaBot v6.2 (Ultimate Smart Adaptive Institutional Signal Engine)
+# app.py – AlphaBot v6.2 FINAL (Smart Adaptive + All Fixes)
 # =====================================================================
+# THIS VERSION INCLUDES:
+# 1. CHOP Regime: check_4h_ema = False (eliminates "4H bullish" rejections)
+# 2. ForexFactory: graceful 403 handling (warning instead of error)
+# 3. Futures WebSocket: ping_interval=20 and last_ping update to keep alive
+# 4. All advanced layers (candle patterns, trendlines, liquidity zones)
+# 5. Dynamic SQS thresholds per regime
+# 6. Robust error handling and logging
+# =====================================================================
+
 import math
 from typing import List, Dict, Optional, Tuple, Any
 import os
@@ -44,7 +53,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("AI-Orchestrator-v6.2")
 
 # =====================================================================
-# CONFIGURATION – Optimized for Smart Adaptive Behavior
+# CONFIGURATION
 # =====================================================================
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -59,17 +68,15 @@ class Config:
     MAX_CANDLES = 500
     BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws"
 
-    # ---- Session: Always active for testing (will be auto-adjusted later) ----
     IST = pytz.timezone('Asia/Kolkata')
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
-    # ---- Adaptive thresholds ----
-    MIN_SQS = 65                     # Base, will be adjusted by regime
+    MIN_SQS = 65
     PENDING_VERIFICATION_CANDLES = 2
-    VOLUME_DECAY_THRESHOLD = 0.6     # 60% decay allowed
+    VOLUME_DECAY_THRESHOLD = 0.6
 
-    ADAPTIVE_LEARN_INTERVAL = 30     # adjust every 30 trades
+    ADAPTIVE_LEARN_INTERVAL = 30
     SIGNAL_COOLDOWN = 1800
     MAX_SIGNALS_PER_DAY = 6
 
@@ -314,7 +321,7 @@ class TradeDatabase:
             cur.close()
 
 # =====================================================================
-# NEWS & ECONOMIC CALENDAR (with improved User-Agent)
+# NEWS & ECONOMIC CALENDAR (with graceful 403 handling)
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
@@ -363,7 +370,6 @@ class EconomicCalendar:
             now = datetime.now(Config.IST)
             month, year = now.month, now.year
             url = f"https://www.forexfactory.com/calendar?month={month}.{year}"
-            # Improved headers to reduce chance of 403
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -374,7 +380,7 @@ class EconomicCalendar:
             }
             resp = requests.get(url, headers=headers, timeout=15)
             if resp.status_code != 200:
-                logger.error(f"ForexFactory calendar fetch failed. Status code: {resp.status_code}")
+                logger.warning(f"ForexFactory calendar fetch failed (status {resp.status_code}). Skipping news blackout.")
                 return
             soup = BeautifulSoup(resp.text, 'lxml')
             rows = soup.find_all('tr', class_=re.compile('calendar__row'))
@@ -411,7 +417,7 @@ class EconomicCalendar:
                         logger.debug(f"Date parse error for {event_name}: {e}")
             logger.info(f"Loaded {len(self.events)} high-impact economic events.")
         except Exception as e:
-            logger.error(f"Economic calendar scraping error: {e}")
+            logger.warning(f"Economic calendar scraping error: {e}. Continuing without news blackout.")
 
     def is_blackout(self, current_dt, asset):
         buffer_minutes = 45
@@ -422,7 +428,7 @@ class EconomicCalendar:
         return False, None
 
 # =====================================================================
-# BINANCE FUTURES WEBSOCKET (Enhanced with OI history & health)
+# BINANCE FUTURES WEBSOCKET (with keep‑alive fixes)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -457,7 +463,8 @@ class BinanceFuturesStream:
                                                  on_message=self._on_message,
                                                  on_error=self._on_error,
                                                  on_close=self._on_close)
-                self.ws.run_forever(ping_interval=30, ping_timeout=10)
+                # Keep connection alive with ping_interval=20 seconds
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 logger.error(f"Futures WebSocket error: {e}")
                 self.reconnect_count += 1
@@ -474,8 +481,15 @@ class BinanceFuturesStream:
 
     def _on_message(self, ws, message):
         try:
+            # Update last_ping on every message
+            self.last_ping = time.time()
             data = json.loads(message)
-            if 'e' not in data: return
+            # Handle subscription confirmation
+            if 'result' in data and 'id' in data:
+                logger.info(f"Futures subscription confirmed: {data}")
+                return
+            if 'e' not in data:
+                return
             e = data['e']
             if e == 'openInterest':
                 symbol = data['s']
@@ -500,7 +514,6 @@ class BinanceFuturesStream:
                     self.data['cvd'][symbol] = self.data['cvd'].get(symbol, 0) + delta
                     self.data['last_trade'][symbol] = price
                     if self.on_data: self.on_data('cvd', symbol, self.data['cvd'][symbol])
-            self.last_ping = time.time()
         except Exception as e:
             logger.debug(f"Futures WebSocket message parse error: {e}")
 
@@ -528,7 +541,7 @@ class BinanceFuturesStream:
         with self.lock:
             hist = list(self.oi_history.get(symbol.lower(), []))
             if len(hist) < 2: return 0
-            return hist[-1] - hist[0]  # simple slope
+            return hist[-1] - hist[0]
 
     def get_cvd(self, symbol):
         with self.lock:
@@ -540,7 +553,7 @@ class BinanceFuturesStream:
             return [e for e in self.data['liquidations'] if e['symbol'] == symbol and (now - e['time']) <= lookback_seconds]
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (Extended with more features)
+# CANDLE TOPOLOGY ENGINE (Extended)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -700,11 +713,9 @@ class CandleTopologyEngine:
         if max_price - min_price < 0.01:
             min_price = price * 0.95
             max_price = price * 1.05
-
         sr = self.support_resistance[asset]
         supports = [s for s in sr["support"] if min_price <= s <= max_price]
         resistances = [r for r in sr["resistance"] if min_price <= r <= max_price]
-
         rows = 10
         chart_lines = ["┌──────────────────────────────────────┐", "│       📊 LIVE TOPOLOGY CHART (Zoom)     │", "├──────────────────────────────────────┤"]
         for i in range(rows, -1, -1):
@@ -783,7 +794,7 @@ class CandleTopologyEngine:
         return {}
 
 # =====================================================================
-# LAYER 1: CANDLE ANATOMY ANALYZER
+# ADVANCED LAYERS (1-4)
 # =====================================================================
 class CandlePatternAnalyzer:
     def __init__(self, topology):
@@ -821,9 +832,6 @@ class CandlePatternAnalyzer:
             patterns['inside_bar'] = 1
         return patterns
 
-# =====================================================================
-# LAYER 2: AUTOMATIC TRENDLINE ENGINE (Simplified)
-# =====================================================================
 class TrendlineEngine:
     def __init__(self, topology):
         self.topology = topology
@@ -832,9 +840,8 @@ class TrendlineEngine:
     def update(self, asset):
         pivots_high = self.topology.pivots[asset]["high"][:10]
         pivots_low = self.topology.pivots[asset]["low"][:10]
-        # Build simple trendline using last two significant pivots
         if len(pivots_high) >= 2:
-            slope = (pivots_high[0] - pivots_high[1]) / 2.0  # approximate slope per candle
+            slope = (pivots_high[0] - pivots_high[1]) / 2.0
             intercept = pivots_high[0]
             self.trendlines[asset] = {'upper': (slope, intercept), 'lower': None}
         if len(pivots_low) >= 2:
@@ -843,12 +850,9 @@ class TrendlineEngine:
             self.trendlines[asset]['lower'] = (slope, intercept)
 
     def check_break(self, asset, price):
-        # Returns 'break_above', 'break_below', 'touch', or ''
         tl = self.trendlines.get(asset, {})
         if not tl:
             return ''
-        # Simulate current level (using last candle index)
-        # Simplified: just check if price > last high pivot or < last low pivot
         if tl.get('upper'):
             last_high = self.topology.pivots[asset]["high"][0] if self.topology.pivots[asset]["high"] else 0
             if price > last_high * 1.001:
@@ -857,14 +861,10 @@ class TrendlineEngine:
             last_low = self.topology.pivots[asset]["low"][0] if self.topology.pivots[asset]["low"] else 0
             if price < last_low * 0.999:
                 return 'break_below'
-        # Touch detection: near pivot levels
         if abs(price - last_high) / last_high < 0.002:
             return 'touch'
         return ''
 
-# =====================================================================
-# LAYER 3: LIQUIDITY ZONE & DYNAMIC S/R
-# =====================================================================
 class LiquidityZoneAnalyzer:
     def __init__(self, topology):
         self.topology = topology
@@ -885,16 +885,12 @@ class LiquidityZoneAnalyzer:
                     'low': c['low'],
                     'type': 'resistance' if c['close'] > c['open'] else 'support'
                 })
-        # Cluster nearby zones (simplified)
         clustered = []
         for z in zones:
             if not clustered or abs(z['high'] - clustered[-1]['high']) / clustered[-1]['high'] > 0.005:
                 clustered.append(z)
         return clustered
 
-# =====================================================================
-# ADVANCED SIGNAL ENGINE (Combines All 4 Layers)
-# =====================================================================
 class AdvancedSignalEngine:
     def __init__(self, topology):
         self.topology = topology
@@ -903,32 +899,25 @@ class AdvancedSignalEngine:
         self.liquidity_analyzer = LiquidityZoneAnalyzer(topology)
 
     def evaluate(self, asset, price, direction):
-        # Layer 1
         patterns = self.pattern_analyzer.analyze(asset)
-        # Layer 2
         self.trendline_engine.update(asset)
         trendline_status = self.trendline_engine.check_break(asset, price)
-        # Layer 3
         zones = self.liquidity_analyzer.get_zones(asset, price)
-        # Layer 4 – already in topology
         bos = self.topology.bos[asset]["direction"]
         choch = self.topology.choch[asset]
 
         score = 0
-        # Pattern bonus
         if patterns:
             if direction == "BUY" and any(p in patterns for p in ['hammer', 'bullish_engulf']):
                 score += 10
             elif direction == "SELL" and any(p in patterns for p in ['shooting_star', 'bearish_engulf']):
                 score += 10
-        # Trendline breakout/touch
         if trendline_status == 'break_above' and direction == "BUY":
             score += 15
         elif trendline_status == 'break_below' and direction == "SELL":
             score += 15
         elif trendline_status == 'touch':
             score += 5
-        # Liquidity zones
         if zones:
             nearest = min(zones, key=lambda z: abs(z['high'] - price))
             atr = self.topology.get_atr(asset)
@@ -936,16 +925,14 @@ class AdvancedSignalEngine:
                 score += 10
             elif direction == "SELL" and nearest['type'] == 'resistance' and abs(price - nearest['low']) < 0.5 * atr:
                 score += 10
-        # Structure
         if bos == direction:
             score += 10
         if choch:
             score += 5
-
         return score, patterns, trendline_status, zones
 
 # =====================================================================
-# DYNAMIC REGIME DETECTOR
+# DYNAMIC REGIME DETECTOR (FIXED: CHOP check_4h_ema = False)
 # =====================================================================
 class RegimeDetector:
     def __init__(self, topology):
@@ -976,14 +963,14 @@ class RegimeDetector:
             regime = "CHOP"
             params = {"min_sqs": 85, "use_micro_sweep": True, "mtf_tolerance": 0.01,
                       "volume_decay_threshold": 0.4, "pending_candles": 3,
-                      "order_flow_strict": True, "check_4h_ema": True}
+                      "order_flow_strict": True, "check_4h_ema": False}   # <-- FIX: False
 
         self.current_regime[asset] = regime
         self.params[asset] = params
         return regime, params
 
 # =====================================================================
-# GATES (Modified to accept dynamic parameters)
+# GATES (Dynamic)
 # =====================================================================
 class MarketRegimeFilter:
     def __init__(self, topology):
@@ -994,7 +981,6 @@ class MarketRegimeFilter:
         adx_1h = self.topology.get_adx(asset, 3600)
         if adx_15 < adx_threshold and adx_1h < adx_threshold:
             return False, f"Sideways/Chop (ADX 15={adx_15:.1f}, 1h={adx_1h:.1f})"
-        # VSA fake breakout
         candles_5m = self.topology.candles[300][asset]
         completed = [c for c in candles_5m if c.get("complete", False)]
         if len(completed) >= 5:
@@ -1017,7 +1003,6 @@ class MTFConfluenceGate:
         if current_price == 0:
             return False, "No price"
 
-        # 4H trend (optional)
         if check_4h:
             candles_4h = self.topology.candles[14400][asset]
             complete_4h = [c for c in candles_4h if c.get("complete", False)]
@@ -1031,7 +1016,6 @@ class MTFConfluenceGate:
                     if direction == "SELL" and current_price > ema50[-1] and current_price > ema200[-1]:
                         return False, "4H bullish"
 
-        # 1H structure
         pivots_high = self.topology.pivots[asset]["high"]
         pivots_low = self.topology.pivots[asset]["low"]
         if len(pivots_high) >= 2 and len(pivots_low) >= 2:
@@ -1040,13 +1024,11 @@ class MTFConfluenceGate:
             if direction == "SELL" and pivots_low[0] > pivots_low[1]:
                 return False, "1H structure up"
 
-        # 15m: OB/FVG (at least one)
         fvgs = self.topology.detect_fvg(asset)
         ob = self.topology.detect_order_block(asset)
         if not ob and not fvgs:
             return False, "No OB or FVG on 15m"
 
-        # 5m: near S/R (dynamic tolerance)
         sr = self.topology.support_resistance[asset]
         if direction == "BUY":
             if sr["support"]:
@@ -1058,7 +1040,6 @@ class MTFConfluenceGate:
                 nearest_resistance = min(sr["resistance"])
                 if abs(current_price - nearest_resistance) / nearest_resistance > tolerance:
                     return False, f"Not near resistance (tolerance {tolerance:.2%})"
-
         return True, "Pass"
 
 class OrderFlowAnalyzer:
@@ -1090,7 +1071,6 @@ class OrderFlowAnalyzer:
                 if direction == "SELL" and price_change < 0 and cvd > 0:
                     return False, "CVD divergence (price down, CVD up)"
         else:
-            # Relaxed mode: only warn
             if direction == "BUY" and oi_trend <= 0:
                 logger.info(f"⚠️ OI not increasing for {asset} BUY, but relaxed mode")
             elif direction == "SELL" and oi_trend >= 0:
@@ -1102,11 +1082,10 @@ class SessionTimer:
         self.ist = Config.IST
 
     def is_trading_time(self) -> Tuple[bool, str, str]:
-        # Always active for testing
         return True, "ALWAYS", "00:00-23:59 IST"
 
 # =====================================================================
-# SQS CALCULATOR (Enhanced with advanced score)
+# SQS CALCULATOR
 # =====================================================================
 class SQS_Calculator:
     def __init__(self, topology):
@@ -1167,7 +1146,6 @@ class PendingVerificationQueue:
             completed = [c for c in candles if c.get("complete", False)]
             if len(completed) < 2:
                 continue
-            # Use dynamic settings from signal data
             limit = data.get('pending_candles', Config.PENDING_VERIFICATION_CANDLES)
             vol_decay = data.get('volume_decay_threshold', Config.VOLUME_DECAY_THRESHOLD)
             new_candles = completed[-limit:] if len(completed) >= limit else completed
@@ -1207,7 +1185,7 @@ class PendingVerificationQueue:
         return ready
 
 # =====================================================================
-# DYNAMIC STOP LOSS (Unchanged)
+# DYNAMIC STOP LOSS
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1236,7 +1214,7 @@ class DynamicStopLoss:
         return sl
 
 # =====================================================================
-# ADAPTIVE LEARNER (Moved before AIOrchestrator)
+# ADAPTIVE LEARNER
 # =====================================================================
 class AdaptiveLearner:
     def __init__(self, db):
@@ -1266,7 +1244,6 @@ class AdaptiveLearner:
         for pattern, session, regime, total, wins in rows:
             if total >= 10:
                 wr = wins / total
-                # Adjust min_sqs for that pattern/regime (simulate)
                 if wr < 0.45:
                     logger.info(f"Adaptive: Pattern {pattern} ({regime}) win rate {wr:.2f} < 45% -> increasing threshold")
                 elif wr > 0.65:
@@ -1274,7 +1251,7 @@ class AdaptiveLearner:
         cur.close()
 
 # =====================================================================
-# TELEGRAM PIPELINE (FIXED)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1314,7 +1291,7 @@ class TelegramPipeline:
         self.queue.put(f"📰 {title}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}")
 
 # =====================================================================
-# BINANCE SPOT WEBSOCKET (Unchanged)
+# BINANCE SPOT WEBSOCKET
 # =====================================================================
 class BinancePublicStream:
     def __init__(self, on_price_update):
@@ -1452,7 +1429,7 @@ def start_health_server(orchestrator):
     httpd.serve_forever()
 
 # =====================================================================
-# LIFECYCLE CONTROLLER (Unchanged)
+# LIFECYCLE CONTROLLER
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1512,7 +1489,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR (v6.2 – Smart Adaptive with Advanced Layers)
+# CORE ORCHESTRATOR
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1523,26 +1500,22 @@ class AIOrchestrator:
         self.telegram = TelegramPipeline()
         self.lifecycle = ActiveTradeLifecycle(self)
 
-        # Futures stream
         self.futures_stream = BinanceFuturesStream()
         self.futures_stream.start()
 
-        # Regime & Advanced Engines
         self.regime_detector = RegimeDetector(self.topology)
         self.advanced_engine = AdvancedSignalEngine(self.topology)
 
-        # Gates
         self.market_regime = MarketRegimeFilter(self.topology)
         self.economic_calendar = EconomicCalendar()
         self.mtf_gate = MTFConfluenceGate(self.topology)
         self.orderflow = OrderFlowAnalyzer(self.topology, self.futures_stream)
         self.session_timer = SessionTimer()
-        self.adaptive = AdaptiveLearner(self.db)          # NOW DEFINED BEFORE
+        self.adaptive = AdaptiveLearner(self.db)
         self.sqs_calc = SQS_Calculator(self.topology)
         self.pending_queue = PendingVerificationQueue(self.topology)
         self.dynamic_sl = DynamicStopLoss(self.topology)
 
-        # State
         self.active_trades = {}
         self.trade_lock = threading.Lock()
         self.price_queue = queue.Queue(maxsize=1000)
@@ -1708,7 +1681,6 @@ class AIOrchestrator:
             self.topology.process_tick(asset, price, volume)
             self._update_active_trades(asset, price)
 
-            # Pending verification check
             if self.topology.candle_just_closed.get(asset, False):
                 if self.pending_queue.pending:
                     removed = self.pending_queue.check_pending(asset)
@@ -1716,7 +1688,6 @@ class AIOrchestrator:
                     for signal in verified:
                         self._send_final_signal(signal)
 
-            # Skip if active trade
             with self.trade_lock:
                 is_active = any(t['asset'] == asset for t in self.active_trades.values())
             if is_active:
@@ -1731,25 +1702,21 @@ class AIOrchestrator:
                                 trade['hold_sent'] = True
                 return
 
-            # New signal only on 15m candle close
             if not self.topology.candle_just_closed.get(asset, False):
                 return
 
             self._update_indicators(asset, price)
 
-            # ---- DYNAMIC REGIME DETECTION ----
             htf_trend = self.asset_state[asset]["htf_trend"]
             tf_trend = self.asset_state[asset]["trend"]
             regime, params = self.regime_detector.detect(asset, price, volume, htf_trend, tf_trend)
 
-            # ---- GATE 5: Session ----
             session_ok, session_name, _ = self.session_timer.is_trading_time()
             if not session_ok:
                 self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"], regime, "Session Filter", regime)
                 self.rejected += 1
                 return
 
-            # ---- GATE 2: News Blackout ----
             now_dt = datetime.now(Config.IST)
             blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
             if blackout:
@@ -1757,8 +1724,6 @@ class AIOrchestrator:
                 self.rejected += 1
                 return
 
-            # ---- GATE 1: Regime ----
-            # Use adaptive ADX threshold: for CHOP, raise threshold to 25; for trends, lower to 18
             adx_threshold = 22
             if regime == "STRONG_TREND":
                 adx_threshold = 18
@@ -1772,7 +1737,6 @@ class AIOrchestrator:
                 self.rejected += 1
                 return
 
-            # ---- Determine direction ----
             if htf_trend == "BULLISH" and tf_trend == "BULLISH":
                 direction = "BUY"
             elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
@@ -1780,20 +1744,17 @@ class AIOrchestrator:
             else:
                 return
 
-            # ---- ADVANCED SIGNAL ENGINE (Layers 1-4) ----
             adv_score, patterns, trendline_status, zones = self.advanced_engine.evaluate(asset, price, direction)
             logger.info(f"Advanced Score for {asset}: {adv_score}, Patterns: {patterns}, Trendline: {trendline_status}")
 
-            # ---- GATE 3: MTF (dynamic params) ----
             mtf_tolerance = params.get("mtf_tolerance", 0.02)
-            check_4h = params.get("check_4h_ema", True)
+            check_4h = params.get("check_4h_ema", False)   # now False by default for CHOP
             mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction, tolerance=mtf_tolerance, check_4h=check_4h)
             if not mtf_ok:
                 self.db.log_rejected(asset, price, 0, mtf_reason, self.asset_state[asset]["volatility"], regime, "MTF Confluence", regime)
                 self.rejected += 1
                 return
 
-            # ---- GATE 4: Order Flow ----
             of_strict = params.get("order_flow_strict", True)
             of_ok, of_reason = self.orderflow.check(asset, direction, price, strict=of_strict)
             if not of_ok:
@@ -1801,7 +1762,6 @@ class AIOrchestrator:
                 self.rejected += 1
                 return
 
-            # ---- SQS Calculation (including advanced score) ----
             sr = self.topology.support_resistance[asset]
             bos = self.topology.bos[asset]
             choch = self.topology.choch[asset]
@@ -1813,7 +1773,7 @@ class AIOrchestrator:
             base_sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, sr,
                                                bos, choch, sweep, ob, fvgs, vol_ratio, htf_trend,
                                                use_micro_sweep=params.get("use_micro_sweep", True))
-            total_sqs = base_sqs + adv_score  # incorporate advanced layer score
+            total_sqs = base_sqs + adv_score
             min_sqs = params.get("min_sqs", Config.MIN_SQS)
 
             if total_sqs < min_sqs:
@@ -1822,7 +1782,6 @@ class AIOrchestrator:
                 self.rejected += 1
                 return
 
-            # ---- Dynamic SL & TP ----
             atr = self.topology.get_atr(asset)
             if atr == 0:
                 atr = price * 0.01
@@ -1843,7 +1802,6 @@ class AIOrchestrator:
             if rr < 1.5:
                 tp = price + 1.5 * risk if direction == "BUY" else price - 1.5 * risk
 
-            # ---- Cooldown & Daily Cap ----
             now_ts = time.time()
             if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
                 self.db.log_rejected(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"], regime, "Cooldown", regime)
@@ -1855,7 +1813,6 @@ class AIOrchestrator:
                 self.rejected += 1
                 return
 
-            # ---- Add to Pending Queue with dynamic params ----
             signal_data = {
                 'asset': asset,
                 'direction': direction,
@@ -1902,7 +1859,6 @@ class AIOrchestrator:
             news_score = signal['news_score']
             dynamic_min_sqs = signal.get('dynamic_min_sqs', Config.MIN_SQS)
 
-            # Build logic parts
             logic_parts = [f"HTF {htf_trend}"]
             if self.topology.bos[asset]["direction"]:
                 logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
@@ -1914,7 +1870,6 @@ class AIOrchestrator:
                 logic_parts.append("OB")
             logic = " + ".join(logic_parts)
 
-            # Log trade
             trade_id = self.db.log_trade(
                 asset, direction, price, sl, tp,
                 sqs, "HIGH", list(patterns.keys()), logic,
@@ -1923,7 +1878,6 @@ class AIOrchestrator:
                 dynamic_min_sqs
             )
 
-            # Send Telegram signal
             chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
             rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
             self.telegram.fire_signal(
@@ -1974,7 +1928,7 @@ class AIOrchestrator:
 
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v6.2 Online – Smart Adaptive Regime + Advanced 4-Layer Engine")
+        self.telegram.send_message("🚀 AI v6.2 FINAL Online – Adaptive Regime + 4 Layers + All Fixes")
 
         last_news = 0
         while True:
