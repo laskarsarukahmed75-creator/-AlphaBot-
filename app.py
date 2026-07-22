@@ -1012,7 +1012,7 @@ class MTFConfluenceGate:
     def __init__(self, topology):
         self.topology = topology
 
-    def check(self, asset: str, direction: str, tolerance=0.02, check_4h=True) -> Tuple[bool, str]:
+    def check(self, asset: str, direction: str, tolerance=0.02, check_4h=False) -> Tuple[bool, str]:
         current_price = self.topology.history[asset][-1]['price'] if self.topology.history[asset] else 0
         if current_price == 0:
             return False, "No price"
