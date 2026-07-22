@@ -515,8 +515,8 @@ class BinanceFuturesStream:
     def _health_check(self):
         while self.running:
             time.sleep(30)
-            if time.time() - self.last_ping > 60:
-                logger.warning("Futures WebSocket no data for >60s, forcing reconnect.")
+            if time.time() - self.last_ping > 300:
+                logger.warning("Futures WebSocket no data for >300s, forcing reconnect.")
                 if self.ws: self.ws.close()
                 self.reconnect_count += 1
 
