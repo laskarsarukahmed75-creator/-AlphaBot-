@@ -1,15 +1,6 @@
 # =====================================================================
-# app.py – AlphaBot v6.2 FINAL (Smart Adaptive + All Fixes)
+# app.py – AlphaBot v6.2 FINAL (With Cloudscraper – Permanent 403 Fix)
 # =====================================================================
-# THIS VERSION INCLUDES:
-# 1. CHOP Regime: check_4h_ema = False (eliminates "4H bullish" rejections)
-# 2. ForexFactory: graceful 403 handling (warning instead of error)
-# 3. Futures WebSocket: ping_interval=20 and last_ping update to keep alive
-# 4. All advanced layers (candle patterns, trendlines, liquidity zones)
-# 5. Dynamic SQS thresholds per regime
-# 6. Robust error handling and logging
-# =====================================================================
-
 import math
 from typing import List, Dict, Optional, Tuple, Any
 import os
@@ -35,6 +26,13 @@ try:
 except ImportError:
     HAS_BS4 = False
     print("⚠️ BeautifulSoup not installed. Economic Calendar scraper disabled.")
+
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
+    print("⚠️ cloudscraper not installed. Install with: pip install cloudscraper")
 
 try:
     from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -77,7 +75,7 @@ class Config:
     VOLUME_DECAY_THRESHOLD = 0.6
 
     ADAPTIVE_LEARN_INTERVAL = 30
-    SIGNAL_COOLDOWN = 1800
+    SIGNAL_COOLDOWN = 1200
     MAX_SIGNALS_PER_DAY = 6
 
     VOLATILITY_MULTIPLIERS = {"low": (1.2, 2.0), "medium": (1.5, 2.5), "high": (1.8, 3.0), "extreme": (2.0, 3.5)}
@@ -87,7 +85,7 @@ class Config:
     CONFIDENCE_UPDATE_INTERVAL = 300
 
 # =====================================================================
-# DATABASE LAYERS (MongoDB + SQLite – Extended)
+# DATABASE LAYERS (MongoDB + SQLite)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -321,7 +319,7 @@ class TradeDatabase:
             cur.close()
 
 # =====================================================================
-# NEWS & ECONOMIC CALENDAR (with graceful 403 handling)
+# NEWS & ECONOMIC CALENDAR (FIXED: Cloudscraper + Graceful Fallback)
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
@@ -378,10 +376,22 @@ class EconomicCalendar:
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1'
             }
-            resp = requests.get(url, headers=headers, timeout=15)
+
+            # ========== PERMANENT 403 FIX: Use cloudscraper ==========
+            if HAS_CLOUDSCRAPER:
+                try:
+                    scraper = cloudscraper.create_scraper()
+                    resp = scraper.get(url, headers=headers, timeout=15)
+                except Exception as e:
+                    logger.warning(f"Cloudscraper failed: {e}, falling back to requests.")
+                    resp = requests.get(url, headers=headers, timeout=15)
+            else:
+                resp = requests.get(url, headers=headers, timeout=15)
+
             if resp.status_code != 200:
                 logger.warning(f"ForexFactory calendar fetch failed (status {resp.status_code}). Skipping news blackout.")
                 return
+
             soup = BeautifulSoup(resp.text, 'lxml')
             rows = soup.find_all('tr', class_=re.compile('calendar__row'))
             for row in rows:
@@ -428,7 +438,7 @@ class EconomicCalendar:
         return False, None
 
 # =====================================================================
-# BINANCE FUTURES WEBSOCKET (with keep‑alive fixes)
+# BINANCE FUTURES WEBSOCKET (with keep‑alive)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -463,7 +473,6 @@ class BinanceFuturesStream:
                                                  on_message=self._on_message,
                                                  on_error=self._on_error,
                                                  on_close=self._on_close)
-                # Keep connection alive with ping_interval=20 seconds
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 logger.error(f"Futures WebSocket error: {e}")
@@ -481,10 +490,8 @@ class BinanceFuturesStream:
 
     def _on_message(self, ws, message):
         try:
-            # Update last_ping on every message
             self.last_ping = time.time()
             data = json.loads(message)
-            # Handle subscription confirmation
             if 'result' in data and 'id' in data:
                 logger.info(f"Futures subscription confirmed: {data}")
                 return
@@ -553,7 +560,7 @@ class BinanceFuturesStream:
             return [e for e in self.data['liquidations'] if e['symbol'] == symbol and (now - e['time']) <= lookback_seconds]
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (Extended)
+# CANDLE TOPOLOGY ENGINE
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -811,23 +818,19 @@ class CandlePatternAnalyzer:
         range_ = last['high'] - last['low']
         if range_ == 0:
             return {}
-        # Doji
         if body / range_ < 0.1:
             patterns['doji'] = 1
-        # Hammer / Shooting Star
         lower_wick = min(last['open'], last['close']) - last['low']
         upper_wick = last['high'] - max(last['open'], last['close'])
         if lower_wick > body * 2 and upper_wick < body * 0.3:
             patterns['hammer'] = 1
         if upper_wick > body * 2 and lower_wick < body * 0.3:
             patterns['shooting_star'] = 1
-        # Engulfing
         if prev and body > abs(prev['close'] - prev['open']):
             if last['close'] > prev['open'] and last['open'] < prev['close']:
                 patterns['bullish_engulf'] = 1
             elif last['close'] < prev['open'] and last['open'] > prev['close']:
                 patterns['bearish_engulf'] = 1
-        # Inside Bar
         if prev and last['high'] < prev['high'] and last['low'] > prev['low']:
             patterns['inside_bar'] = 1
         return patterns
@@ -932,7 +935,7 @@ class AdvancedSignalEngine:
         return score, patterns, trendline_status, zones
 
 # =====================================================================
-# DYNAMIC REGIME DETECTOR (FIXED: CHOP check_4h_ema = False)
+# DYNAMIC REGIME DETECTOR – OPTIMIZED CHOP
 # =====================================================================
 class RegimeDetector:
     def __init__(self, topology):
@@ -961,16 +964,16 @@ class RegimeDetector:
                       "order_flow_strict": False, "check_4h_ema": False}
         else:
             regime = "CHOP"
-            params = {"min_sqs": 85, "use_micro_sweep": True, "mtf_tolerance": 0.01,
-                      "volume_decay_threshold": 0.4, "pending_candles": 3,
-                      "order_flow_strict": True, "check_4h_ema": False}   # <-- FIX: False
+            params = {"min_sqs": 75, "use_micro_sweep": True, "mtf_tolerance": 0.025,
+                      "volume_decay_threshold": 0.7, "pending_candles": 2,
+                      "order_flow_strict": True, "check_4h_ema": False}
 
         self.current_regime[asset] = regime
         self.params[asset] = params
         return regime, params
 
 # =====================================================================
-# GATES (Dynamic)
+# GATES
 # =====================================================================
 class MarketRegimeFilter:
     def __init__(self, topology):
@@ -1115,7 +1118,7 @@ class SQS_Calculator:
         return score
 
 # =====================================================================
-# PENDING VERIFICATION QUEUE (Dynamic)
+# PENDING VERIFICATION QUEUE
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
@@ -1324,7 +1327,7 @@ class BinancePublicStream:
             pass
 
 # =====================================================================
-# HEALTH SERVER (with /rejections endpoint)
+# HEALTH SERVER
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -1748,7 +1751,7 @@ class AIOrchestrator:
             logger.info(f"Advanced Score for {asset}: {adv_score}, Patterns: {patterns}, Trendline: {trendline_status}")
 
             mtf_tolerance = params.get("mtf_tolerance", 0.02)
-            check_4h = params.get("check_4h_ema", False)   # now False by default for CHOP
+            check_4h = params.get("check_4h_ema", False)
             mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction, tolerance=mtf_tolerance, check_4h=check_4h)
             if not mtf_ok:
                 self.db.log_rejected(asset, price, 0, mtf_reason, self.asset_state[asset]["volatility"], regime, "MTF Confluence", regime)
@@ -1928,7 +1931,7 @@ class AIOrchestrator:
 
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v6.2 FINAL Online – Adaptive Regime + 4 Layers + All Fixes")
+        self.telegram.send_message("🚀 AI v6.2 FINAL Online – Permanent 403 Fix Applied!")
 
         last_news = 0
         while True:
