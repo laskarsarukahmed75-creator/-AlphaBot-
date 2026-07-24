@@ -1,7 +1,8 @@
 # =====================================================================
-# app.py – AlphaBot v6.3 FINAL (Production-Ready)
+# app.py – AlphaBot v6.3 FINAL (Production-Ready with Pending Fix)
 # =====================================================================
-# Fully expanded, all classes, methods, and logic implemented.
+# Full production script. All classes, methods, SQL queries, WebSocket
+# handlers, and execution logic are fully expanded.
 # =====================================================================
 
 import math
@@ -98,7 +99,8 @@ class Config:
 class MongoDatabase:
     def __init__(self):
         if not HAS_PYMONGO or not Config.MONGO_URI:
-            self.client = self.db = None
+            self.client = None
+            self.db = None
             return
         self.auth_failed = False
         try:
@@ -109,7 +111,8 @@ class MongoDatabase:
             logger.info("MongoDB connected successfully.")
         except Exception as e:
             logger.warning(f"MongoDB connection failed: {e}. Running without MongoDB.")
-            self.client = self.db = None
+            self.client = None
+            self.db = None
 
     def _create_indexes(self):
         if self.db is None:
@@ -225,7 +228,7 @@ class TradeDatabase:
                 min_sqs INTEGER, use_sweep INTEGER, mtf_tolerance REAL,
                 volume_decay REAL, last_updated INTEGER
             )''')
-            # Auto-migration: add signal_type column if missing (for older DBs)
+            # Auto-migration: add signal_type column if missing
             try:
                 cur.execute("ALTER TABLE trades ADD COLUMN signal_type TEXT DEFAULT 'STANDARD'")
             except sqlite3.OperationalError:
@@ -352,7 +355,7 @@ class TradeDatabase:
             cur.close()
 
 # =====================================================================
-# NEWS & ECONOMIC CALENDAR (with cloudscraper)
+# NEWS & ECONOMIC CALENDAR
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
@@ -477,7 +480,7 @@ class EconomicCalendar:
         return False, None
 
 # =====================================================================
-# BINANCE FUTURES WEBSOCKET (for OI, CVD, liquidations)
+# BINANCE FUTURES WEBSOCKET
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -612,7 +615,7 @@ class BinanceFuturesStream:
             return [e for e in self.data['liquidations'] if e['symbol'] == symbol and (now - e['time']) <= lookback_seconds]
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (Core price-action analytics)
+# CANDLE TOPOLOGY ENGINE
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -894,10 +897,12 @@ class CandleTopologyEngine:
         return {}
 
     def _calc_rsi(self, closes, period=14):
+        # Fixed: calculate RSI using the most recent 'period' candles
         if len(closes) < period + 1:
             return 50
+        start_idx = len(closes) - period - 1
         gains, losses = 0, 0
-        for i in range(1, period + 1):
+        for i in range(start_idx + 1, len(closes)):
             diff = closes[i] - closes[i - 1]
             if diff > 0:
                 gains += diff
@@ -912,7 +917,7 @@ class CandleTopologyEngine:
         return rsi
 
 # =====================================================================
-# ADVANCED ANALYTICAL LAYERS (Candle patterns, Trendlines, Liquidity zones)
+# ADVANCED ANALYTICAL LAYERS
 # =====================================================================
 class CandlePatternAnalyzer:
     def __init__(self, topology):
@@ -1049,7 +1054,7 @@ class AdvancedSignalEngine:
         return score, patterns, trendline_status, zones
 
 # =====================================================================
-# ENGINE A: SNIPER EXHAUSTION FILTER (Priority 1)
+# ENGINE A: SNIPER EXHAUSTION FILTER
 # =====================================================================
 class RallyExhaustionFilter:
     def __init__(self, topology):
@@ -1292,11 +1297,11 @@ class SessionTimer:
         self.ist = Config.IST
 
     def is_trading_time(self) -> Tuple[bool, str, str]:
-        # Always active for testing (can be made session‑aware later)
+        # Always active for testing
         return True, "ALWAYS", "00:00-23:59 IST"
 
 # =====================================================================
-# SQS CALCULATOR (Institutional Quality Score)
+# SQS CALCULATOR
 # =====================================================================
 class SQS_Calculator:
     def __init__(self, topology):
@@ -1326,7 +1331,7 @@ class SQS_Calculator:
         return score
 
 # =====================================================================
-# SMART DYNAMIC STOP LOSS (FIXED)
+# SMART DYNAMIC STOP LOSS
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1470,7 +1475,7 @@ class PendingVerificationQueue:
         return ready
 
 # =====================================================================
-# TELEGRAM PIPELINE (with distinction for Sniper signals)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1494,10 +1499,15 @@ class TelegramPipeline:
     def fire_signal(self, asset, direction, price, sl, tp, chart, logic, news,
                     score, patterns, trade_id, session, rr, regime, signal_type="STANDARD"):
         if signal_type == "SNIPER":
-            header = "🎯 AI SIGNAL: SNIPER EXHAUSTION REVERSAL"
+            if direction == "SELL":
+                header = "🎯 <b>AI SNIPER REVERSAL (SELL 🔴)</b>"
+            else:
+                header = "🎯 <b>AI SNIPER REVERSAL (BUY 🟢)</b>"
         else:
-            icon = "🔥" if direction == "BUY" else "❄️"
-            header = f"{icon} <b>AI SIGNAL: {direction}</b>"
+            if direction == "SELL":
+                header = "❄️ <b>AI SCALP SIGNAL: SELL 🔴</b>"
+            else:
+                header = "🔥 <b>AI SCALP SIGNAL: BUY 🟢</b>"
 
         msg = (f"{header}\n"
                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1516,7 +1526,7 @@ class TelegramPipeline:
         self.queue.put(f"📰 {title}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}")
 
 # =====================================================================
-# ADAPTIVE LEARNER (for pattern performance)
+# ADAPTIVE LEARNER
 # =====================================================================
 class AdaptiveLearner:
     def __init__(self, db):
@@ -1553,7 +1563,7 @@ class AdaptiveLearner:
         cur.close()
 
 # =====================================================================
-# BINANCE SPOT WEBSOCKET (price feed)
+# BINANCE SPOT WEBSOCKET
 # =====================================================================
 class BinancePublicStream:
     def __init__(self, on_price_update):
@@ -1589,7 +1599,7 @@ class BinancePublicStream:
             pass
 
 # =====================================================================
-# HEALTH SERVER (with /rejections endpoint)
+# HEALTH SERVER
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -1633,7 +1643,11 @@ def start_health_server(orchestrator):
             with orchestrator.trade_lock:
                 for tid, trade in orchestrator.active_trades.items():
                     current_price = orchestrator.topology.history[trade['asset']][-1]['price'] if orchestrator.topology.history[trade['asset']] else trade['entry']
-                    pnl = round(current_price - trade['entry'] if trade['direction'] == 'BUY' else trade['entry'] - current_price, 2)
+                    if trade['direction'] == 'BUY':
+                        pnl = current_price - trade['entry']
+                    else:
+                        pnl = trade['entry'] - current_price
+                    pnl = round(pnl, 2)
                     active_trades_list.append({
                         "id": tid,
                         "asset": trade['asset'],
@@ -1702,7 +1716,7 @@ def start_health_server(orchestrator):
     httpd.serve_forever()
 
 # =====================================================================
-# LIFECYCLE CONTROLLER (for active trade monitoring)
+# LIFECYCLE CONTROLLER
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1723,13 +1737,13 @@ class ActiveTradeLifecycle:
                     atr = self.orch.topology.get_atr(asset)
                     htf_trend = self.orch.asset_state[asset]["htf_trend"]
                     trade_duration = now - trade.get('entry_time', now)
-                    # Time decay
+
                     if trade_duration > Config.TIME_DECAY_SECONDS and abs(current_price - trade['entry']) / trade['entry'] < Config.TIME_DECAY_THRESHOLD_PCT:
                         self.orch._close_trade(tid, current_price, 0.0, "Time-Decay")
                         to_remove.append(tid)
                         self.orch.telegram.send_message(f"⏳ Trade #{tid} closed due to consolidation.")
                         continue
-                    # Health & confidence updates
+
                     base_score = trade.get('initial_score', 70)
                     health = 100
                     if (trade['direction'] == 'BUY' and htf_trend == 'BULLISH') or (trade['direction'] == 'SELL' and htf_trend == 'BEARISH'):
@@ -1744,20 +1758,36 @@ class ActiveTradeLifecycle:
                             health -= 25
                         elif trade['direction'] == 'SELL' and last_c['close'] > last_c['open'] and (last_c['close'] - last_c['open']) > atr * 0.7:
                             health -= 25
+
                     if health < Config.HEALTH_EMERGENCY_THRESHOLD:
-                        pnl = current_price - trade['entry'] if trade['direction'] == 'BUY' else trade['entry'] - current_price
+                        if trade['direction'] == 'BUY':
+                            pnl = current_price - trade['entry']
+                        else:
+                            pnl = trade['entry'] - current_price
                         self.orch._close_trade(tid, current_price, pnl, f"Emergency (Health {health}%)")
                         to_remove.append(tid)
                         self.orch.telegram.send_message(f"🚨 Trade #{tid} cut early (Health {health}%).")
                         continue
+
                     if int(time.time()) % Config.CONFIDENCE_UPDATE_INTERVAL < 60:
-                        msg = (f"🔄 Lifecycle Update: #{tid} ({asset})\n"
-                               f"Direction: {trade['direction']} | PnL: {(current_price - trade['entry']):.2f}\n"
-                               f"Confidence: {trade.get('current_score', base_score)}% → {base_score}%\n"
-                               f"Health: {health}%")
+                        if trade['direction'] == 'BUY':
+                            pnl = current_price - trade['entry']
+                        else:
+                            pnl = trade['entry'] - current_price
+                        if pnl >= 0:
+                            pnl_str = f"+{pnl:.2f} (PROFIT 🟢)"
+                        else:
+                            pnl_str = f"-{abs(pnl):.2f} (DRAWDOWN 🔴)"
+                        direction_side = "BUY 🟢" if trade['direction'] == 'BUY' else "SELL 🔴"
+                        msg = (f"🔄 <b>TRADE MONITOR: #{tid} ({Config.DISPLAY_NAMES.get(asset, asset)})</b>\n"
+                               f"📊 Side: {direction_side}\n"
+                               f"💰 PnL: {pnl_str}\n"
+                               f"⚡ Confidence: {base_score}% | ❤️ Health: {health}%")
                         self.orch.telegram.send_message(msg)
+
                     trade['current_score'] = base_score
                     trade['health'] = health
+
                 for tid in to_remove:
                     if tid in self.orch.active_trades:
                         del self.orch.active_trades[tid]
@@ -1916,7 +1946,6 @@ class AIOrchestrator:
             for tid, trade in list(self.active_trades.items()):
                 if trade['asset'] != asset:
                     continue
-                # Breakeven lock at 50% of target
                 if not trade.get('breakeven_locked', False):
                     target_dist = abs(trade['tp'] - trade['entry'])
                     half = trade['entry'] + 0.5 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.5 * target_dist
@@ -1925,7 +1954,6 @@ class AIOrchestrator:
                             trade['sl'] = trade['entry']
                             trade['breakeven_locked'] = True
                             logger.info(f"BE Locked for {tid}")
-                # Trailing stop activation at 70% of target
                 if not trade.get('trailing_activated', False):
                     target_dist = abs(trade['tp'] - trade['entry'])
                     trigger = trade['entry'] + 0.7 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.7 * target_dist
@@ -1935,20 +1963,23 @@ class AIOrchestrator:
                             trade['sl'] = new_sl
                             trade['trailing_activated'] = True
                             logger.info(f"Trailing activated for {tid}, new SL: {new_sl:.2f}")
-                # Check SL and TP
                 if trade['direction'] == 'BUY':
                     if price <= trade['sl']:
-                        self._close_trade(tid, price, price - trade['entry'], "SL Hit")
+                        pnl = price - trade['entry']
+                        self._close_trade(tid, price, pnl, "SL Hit")
                         to_remove.append(tid)
                     elif price >= trade['tp']:
-                        self._close_trade(tid, price, price - trade['entry'], "TP Hit")
+                        pnl = price - trade['entry']
+                        self._close_trade(tid, price, pnl, "TP Hit")
                         to_remove.append(tid)
                 else:
                     if price >= trade['sl']:
-                        self._close_trade(tid, price, trade['entry'] - price, "SL Hit")
+                        pnl = trade['entry'] - price
+                        self._close_trade(tid, price, pnl, "SL Hit")
                         to_remove.append(tid)
                     elif price <= trade['tp']:
-                        self._close_trade(tid, price, trade['entry'] - price, "TP Hit")
+                        pnl = trade['entry'] - price
+                        self._close_trade(tid, price, pnl, "TP Hit")
                         to_remove.append(tid)
             for tid in to_remove:
                 if tid in self.active_trades:
@@ -1963,20 +1994,26 @@ class AIOrchestrator:
 
             # Process only on 15m candle close
             if self.topology.candle_just_closed.get(asset, False):
-                # ---- ENGINE A: SNIPER REVERSAL (Priority 1) ----
+                # ==================== FIX: PENDING VERIFICATION FIRST ====================
+                # 1. Priority 0: Process pending verifications for Scalper signals
+                if self.pending_queue.pending:
+                    self.pending_queue.check_pending(asset)
+                    verified = self.pending_queue.get_verified_signals()
+                    for signal in verified:
+                        self._send_final_signal(signal)
+
+                # ---- 2. ENGINE A: SNIPER REVERSAL (Priority 1) ----
                 exh_result, exh_error = self.exhaust_filter.evaluate(asset, price)
                 if exh_result:
                     direction = exh_result["direction"]
                     score = exh_result["score"]
                     reason = exh_result["reason"]
                     logger.info(f"🎯 SNIPER EXHAUSTION DETECTED: {asset} {direction} (Score: {score}, Reason: {reason})")
-                    # Build signal with dynamic SL/TP, force 3:1 R:R
                     atr = self.topology.get_atr(asset)
                     if atr == 0:
                         atr = price * 0.01
                     sl, tp = self.dynamic_sl.calculate(asset, direction, price, atr)
                     risk = abs(price - sl)
-                    # Override TP for 3x risk (sniper)
                     if direction == "SELL":
                         forced_tp = price - 3 * risk
                         if forced_tp < price * 0.70:
@@ -1991,7 +2028,6 @@ class AIOrchestrator:
                     if rr < 2.5:
                         tp = price - 2.5 * risk if direction == "SELL" else price + 2.5 * risk
                         rr = 2.5
-                    # Bypass all gates: send final signal immediately
                     signal_data = {
                         'asset': asset,
                         'direction': direction,
@@ -2010,19 +2046,18 @@ class AIOrchestrator:
                         'score': 0,
                         'confidence': 'VERY HIGH',
                         'num_passed': 11,
-                        'signal_type': 'SNIPER'
+                        'signal_type': 'SNIPER',
+                        'dynamic_min_sqs': score
                     }
                     self._send_final_signal(signal_data)
                     return  # STOP further processing for this candle
 
-                # ---- ENGINE B: STANDARD SCALPER ----
-                # Update indicators and detect regime
+                # ---- 3. ENGINE B: STANDARD SCALPER ----
                 self._update_indicators(asset, price)
                 htf_trend = self.asset_state[asset]["htf_trend"]
                 tf_trend = self.asset_state[asset]["trend"]
                 regime, params = self.regime_detector.detect(asset, price, volume, htf_trend, tf_trend)
 
-                # GATE 5: Session
                 session_ok, session_name, _ = self.session_timer.is_trading_time()
                 if not session_ok:
                     self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"],
@@ -2030,7 +2065,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # GATE 2: News Blackout
                 now_dt = datetime.now(Config.IST)
                 blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
                 if blackout:
@@ -2039,7 +2073,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # GATE 1: Market Regime (ADX threshold dynamically adjusted)
                 adx_threshold = 22
                 if regime == "STRONG_TREND":
                     adx_threshold = 18
@@ -2054,7 +2087,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # Determine direction (HTF + TF alignment)
                 if htf_trend == "BULLISH" and tf_trend == "BULLISH":
                     direction = "BUY"
                 elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
@@ -2062,11 +2094,9 @@ class AIOrchestrator:
                 else:
                     return
 
-                # Advanced Signal Engine (bonus)
                 adv_score, patterns, trendline_status, zones = self.advanced_engine.evaluate(asset, price, direction)
                 logger.info(f"Advanced Score for {asset}: {adv_score}, Patterns: {patterns}, Trendline: {trendline_status}")
 
-                # GATE 3: MTF Confluence (with dynamic params)
                 mtf_tolerance = params.get("mtf_tolerance", 0.02)
                 check_4h = params.get("check_4h_ema", False)
                 mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction, tolerance=mtf_tolerance, check_4h=check_4h)
@@ -2076,7 +2106,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # GATE 4: Order Flow
                 of_strict = params.get("order_flow_strict", True)
                 of_ok, of_reason = self.orderflow.check(asset, direction, price, strict=of_strict)
                 if not of_ok:
@@ -2085,7 +2114,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # SQS Calculation (base + advanced)
                 sr = self.topology.support_resistance[asset]
                 bos = self.topology.bos[asset]
                 choch = self.topology.choch[asset]
@@ -2106,7 +2134,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # ---- Dynamic SL/TP (using new class) ----
                 atr = self.topology.get_atr(asset)
                 if atr == 0:
                     atr = price * 0.01
@@ -2114,7 +2141,6 @@ class AIOrchestrator:
                 risk = abs(price - sl)
                 rr = abs(tp - price) / risk if risk > 0 else 0
 
-                # ---- Cooldown & Daily Cap ----
                 now_ts = time.time()
                 if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
                     self.db.log_rejected(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"],
@@ -2128,7 +2154,6 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
-                # ---- Add to Pending Queue ----
                 signal_data = {
                     'asset': asset,
                     'direction': direction,
@@ -2177,19 +2202,21 @@ class AIOrchestrator:
             dynamic_min_sqs = signal.get('dynamic_min_sqs', Config.MIN_SQS)
             signal_type = signal.get('signal_type', 'STANDARD')
 
-            # Build logic parts
-            logic_parts = [f"HTF {htf_trend}"]
-            if self.topology.bos[asset]["direction"]:
-                logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
-            if self.topology.choch[asset]:
-                logic_parts.append("CHOCH")
-            if self.topology.detect_liquidity_sweep(asset, price):
-                logic_parts.append("SWEEP")
-            if self.topology.detect_order_block(asset):
-                logic_parts.append("OB")
-            logic = " + ".join(logic_parts)
+            if signal_type == "SNIPER":
+                # logic already contains reason; don't overwrite
+                pass
+            else:
+                logic_parts = [f"HTF {htf_trend}"]
+                if self.topology.bos[asset]["direction"]:
+                    logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
+                if self.topology.choch[asset]:
+                    logic_parts.append("CHOCH")
+                if self.topology.detect_liquidity_sweep(asset, price):
+                    logic_parts.append("SWEEP")
+                if self.topology.detect_order_block(asset):
+                    logic_parts.append("OB")
+                logic = " + ".join(logic_parts)
 
-            # Log trade
             trade_id = self.db.log_trade(
                 asset, direction, price, sl, tp,
                 sqs, "HIGH", list(patterns.keys()), logic,
@@ -2198,11 +2225,9 @@ class AIOrchestrator:
                 dynamic_min_sqs, signal_type
             )
 
-            # Chart
             chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
             rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
 
-            # Telegram
             self.telegram.fire_signal(
                 asset=asset, direction=direction, price=price, sl=sl, tp=tp,
                 chart=chart, logic=logic, news=news,
@@ -2215,7 +2240,6 @@ class AIOrchestrator:
             self.last_signal_time[asset] = time.time()
             self.signal_timestamps.append(time.time())
 
-            # Add to active trades
             with self.trade_lock:
                 self.active_trades[trade_id] = {
                     'id': trade_id,
@@ -2237,11 +2261,9 @@ class AIOrchestrator:
             logger.error(f"Error in _send_final_signal: {e}", exc_info=True)
 
     def run(self):
-        # Start health server and self-ping
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
         threading.Thread(target=self._ping_self_loop, daemon=True).start()
 
-        # Load historical data in parallel
         logger.info("Loading historical data from MongoDB/Binance in parallel...")
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
@@ -2252,12 +2274,10 @@ class AIOrchestrator:
                 pass
         logger.info("Data loading complete.")
 
-        # Start spot WebSocket
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
         self.telegram.send_message("🚀 AI v6.3 Online – Dual-Engine Architecture + Smart SL/TP")
 
-        # Main loop
         last_news = 0
         while True:
             try:
