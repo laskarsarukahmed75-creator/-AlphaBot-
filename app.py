@@ -1,10 +1,6 @@
 # =====================================================================
-# app.py – AlphaBot v6.3 FINAL (Production-Ready with Pending Fix)
+# app.py – AlphaBot v6.5 Advanced (Full Production Architecture)
 # =====================================================================
-# Full production script. All classes, methods, SQL queries, WebSocket
-# handlers, and execution logic are fully expanded.
-# =====================================================================
-
 import math
 from typing import List, Dict, Optional, Tuple, Any
 import os
@@ -52,11 +48,8 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-# =====================================================================
-# LOGGING SETUP
-# =====================================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v6.3")
+logger = logging.getLogger("AI-Orchestrator-v6.5")
 
 # =====================================================================
 # CONFIGURATION
@@ -78,7 +71,7 @@ class Config:
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
-    # Base thresholds (will be adjusted dynamically)
+    # ---- Thresholds ----
     MIN_SQS = 65
     PENDING_VERIFICATION_CANDLES = 2
     VOLUME_DECAY_THRESHOLD = 0.6
@@ -87,11 +80,17 @@ class Config:
     SIGNAL_COOLDOWN = 1200
     MAX_SIGNALS_PER_DAY = 8
 
+    # ---- Max hold time for active trades (4 hours) ----
+    MAX_HOLD_TIME = 14400   # seconds (4 hours)
+
     VOLATILITY_MULTIPLIERS = {"low": (1.2, 2.0), "medium": (1.5, 2.5), "high": (1.8, 3.0), "extreme": (2.0, 3.5)}
-    TIME_DECAY_SECONDS = 1500
+    TIME_DECAY_SECONDS = 1500          # 25 minutes
     TIME_DECAY_THRESHOLD_PCT = 0.002
     HEALTH_EMERGENCY_THRESHOLD = 55
     CONFIDENCE_UPDATE_INTERVAL = 300
+
+    # ---- Admin secret for protected endpoints ----
+    ADMIN_SECRET = "AlphaSecret123"
 
 # =====================================================================
 # DATABASE LAYERS
@@ -205,7 +204,8 @@ class TradeDatabase:
                 entry_time INTEGER, exit_reason TEXT, health_history TEXT,
                 session TEXT, sqs_score INTEGER, pattern_name TEXT,
                 regime TEXT, dynamic_min_sqs INTEGER,
-                signal_type TEXT DEFAULT 'STANDARD'
+                signal_type TEXT DEFAULT 'STANDARD',
+                signal_token TEXT
             )''')
             cur.execute('''CREATE TABLE IF NOT EXISTS rejected_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,28 +228,32 @@ class TradeDatabase:
                 min_sqs INTEGER, use_sweep INTEGER, mtf_tolerance REAL,
                 volume_decay REAL, last_updated INTEGER
             )''')
-            # Auto-migration: add signal_type column if missing
+            # Auto-migration: add signal_type and signal_token columns if missing
             try:
                 cur.execute("ALTER TABLE trades ADD COLUMN signal_type TEXT DEFAULT 'STANDARD'")
             except sqlite3.OperationalError:
-                pass  # Column already exists
+                pass
+            try:
+                cur.execute("ALTER TABLE trades ADD COLUMN signal_token TEXT")
+            except sqlite3.OperationalError:
+                pass
             self.conn.commit()
         finally:
             cur.close()
 
     def log_trade(self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
                   volatility, regime, htf_trend, news_score, session, sqs_score, pattern_name,
-                  dynamic_min_sqs, signal_type="STANDARD"):
+                  dynamic_min_sqs, signal_type="STANDARD", signal_token=None):
         cur = self.conn.cursor()
         try:
             cur.execute('''INSERT INTO trades 
                 (asset, direction, entry, stop_loss, take_profit, score, confidence, patterns, logic,
                  timestamp, volatility, market_regime, htf_trend, news_score, entry_time, status,
-                 session, sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                 session, sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type, signal_token)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (asset, direction, entry, sl, tp, score, confidence, json.dumps(patterns), logic,
                  int(time.time()), volatility, regime, htf_trend, news_score, int(time.time()), 'open',
-                 session, sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type))
+                 session, sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type, signal_token))
             self.conn.commit()
             return cur.lastrowid
         finally:
@@ -1497,25 +1501,30 @@ class TelegramPipeline:
         self.queue.put(text)
 
     def fire_signal(self, asset, direction, price, sl, tp, chart, logic, news,
-                    score, patterns, trade_id, session, rr, regime, signal_type="STANDARD"):
+                    score, patterns, trade_id, session, rr, regime, signal_type="STANDARD", signal_token=None):
         if signal_type == "SNIPER":
+            engine_label = "🎯 [ENGINE A: SNIPER REVERSAL] (Tej / High-Reward Reversal)"
             if direction == "SELL":
                 header = "🎯 <b>AI SNIPER REVERSAL (SELL 🔴)</b>"
             else:
                 header = "🎯 <b>AI SNIPER REVERSAL (BUY 🟢)</b>"
         else:
+            engine_label = "⚡ [ENGINE B: STANDARD SCALPER] (Chhota / Quick Momentum)"
             if direction == "SELL":
                 header = "❄️ <b>AI SCALP SIGNAL: SELL 🔴</b>"
             else:
                 header = "🔥 <b>AI SCALP SIGNAL: BUY 🟢</b>"
 
+        token_line = f"🆔 Token: {signal_token} (DB ID: #{trade_id})" if signal_token else f"🆔 DB ID: #{trade_id}"
+
         msg = (f"{header}\n"
                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-               f"📊 {Config.DISPLAY_NAMES.get(asset, asset)} | 🆔 #{trade_id}\n"
+               f"📊 {Config.DISPLAY_NAMES.get(asset, asset)} | {token_line}\n"
                f"⏰ {session} | ⚡ {score['confidence']} ({score['total_score']:.0f}%)\n"
                f"🎯 R:R {rr:.2f}\n"
                f"💰 Entry: {price:.2f}  🛑 SL: {sl:.2f}  🎯 TP: {tp:.2f}\n"
                f"📈 Regime: {regime}  | Type: {signal_type}\n"
+               f"📌 Engine: {engine_label}\n"
                f"\n📊 CHART:\n{chart}\n"
                f"🧠 Logic: {logic}\n📰 News: {news}\n"
                f"📊 Layers Passed: {score['num_passed']}/11\n"
@@ -1599,14 +1608,150 @@ class BinancePublicStream:
             pass
 
 # =====================================================================
-# HEALTH SERVER
+# HEALTH SERVER (with admin endpoints)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == '/rejections':
+            # Extract query params
+            path_parts = self.path.split('?')
+            path = path_parts[0]
+            params = {}
+            if len(path_parts) > 1:
+                for pair in path_parts[1].split('&'):
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        params[k] = v
+
+            # ---- Admin: Close specific trade by ID or Token ----
+            if path == '/admin/close_trade':
+                if params.get('key') != Config.ADMIN_SECRET:
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
+                    return
+                trade_id = params.get('id')
+                token = params.get('token')
+                if not trade_id and not token:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Missing id or token parameter"}).encode())
+                    return
+                try:
+                    with orchestrator.trade_lock:
+                        closed = False
+                        for tid, trade in list(orchestrator.active_trades.items()):
+                            if (trade_id and str(tid) == str(trade_id)) or (token and trade.get('signal_token') == token):
+                                asset = trade['asset']
+                                current_price = orchestrator.topology.history[asset][-1]['price'] if orchestrator.topology.history[asset] else trade['entry']
+                                if trade['direction'] == 'BUY':
+                                    pnl = current_price - trade['entry']
+                                else:
+                                    pnl = trade['entry'] - current_price
+                                orchestrator._close_trade(tid, current_price, pnl, "Admin Close (Manual)")
+                                del orchestrator.active_trades[tid]
+                                closed = True
+                                orchestrator.telegram.send_message(f"🔒 Admin closed trade #{tid} (Token: {token}) at {current_price:.2f} | PnL: {pnl:+.2f}")
+                                break
+                    if closed:
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "success", "message": f"Trade {trade_id or token} closed"}).encode())
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "Trade not found"}).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
+
+            # ---- Admin: Clear specific asset ----
+            if path == '/admin/clear_asset':
+                if params.get('key') != Config.ADMIN_SECRET:
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
+                    return
+                symbol = params.get('symbol')
+                if not symbol or symbol not in Config.ASSETS:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Invalid or missing symbol"}).encode())
+                    return
+                try:
+                    closed_count = 0
+                    with orchestrator.trade_lock:
+                        to_remove = []
+                        for tid, trade in list(orchestrator.active_trades.items()):
+                            if trade['asset'] == symbol:
+                                current_price = orchestrator.topology.history[symbol][-1]['price'] if orchestrator.topology.history[symbol] else trade['entry']
+                                if trade['direction'] == 'BUY':
+                                    pnl = current_price - trade['entry']
+                                else:
+                                    pnl = trade['entry'] - current_price
+                                orchestrator._close_trade(tid, current_price, pnl, "Admin Clear Asset")
+                                to_remove.append(tid)
+                                closed_count += 1
+                        for tid in to_remove:
+                            if tid in orchestrator.active_trades:
+                                del orchestrator.active_trades[tid]
+                    # Clear pending for that asset
+                    pending_removed = 0
+                    for key in list(orchestrator.pending_queue.pending.keys()):
+                        if orchestrator.pending_queue.pending[key]['asset'] == symbol:
+                            del orchestrator.pending_queue.pending[key]
+                            pending_removed += 1
+                    orchestrator.last_signal_time[symbol] = 0
+                    orchestrator.telegram.send_message(f"🧹 Admin cleared {closed_count} trades and {pending_removed} pending signals for {symbol}.")
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "success", "closed": closed_count, "pending_cleared": pending_removed}).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
+
+            # ---- Admin: Master reset (clear all) ----
+            if path == '/admin/clear_all':
+                if params.get('key') != Config.ADMIN_SECRET:
+                    self.send_response(403)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
+                    return
+                try:
+                    closed_count = 0
+                    with orchestrator.trade_lock:
+                        for tid, trade in list(orchestrator.active_trades.items()):
+                            asset = trade['asset']
+                            current_price = orchestrator.topology.history[asset][-1]['price'] if orchestrator.topology.history[asset] else trade['entry']
+                            if trade['direction'] == 'BUY':
+                                pnl = current_price - trade['entry']
+                            else:
+                                pnl = trade['entry'] - current_price
+                            orchestrator._close_trade(tid, current_price, pnl, "Admin Master Reset")
+                            closed_count += 1
+                        orchestrator.active_trades.clear()
+                    pending_count = len(orchestrator.pending_queue.pending)
+                    orchestrator.pending_queue.pending.clear()
+                    orchestrator.last_signal_time = {a: 0 for a in Config.ASSETS}
+                    orchestrator.signal_timestamps.clear()
+                    orchestrator.telegram.send_message(f"🧹 Admin master reset: Cleared {closed_count} trades and {pending_count} pending signals. All assets reset.")
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "success", "closed_trades": closed_count, "cleared_pending": pending_count}).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
+
+            # ---- Existing /rejections endpoint ----
+            if path == '/rejections':
                 self.send_response(200)
                 self.send_header("Content-type", "application/json")
                 self.end_headers()
@@ -1634,6 +1779,7 @@ def start_health_server(orchestrator):
                     self.wfile.write(json.dumps({"error": str(e)}).encode())
                 return
 
+            # ---- Health response ----
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -1659,7 +1805,8 @@ def start_health_server(orchestrator):
                         "breakeven_locked": trade.get('breakeven_locked', False),
                         "trailing_activated": trade.get('trailing_activated', False),
                         "health": trade.get('health', 100),
-                        "confidence": trade.get('current_score', 0)
+                        "confidence": trade.get('current_score', 0),
+                        "signal_token": trade.get('signal_token', None)
                     })
             perf = orchestrator.db.get_performance_metrics()
             mongo_stats = {}
@@ -1687,7 +1834,7 @@ def start_health_server(orchestrator):
                     candle_delay = max(candle_delay, int(time.time()) - candles[-1]["timestamp"] - 60)
             response = {
                 "status": "online",
-                "version": "6.3",
+                "version": "6.5",
                 "uptime_seconds": int(time.time() - orchestrator.start_time),
                 "cpu_percent": cpu,
                 "memory_percent": mem,
@@ -1716,7 +1863,7 @@ def start_health_server(orchestrator):
     httpd.serve_forever()
 
 # =====================================================================
-# LIFECYCLE CONTROLLER
+# LIFECYCLE CONTROLLER (with MAX_HOLD_TIME)
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1738,12 +1885,30 @@ class ActiveTradeLifecycle:
                     htf_trend = self.orch.asset_state[asset]["htf_trend"]
                     trade_duration = now - trade.get('entry_time', now)
 
+                    # ---- Smart Max Hold Time: Force close after 4 hours ----
+                    if trade_duration > Config.MAX_HOLD_TIME:
+                        if trade['direction'] == 'BUY':
+                            pnl = current_price - trade['entry']
+                        else:
+                            pnl = trade['entry'] - current_price
+                        if pnl > 0:
+                            # Lock SL to breakeven before closing (already in profit, just close with profit)
+                            self.orch._close_trade(tid, current_price, pnl, f"MaxHoldTime (Profit: {pnl:.2f})")
+                            self.orch.telegram.send_message(f"💰 Trade #{tid} force-closed in profit after {Config.MAX_HOLD_TIME//3600}h (PnL: +{pnl:.2f})")
+                        else:
+                            self.orch._close_trade(tid, current_price, pnl, f"MaxHoldTime (Loss: {pnl:.2f})")
+                            self.orch.telegram.send_message(f"⏰ Trade #{tid} force-closed in loss after {Config.MAX_HOLD_TIME//3600}h (PnL: {pnl:.2f})")
+                        to_remove.append(tid)
+                        continue
+
+                    # ---- Time Decay (existing) ----
                     if trade_duration > Config.TIME_DECAY_SECONDS and abs(current_price - trade['entry']) / trade['entry'] < Config.TIME_DECAY_THRESHOLD_PCT:
                         self.orch._close_trade(tid, current_price, 0.0, "Time-Decay")
                         to_remove.append(tid)
                         self.orch.telegram.send_message(f"⏳ Trade #{tid} closed due to consolidation.")
                         continue
 
+                    # ---- Health and confidence updates ----
                     base_score = trade.get('initial_score', 70)
                     health = 100
                     if (trade['direction'] == 'BUY' and htf_trend == 'BULLISH') or (trade['direction'] == 'SELL' and htf_trend == 'BEARISH'):
@@ -1779,9 +1944,10 @@ class ActiveTradeLifecycle:
                         else:
                             pnl_str = f"-{abs(pnl):.2f} (DRAWDOWN 🔴)"
                         direction_side = "BUY 🟢" if trade['direction'] == 'BUY' else "SELL 🔴"
+                        token_display = f"Token: {trade.get('signal_token', 'N/A')} | " if trade.get('signal_token') else ""
                         msg = (f"🔄 <b>TRADE MONITOR: #{tid} ({Config.DISPLAY_NAMES.get(asset, asset)})</b>\n"
                                f"📊 Side: {direction_side}\n"
-                               f"💰 PnL: {pnl_str}\n"
+                               f"{token_display}💰 PnL: {pnl_str}\n"
                                f"⚡ Confidence: {base_score}% | ❤️ Health: {health}%")
                         self.orch.telegram.send_message(msg)
 
@@ -1831,12 +1997,19 @@ class AIOrchestrator:
         self.asset_state = {a: {"trend": "NEUTRAL", "htf_trend": "NEUTRAL", "volume_ratio": 1.0,
                                 "rsi": 50, "adx": 20, "volatility": 0.01,
                                 "news_sentiment": 0, "news_importance": 0.5} for a in Config.ASSETS}
+        # Per-asset signal token counters
+        self.signal_token_counters = {a: 0 for a in Config.ASSETS}
         self.accepted = 0
         self.rejected = 0
         self.stream = None
 
         threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
         threading.Thread(target=self._process_queue, daemon=True).start()
+
+    def _generate_signal_token(self, asset):
+        self.signal_token_counters[asset] += 1
+        base = asset.replace('USDT', '')
+        return f"{base}-SIG#{self.signal_token_counters[asset]:03d}"
 
     def _process_queue(self):
         while True:
@@ -1946,6 +2119,7 @@ class AIOrchestrator:
             for tid, trade in list(self.active_trades.items()):
                 if trade['asset'] != asset:
                     continue
+                # Breakeven lock at 50% of target
                 if not trade.get('breakeven_locked', False):
                     target_dist = abs(trade['tp'] - trade['entry'])
                     half = trade['entry'] + 0.5 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.5 * target_dist
@@ -1954,6 +2128,7 @@ class AIOrchestrator:
                             trade['sl'] = trade['entry']
                             trade['breakeven_locked'] = True
                             logger.info(f"BE Locked for {tid}")
+                # Trailing stop activation at 70% of target
                 if not trade.get('trailing_activated', False):
                     target_dist = abs(trade['tp'] - trade['entry'])
                     trigger = trade['entry'] + 0.7 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.7 * target_dist
@@ -1963,6 +2138,7 @@ class AIOrchestrator:
                             trade['sl'] = new_sl
                             trade['trailing_activated'] = True
                             logger.info(f"Trailing activated for {tid}, new SL: {new_sl:.2f}")
+                # Check SL and TP
                 if trade['direction'] == 'BUY':
                     if price <= trade['sl']:
                         pnl = price - trade['entry']
@@ -1994,15 +2170,14 @@ class AIOrchestrator:
 
             # Process only on 15m candle close
             if self.topology.candle_just_closed.get(asset, False):
-                # ==================== FIX: PENDING VERIFICATION FIRST ====================
-                # 1. Priority 0: Process pending verifications for Scalper signals
+                # ---- Priority 0: Pending Verification (Scalper signals) ----
                 if self.pending_queue.pending:
                     self.pending_queue.check_pending(asset)
                     verified = self.pending_queue.get_verified_signals()
                     for signal in verified:
                         self._send_final_signal(signal)
 
-                # ---- 2. ENGINE A: SNIPER REVERSAL (Priority 1) ----
+                # ---- Priority 1: Engine A - Sniper Reversal ----
                 exh_result, exh_error = self.exhaust_filter.evaluate(asset, price)
                 if exh_result:
                     direction = exh_result["direction"]
@@ -2028,6 +2203,8 @@ class AIOrchestrator:
                     if rr < 2.5:
                         tp = price - 2.5 * risk if direction == "SELL" else price + 2.5 * risk
                         rr = 2.5
+                    # Generate signal token
+                    signal_token = self._generate_signal_token(asset)
                     signal_data = {
                         'asset': asset,
                         'direction': direction,
@@ -2047,17 +2224,19 @@ class AIOrchestrator:
                         'confidence': 'VERY HIGH',
                         'num_passed': 11,
                         'signal_type': 'SNIPER',
-                        'dynamic_min_sqs': score
+                        'dynamic_min_sqs': score,
+                        'signal_token': signal_token
                     }
                     self._send_final_signal(signal_data)
-                    return  # STOP further processing for this candle
+                    return  # stop further processing
 
-                # ---- 3. ENGINE B: STANDARD SCALPER ----
+                # ---- Priority 2: Engine B - Standard Scalper ----
                 self._update_indicators(asset, price)
                 htf_trend = self.asset_state[asset]["htf_trend"]
                 tf_trend = self.asset_state[asset]["trend"]
                 regime, params = self.regime_detector.detect(asset, price, volume, htf_trend, tf_trend)
 
+                # Gate 5: Session
                 session_ok, session_name, _ = self.session_timer.is_trading_time()
                 if not session_ok:
                     self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"],
@@ -2065,6 +2244,7 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
+                # Gate 2: News Blackout
                 now_dt = datetime.now(Config.IST)
                 blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
                 if blackout:
@@ -2073,6 +2253,7 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
+                # Gate 1: Market Regime with dynamic ADX threshold
                 adx_threshold = 22
                 if regime == "STRONG_TREND":
                     adx_threshold = 18
@@ -2087,6 +2268,7 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
+                # Determine direction
                 if htf_trend == "BULLISH" and tf_trend == "BULLISH":
                     direction = "BUY"
                 elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
@@ -2094,9 +2276,11 @@ class AIOrchestrator:
                 else:
                     return
 
+                # Advanced Signal Engine (bonus)
                 adv_score, patterns, trendline_status, zones = self.advanced_engine.evaluate(asset, price, direction)
                 logger.info(f"Advanced Score for {asset}: {adv_score}, Patterns: {patterns}, Trendline: {trendline_status}")
 
+                # Gate 3: MTF Confluence
                 mtf_tolerance = params.get("mtf_tolerance", 0.02)
                 check_4h = params.get("check_4h_ema", False)
                 mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction, tolerance=mtf_tolerance, check_4h=check_4h)
@@ -2106,6 +2290,7 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
+                # Gate 4: Order Flow
                 of_strict = params.get("order_flow_strict", True)
                 of_ok, of_reason = self.orderflow.check(asset, direction, price, strict=of_strict)
                 if not of_ok:
@@ -2114,6 +2299,7 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
+                # SQS Calculation
                 sr = self.topology.support_resistance[asset]
                 bos = self.topology.bos[asset]
                 choch = self.topology.choch[asset]
@@ -2134,6 +2320,7 @@ class AIOrchestrator:
                     self.rejected += 1
                     return
 
+                # Dynamic SL/TP
                 atr = self.topology.get_atr(asset)
                 if atr == 0:
                     atr = price * 0.01
@@ -2141,6 +2328,7 @@ class AIOrchestrator:
                 risk = abs(price - sl)
                 rr = abs(tp - price) / risk if risk > 0 else 0
 
+                # Cooldown & Daily Cap
                 now_ts = time.time()
                 if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
                     self.db.log_rejected(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"],
@@ -2153,6 +2341,9 @@ class AIOrchestrator:
                                          regime, "Daily Cap", regime)
                     self.rejected += 1
                     return
+
+                # Generate signal token
+                signal_token = self._generate_signal_token(asset)
 
                 signal_data = {
                     'asset': asset,
@@ -2175,10 +2366,11 @@ class AIOrchestrator:
                     'pending_candles': params.get('pending_candles', 2),
                     'volume_decay_threshold': params.get('volume_decay_threshold', 0.6),
                     'dynamic_min_sqs': min_sqs,
-                    'signal_type': 'STANDARD'
+                    'signal_type': 'STANDARD',
+                    'signal_token': signal_token
                 }
                 self.pending_queue.add_signal(signal_data)
-                logger.info(f"⏳ Signal pending: {asset} {direction} @ {price} (SQS: {total_sqs}) Regime: {regime}")
+                logger.info(f"⏳ Signal pending: {asset} {direction} @ {price} (SQS: {total_sqs}) Regime: {regime} Token: {signal_token}")
 
         except Exception as e:
             logger.error(f"Error in _handle_price_tick: {e}", exc_info=True)
@@ -2201,6 +2393,7 @@ class AIOrchestrator:
             news_score = signal['news_score']
             dynamic_min_sqs = signal.get('dynamic_min_sqs', Config.MIN_SQS)
             signal_type = signal.get('signal_type', 'STANDARD')
+            signal_token = signal.get('signal_token', None)
 
             if signal_type == "SNIPER":
                 # logic already contains reason; don't overwrite
@@ -2222,7 +2415,7 @@ class AIOrchestrator:
                 sqs, "HIGH", list(patterns.keys()), logic,
                 volatility, regime, htf_trend, news_score,
                 session, sqs, list(patterns.keys())[0] if patterns else "unknown",
-                dynamic_min_sqs, signal_type
+                dynamic_min_sqs, signal_type, signal_token
             )
 
             chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
@@ -2233,7 +2426,8 @@ class AIOrchestrator:
                 chart=chart, logic=logic, news=news,
                 score={"total_score": sqs, "confidence": "HIGH", "num_passed": 11},
                 patterns=patterns, trade_id=trade_id,
-                session=session, rr=rr, regime=regime, signal_type=signal_type
+                session=session, rr=rr, regime=regime, signal_type=signal_type,
+                signal_token=signal_token
             )
 
             self.accepted += 1
@@ -2255,7 +2449,8 @@ class AIOrchestrator:
                     'initial_score': sqs,
                     'current_score': sqs,
                     'health': 100,
-                    'regime': regime
+                    'regime': regime,
+                    'signal_token': signal_token
                 }
         except Exception as e:
             logger.error(f"Error in _send_final_signal: {e}", exc_info=True)
@@ -2276,7 +2471,7 @@ class AIOrchestrator:
 
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v6.3 Online – Dual-Engine Architecture + Smart SL/TP")
+        self.telegram.send_message("🚀 AI v6.5 Advanced Online – Dual-Engine + Smart Token + Admin Overrides")
 
         last_news = 0
         while True:
