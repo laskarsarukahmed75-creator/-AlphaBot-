@@ -2224,6 +2224,26 @@ class AIOrchestrator:
                     score = exh_result["score"]
                     reason = exh_result["reason"]
                     logger.info(f"🎯 SNIPER EXHAUSTION DETECTED: {asset} {direction} (Score: {score}, Reason: {reason})")
+        # ---- Institutional Bottling Check for BUY ----
+        if direction == "BUY":
+            analyzer = self.institutional_analyzers.get(asset)
+            if analyzer:
+                regime = self.regime_detector.current_regime.get(asset, "CHOP")
+                analyzer.set_regime(regime)
+                reversal_confirmed, score, details = analyzer.analyze(price)
+                
+                if not reversal_confirmed:
+                    self.db.log_rejected(
+                        asset, price, 0,
+                        f"Bottling Score {score:.2f} < 90",
+                        self.asset_state[asset]["volatility"],
+                        regime,
+                        "Institutional Bottling",
+                        regime
+                    )
+                    self.rejected += 1
+                    return
+
                     atr = self.topology.get_atr(asset)
                     if atr == 0:
                         atr = price * 0.01
