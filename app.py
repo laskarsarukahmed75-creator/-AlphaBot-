@@ -2008,6 +2008,43 @@ class AIOrchestrator:
 
         threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
         threading.Thread(target=self._process_queue, daemon=True).start()
+                # Initialize OI fetcher and analyzer per asset
+        self.oi_fetchers = {}
+        self.institutional_analyzers = {}
+        self.absorption_listeners = {}
+
+        for asset in Config.ASSETS:
+            fetcher = OIFetcher(asset)
+            self.oi_fetchers[asset] = fetcher
+            analyzer = InstitutionalAnalyzer(asset)
+            analyzer.set_oi_fetcher(fetcher)
+            self.institutional_analyzers[asset] = analyzer
+            
+            # Start WebSocket listener
+            from modules.websocket_listener import AbsorptionWebSocket
+            listener = AbsorptionWebSocket(asset)
+            listener.start()
+            self.absorption_listeners[asset] = listener
+
+        # Background thread to keep analyzer updated
+        threading.Thread(target=self._update_analyzer_loop, daemon=True).start()
+        
+     def _update_analyzer_loop(self):
+        while True:
+            try:
+                for asset in Config.ASSETS:
+                    listener = self.absorption_listeners.get(asset)
+                    if listener:
+                        state = listener.get_state()
+                        if state is not None:
+                            analyzer = self.institutional_analyzers.get(asset)
+                            if analyzer:
+                                analyzer.update_absorption_state(state)
+                                analyzer.update_cvd_state(state)
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Analyzer update loop error: {e}")
+                time.sleep(5)
 
     def _generate_signal_token(self, asset):
         self.signal_token_counters[asset] += 1
