@@ -19,9 +19,11 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import websocket
+
 # --- NEW MODULE IMPORTS ---
 from modules.institutional_analyzer import InstitutionalAnalyzer
 from modules.oi_fetcher import OIFetcher
+from modules.websocket_listener import AbsorptionWebSocket
 
 # Optional imports with graceful fallback
 try:
@@ -1611,7 +1613,7 @@ class BinancePublicStream:
             pass
 
 # =====================================================================
-# HEALTH SERVER (with admin endpoints)
+# HEALTH SERVER (with admin endpoints and bottling metrics)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -1782,7 +1784,7 @@ def start_health_server(orchestrator):
                     self.wfile.write(json.dumps({"error": str(e)}).encode())
                 return
 
-            # ---- Health response ----
+            # ---- Health response with institutional bottling metrics ----
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -1835,6 +1837,16 @@ def start_health_server(orchestrator):
                 candles = orchestrator.topology.candles[60][asset]
                 if candles and candles[-1].get("complete", False):
                     candle_delay = max(candle_delay, int(time.time()) - candles[-1]["timestamp"] - 60)
+
+            # ---- Build bottling metrics ----
+            bottling_metrics = {}
+            for asset in Config.ASSETS:
+                analyzer = orchestrator.institutional_analyzers.get(asset)
+                if analyzer:
+                    bottling_metrics[asset] = analyzer.get_bottling_metrics()
+                else:
+                    bottling_metrics[asset] = {}
+
             response = {
                 "status": "online",
                 "version": "6.5",
@@ -1852,7 +1864,8 @@ def start_health_server(orchestrator):
                 "news_sentiment": orchestrator.news.last_news.get('sentiment', {}).get('label', 'NEUTRAL'),
                 "fear_greed": orchestrator.news.fear_greed,
                 "mongodb": mongo_stats,
-                "regimes": orchestrator.regime_detector.current_regime if hasattr(orchestrator, 'regime_detector') else {}
+                "regimes": orchestrator.regime_detector.current_regime if hasattr(orchestrator, 'regime_detector') else {},
+                "institutional_bottling": bottling_metrics
             }
             self.wfile.write(json.dumps(response, indent=2).encode())
 
@@ -1895,7 +1908,6 @@ class ActiveTradeLifecycle:
                         else:
                             pnl = trade['entry'] - current_price
                         if pnl > 0:
-                            # Lock SL to breakeven before closing (already in profit, just close with profit)
                             self.orch._close_trade(tid, current_price, pnl, f"MaxHoldTime (Profit: {pnl:.2f})")
                             self.orch.telegram.send_message(f"💰 Trade #{tid} force-closed in profit after {Config.MAX_HOLD_TIME//3600}h (PnL: +{pnl:.2f})")
                         else:
@@ -2006,29 +2018,28 @@ class AIOrchestrator:
         self.rejected = 0
         self.stream = None
 
-        threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
-        threading.Thread(target=self._process_queue, daemon=True).start()
-                # Initialize OI fetcher and analyzer per asset
+        # ---- NEW: Institutional Analyzer Integration ----
         self.oi_fetchers = {}
         self.institutional_analyzers = {}
         self.absorption_listeners = {}
-
         for asset in Config.ASSETS:
             fetcher = OIFetcher(asset)
             self.oi_fetchers[asset] = fetcher
             analyzer = InstitutionalAnalyzer(asset)
             analyzer.set_oi_fetcher(fetcher)
             self.institutional_analyzers[asset] = analyzer
-            
             # Start WebSocket listener
-            from modules.websocket_listener import AbsorptionWebSocket
             listener = AbsorptionWebSocket(asset)
             listener.start()
             self.absorption_listeners[asset] = listener
 
-        # Background thread to keep analyzer updated
+        # Background thread to update analyzer states
         threading.Thread(target=self._update_analyzer_loop, daemon=True).start()
-        
+        # ---- END NEW ----
+
+        threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
+        threading.Thread(target=self._process_queue, daemon=True).start()
+
     def _update_analyzer_loop(self):
         while True:
             try:
@@ -2224,26 +2235,6 @@ class AIOrchestrator:
                     score = exh_result["score"]
                     reason = exh_result["reason"]
                     logger.info(f"🎯 SNIPER EXHAUSTION DETECTED: {asset} {direction} (Score: {score}, Reason: {reason})")
-        # ---- Institutional Bottling Check for BUY ----
-        if direction == "BUY":
-            analyzer = self.institutional_analyzers.get(asset)
-            if analyzer:
-                regime = self.regime_detector.current_regime.get(asset, "CHOP")
-                analyzer.set_regime(regime)
-                reversal_confirmed, score, details = analyzer.analyze(price)
-                
-                if not reversal_confirmed:
-                    self.db.log_rejected(
-                        asset, price, 0,
-                        f"Bottling Score {score:.2f} < 90",
-                        self.asset_state[asset]["volatility"],
-                        regime,
-                        "Institutional Bottling",
-                        regime
-                    )
-                    self.rejected += 1
-                    return
-
                     atr = self.topology.get_atr(asset)
                     if atr == 0:
                         atr = price * 0.01
@@ -2263,7 +2254,6 @@ class AIOrchestrator:
                     if rr < 2.5:
                         tp = price - 2.5 * risk if direction == "SELL" else price + 2.5 * risk
                         rr = 2.5
-                    # Generate signal token
                     signal_token = self._generate_signal_token(asset)
                     signal_data = {
                         'asset': asset,
@@ -2335,6 +2325,27 @@ class AIOrchestrator:
                     direction = "SELL"
                 else:
                     return
+
+                # ---- Institutional Bottling Check for BUY ----
+                if direction == "BUY":
+                    analyzer = self.institutional_analyzers.get(asset)
+                    if analyzer:
+                        # Update regime for the analyzer
+                        analyzer.set_regime(regime)
+                        reversal_confirmed, score, details = analyzer.analyze(price)
+                        if not reversal_confirmed:
+                            self.db.log_rejected(
+                                asset, price, 0,
+                                f"Bottling Score {score:.2f} < 90",
+                                self.asset_state[asset]["volatility"],
+                                regime,
+                                "Institutional Bottling",
+                                regime
+                            )
+                            self.rejected += 1
+                            return
+                        # If confirmed, we can optionally add bottling details to signal later
+                # ---- End Institutional Check ----
 
                 # Advanced Signal Engine (bonus)
                 adv_score, patterns, trendline_status, zones = self.advanced_engine.evaluate(asset, price, direction)
@@ -2531,7 +2542,7 @@ class AIOrchestrator:
 
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v6.5 Advanced Online – Dual-Engine + Smart Token + Admin Overrides")
+        self.telegram.send_message("🚀 AI v6.5 Advanced Online – Dual-Engine + Smart Token + Admin Overrides + Bottling Engine")
 
         last_news = 0
         while True:
