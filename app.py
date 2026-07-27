@@ -2029,7 +2029,7 @@ class AIOrchestrator:
         # Background thread to keep analyzer updated
         threading.Thread(target=self._update_analyzer_loop, daemon=True).start()
         
-     def _update_analyzer_loop(self):
+    def _update_analyzer_loop(self):
         while True:
             try:
                 for asset in Config.ASSETS:
