@@ -4,6 +4,7 @@
 import math
 from typing import List, Dict, Optional, Tuple, Any
 import os
+import sys
 import time
 import json
 import logging
@@ -20,10 +21,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import websocket
 
+# ---- FORCE ADD CURRENT DIRECTORY TO SYS PATH ----
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 # --- NEW MODULE IMPORTS ---
-from modules.institutional_analyzer import InstitutionalAnalyzer
-from modules.oi_fetcher import OIFetcher
-from modules.websocket_listener import AbsorptionWebSocket
+try:
+    from modules.institutional_analyzer import InstitutionalAnalyzer
+    from modules.oi_fetcher import OIFetcher
+    from modules.websocket_listener import AbsorptionWebSocket
+except ModuleNotFoundError:
+    from institutional_analyzer import InstitutionalAnalyzer
+    from oi_fetcher import OIFetcher
+    from websocket_listener import AbsorptionWebSocket
 
 # Optional imports with graceful fallback
 try:
