@@ -59,7 +59,7 @@ class AbsorptionWebSocket:
         if self.ws:
             self.ws.close()
 
-    def _run(self):
+    def _rus(self):
         while self.running:
             try:
                 self.ws = websocket.WebSocketApp(
@@ -69,7 +69,7 @@ class AbsorptionWebSocket:
                     on_close=self._on_close,
                     on_open=self._on_open
                 )
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                self.ws.run_forever(ping_interval=15, ping_timeout=8)
                 time.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(30, self.reconnect_delay * 1.5)
             except Exception as e:
