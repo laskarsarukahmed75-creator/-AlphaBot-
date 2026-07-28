@@ -2047,16 +2047,37 @@ class AIOrchestrator:
         self.oi_fetchers = {}
         self.institutional_analyzers = {}
         self.absorption_listeners = {}
+                # 🟢 नया सुरक्षित (Safe) कोड
         for asset in Config.ASSETS:
-            fetcher = OIFetcher(asset)
-            self.oi_fetchers[asset] = fetcher
-            analyzer = InstitutionalAnalyzer(asset)
-            analyzer.set_oi_fetcher(fetcher)
-            self.institutional_analyzers[asset] = analyzer
-            # Start WebSocket listener
-            listener = AbsorptionWebSocket(asset)
-            listener.start()
-            self.absorption_listeners[asset] = listener
+            # 1. Safe OIFetcher
+            fetcher = OIFetcher(asset) if OIFetcher is not None and callable(OIFetcher) else None
+            if fetcher:
+                self.oi_fetchers[asset] = fetcher
+
+            # 2. Safe InstitutionalAnalyzer
+            if InstitutionalAnalyzer is not None and callable(InstitutionalAnalyzer):
+                try:
+                    analyzer = InstitutionalAnalyzer(asset)
+                    if fetcher and hasattr(analyzer, 'set_oi_fetcher'):
+                        analyzer.set_oi_fetcher(fetcher)
+                    self.institutional_analyzers[asset] = analyzer
+                except Exception as e:
+                    logger.error(f"Failed to init InstitutionalAnalyzer for {asset}: {e}")
+                    self.institutional_analyzers[asset] = None
+            else:
+                self.institutional_analyzers[asset] = None
+
+            # 3. Safe AbsorptionWebSocket
+            if AbsorptionWebSocket is not None and callable(AbsorptionWebSocket):
+                try:
+                    listener = AbsorptionWebSocket(asset)
+                    listener.start()
+                    self.absorption_listeners[asset] = listener
+                except Exception as e:
+                    logger.error(f"Failed to start AbsorptionWebSocket for {asset}: {e}")
+                    self.absorption_listeners[asset] = None
+            else:
+                self.absorption_listeners[asset] = None
 
         # Background thread to update analyzer states
         threading.Thread(target=self._update_analyzer_loop, daemon=True).start()
