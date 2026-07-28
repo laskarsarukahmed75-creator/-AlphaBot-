@@ -25,14 +25,30 @@ import websocket
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # --- DIRECT & MODULE IMPORTS (Double Safety) ---
+# --- SAFE DIRECT & MODULE IMPORTS ---
 try:
     from institutional_analyzer import InstitutionalAnalyzer
+except Exception:
+    try:
+        from modules.institutional_analyzer import InstitutionalAnalyzer
+    except Exception:
+        InstitutionalAnalyzer = None
+
+try:
     from oi_fetcher import OIFetcher
+except Exception:
+    try:
+        from modules.oi_fetcher import OIFetcher
+    except Exception:
+        OIFetcher = None
+
+try:
     from websocket_listener import AbsorptionWebSocket
-except ModuleNotFoundError:
-    from modules.institutional_analyzer import InstitutionalAnalyzer
-    from modules.oi_fetcher import OIFetcher
-    from modules.websocket_listener import AbsorptionWebSocket
+except Exception:
+    try:
+        from modules.websocket_listener import AbsorptionWebSocket
+    except Exception:
+        AbsorptionWebSocket = None
 
 # Optional imports with graceful fallback
 try:
