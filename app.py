@@ -1624,7 +1624,7 @@ class BinancePublicStream:
                     on_message=self._on_msg,
                     on_error=lambda x, y: None
                 )
-                ws.run_forever(ping_interval=30, ping_timeout=10)
+                ws.run_forever(ping_interval=15, ping_timeout=8)
             except Exception:
                 time.sleep(5)
 
