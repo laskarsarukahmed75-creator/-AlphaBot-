@@ -59,7 +59,7 @@ class AbsorptionWebSocket:
         if self.ws:
             self.ws.close()
 
-    def _rus(self):
+    def _run(self):
         while self.running:
             try:
                 self.ws = websocket.WebSocketApp(
