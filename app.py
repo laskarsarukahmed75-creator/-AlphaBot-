@@ -551,7 +551,7 @@ class BinanceFuturesStream:
                                                  on_message=self._on_message,
                                                  on_error=self._on_error,
                                                  on_close=self._on_close)
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                self.ws.run_forever(ping_interval=15, ping_timeout=8)
             except Exception as e:
                 logger.error(f"Futures WebSocket error: {e}")
                 self.reconnect_count += 1
