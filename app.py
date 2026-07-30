@@ -514,7 +514,7 @@ class EconomicCalendar:
         return False, None
 
 # =====================================================================
-# BINANCE FUTURES WEBSOCKET (FINAL CORRECTED – PROTOCOL PING)
+# BINANCE FUTURES WEBSOCKET (ROOT FIX – NO HEALTH CHECK)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -533,10 +533,9 @@ class BinanceFuturesStream:
         self.reconnect_count = 0
         self.on_data = on_data
         self.thread = None
-        self.last_ping = time.time()
+        self.last_ping = time.time()     # only for logging, not used for health
         self.msg_count = 0
         self.last_log_time = time.time()
-        # No separate ping thread – library handles it
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -544,7 +543,7 @@ class BinanceFuturesStream:
         self.running = True
         self.thread = threading.Thread(target=self._ws_loop, daemon=True)
         self.thread.start()
-        threading.Thread(target=self._health_check, daemon=True).start()
+        # HEALTH CHECK REMOVED – library handles reconnection via ping_timeout
 
     def stop(self):
         self.running = False
@@ -562,15 +561,15 @@ class BinanceFuturesStream:
                     on_error=self._on_error,
                     on_close=self._on_close
                 )
-                # ---- Protocol-level Ping (h24 20s में) ----
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                # ---- Protocol-level Ping every 15s, timeout 10s ----
+                self.ws.run_forever(ping_interval=15, ping_timeout=10)
             except Exception as e:
                 logger.error(f"Futures WebSocket error: {e}")
                 self.reconnect_count += 1
                 time.sleep(delay)
                 delay = min(60, delay * 2)
             else:
-                delay = 1
+                delay = 1  # reset on successful connection
 
     def _on_open(self, ws):
         logger.info("Binance Futures WebSocket connected.")
@@ -584,11 +583,10 @@ class BinanceFuturesStream:
         self.last_log_time = time.time()
 
     def _on_message(self, ws, message):
-        # Update timestamp and message counter
+        # Update timestamp for logging (not used for health)
         self.last_ping = time.time()
         self.msg_count += 1
 
-        # Log message rate every 60 seconds
         now = time.time()
         if now - self.last_log_time >= 60:
             logger.info(f"Futures WS msg rate: {self.msg_count} msgs/min")
@@ -645,16 +643,6 @@ class BinanceFuturesStream:
         logger.warning(f"Futures WebSocket closed: {close_status_code} - {close_msg}")
         self.reconnect_count += 1
 
-    def _health_check(self):
-        while self.running:
-            time.sleep(30)
-            # ---- 300s safety – now never triggers due to protocol ping ----
-            if time.time() - self.last_ping > 600:
-                logger.warning("Futures WebSocket no data for >600s, forcing reconnect.")
-                if self.ws:
-                    self.ws.close()
-                self.reconnect_count += 1
-
     # ---- Public methods ----
     def get_open_interest(self, symbol):
         with self.lock:
@@ -675,6 +663,7 @@ class BinanceFuturesStream:
         with self.lock:
             now = time.time()
             return [e for e in self.data['liquidations'] if e['symbol'] == symbol and (now - e['time']) <= lookback_seconds]
+
 # =====================================================================
 # CANDLE TOPOLOGY ENGINE
 # =====================================================================
