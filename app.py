@@ -649,8 +649,8 @@ class BinanceFuturesStream:
         while self.running:
             time.sleep(30)
             # ---- 300s safety – now never triggers due to protocol ping ----
-            if time.time() - self.last_ping > 300:
-                logger.warning("Futures WebSocket no data for >300s, forcing reconnect.")
+            if time.time() - self.last_ping > 600:
+                logger.warning("Futures WebSocket no data for >600s, forcing reconnect.")
                 if self.ws:
                     self.ws.close()
                 self.reconnect_count += 1
