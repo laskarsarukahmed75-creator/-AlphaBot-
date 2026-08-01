@@ -2023,28 +2023,6 @@ class ActiveTradeLifecycle:
 # =====================================================================
 # AlphaBot v6.5 – AIOrchestrator (Ultra-Advance Dynamic Architecture)
 # =====================================================================
-import threading
-import time
-import queue
-import gc
-from collections import deque
-from datetime import datetime
-import json
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# ---- Safe Module Imports with Fallback ----
-try:
-    from modules.oi_fetcher import OIFetcher
-    from modules.websocket_listener import AbsorptionWebSocket
-    from modules.institutional_analyzer import InstitutionalAnalyzer
-except ImportError:
-    from oi_fetcher import OIFetcher
-    from websocket_listener import AbsorptionWebSocket
-    from institutional_analyzer import InstitutionalAnalyzer
-
-logger = logging.getLogger("AI-Orchestrator-v6.5")
-
 class AIOrchestrator:
     def __init__(self):
         # ---- Core Components ----
