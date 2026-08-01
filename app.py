@@ -21,32 +21,37 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import websocket
 
-# ---- FORCE ADD CURRENT DIRECTORY TO SYS PATH ----
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# ---- FORCE ADD CURRENT & MODULES DIRECTORY TO SYS PATH ----
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-# --- DIRECT & MODULE IMPORTS (Double Safety) ---
-# --- SAFE DIRECT & MODULE IMPORTS ---
+MODULES_DIR = os.path.join(BASE_DIR, "modules")
+if os.path.exists(MODULES_DIR) and MODULES_DIR not in sys.path:
+    sys.path.insert(0, MODULES_DIR)
+
+# ---- SAFE DUAL-PATH IMPORTS (Modules Priority First) ----
 try:
-    from institutional_analyzer import InstitutionalAnalyzer
+    from modules.institutional_analyzer import InstitutionalAnalyzer
 except Exception:
     try:
-        from modules.institutional_analyzer import InstitutionalAnalyzer
+        from institutional_analyzer import InstitutionalAnalyzer
     except Exception:
         InstitutionalAnalyzer = None
 
 try:
-    from oi_fetcher import OIFetcher
+    from modules.oi_fetcher import OIFetcher
 except Exception:
     try:
-        from modules.oi_fetcher import OIFetcher
+        from oi_fetcher import OIFetcher
     except Exception:
         OIFetcher = None
 
 try:
-    from websocket_listener import AbsorptionWebSocket
+    from modules.websocket_listener import AbsorptionWebSocket
 except Exception:
     try:
-        from modules.websocket_listener import AbsorptionWebSocket
+        from websocket_listener import AbsorptionWebSocket
     except Exception:
         AbsorptionWebSocket = None
 
