@@ -103,33 +103,33 @@ class MongoDatabase:
             self.client = None; self.db = None
 
     def _create_indexes(self):
-        if not self.db: return
+        if self.db is None: return
         try:
             self.db.candles.create_index([("asset", 1), ("timeframe", 1), ("timestamp", 1)], unique=True)
             self.db.trades.create_index([("asset", 1), ("timestamp", -1)])
         except Exception: pass
 
     def save_candle(self, asset, tf, candle):
-        if not self.db: return
+        if self.db is None: return
         try:
             doc = {**candle, "asset": asset, "timeframe": tf}
             self.db.candles.update_one({"asset": asset, "timeframe": tf, "timestamp": candle["timestamp"]}, {"$set": doc}, upsert=True)
         except Exception: pass
 
     def load_candles(self, asset, tf, limit=500):
-        if not self.db: return []
+        if self.db is None: return []
         try:
             return list(self.db.candles.find({"asset": asset, "timeframe": tf}).sort("timestamp", 1).limit(limit))
         except Exception: return []
 
     def save_trade_backup(self, trade_data):
-        if not self.db: return
+        if self.db is None: return
         try:
             self.db.trades.update_one({"id": trade_data["id"]}, {"$set": trade_data}, upsert=True)
         except Exception: pass
 
     def save_rejected_backup(self, rejected_data):
-        if not self.db: return
+        if self.db is None: return
         try:
             self.db.rejected.insert_one(rejected_data)
         except Exception: pass
