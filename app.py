@@ -26,10 +26,12 @@ try:
     from modules.institutional_analyzer import InstitutionalAnalyzer
 except Exception:
     InstitutionalAnalyzer = None
+
 try:
     from modules.oi_fetcher import OIFetcher
 except Exception:
     OIFetcher = None
+
 try:
     from modules.websocket_listener import AbsorptionWebSocket
 except Exception:
@@ -40,6 +42,12 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
+
+try:
+    import pymongo
+    HAS_PYMONGO = True
+except ImportError:
+    HAS_PYMONGO = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("AI-Orchestrator-v7.0")
