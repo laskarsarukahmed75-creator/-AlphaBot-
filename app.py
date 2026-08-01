@@ -1958,39 +1958,49 @@ class AIOrchestrator:
 
     def _send_final_signal(self, signal):
         try:
-            asset = signal['asset']; direction = signal['direction']; price = signal['entry']
-            sl = signal['sl']; tp = signal['tp']; sqs = signal['sqs']
-            session = signal['session']; patterns = signal['patterns']; logic = signal['logic']
-            news = signal['news']; volatility = signal['volatility']; regime = signal['regime']
-            htf_trend = signal['htf_trend']; news_score = signal['news_score']
+            asset = signal['asset']
+            direction = signal['direction']
+            price = signal['entry']
+            sl, tp = signal['sl'], signal['tp']
+            sqs, session = signal['sqs'], signal['session']
+            patterns, logic, news = signal['patterns'], signal['logic'], signal['news']
+            volatility, regime, htf_trend = signal['volatility'], signal['regime'], signal['htf_trend']
+            news_score = signal['news_score']
             dynamic_min_sqs = signal.get('dynamic_min_sqs', Config.MIN_SQS)
             signal_type = signal.get('signal_type', 'STANDARD')
             token = signal.get('signal_token', None)
             pattern_name = signal.get('pattern_name', "unknown")
             chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
-            rr = abs(tp-price) / abs(price-sl) if abs(price-sl) > 0 else 0
+            rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
 
-            # Async DB write
-            trade_id = self.db_pipeline.add_trade(
+            # Direct synchronous SQLite write (To get valid trade_id)
+            trade_id = self.db.log_trade(
                 asset, direction, price, sl, tp, sqs, "HIGH", list(patterns.keys()), logic,
                 volatility, regime, htf_trend, news_score, session, sqs,
-                pattern_name, dynamic_min_sqs, signal_type, token,
-                data={'id': 0, 'asset': asset, ...}
+                pattern_name, dynamic_min_sqs, signal_type, token
             )
-            # We need to get the actual trade_id; we'll sync later or modify DB pipeline to return id.
-            # For now, we'll do a synchronous call for ID, but we'll queue the backup.
-            # Better: we'll keep synchronous SQLite for main trade log but queue MongoDB backup.
-            # Adjusting: We'll call db.log_trade synchronously and then queue MongoDB backup.
-            trade_id = self.db.log_trade(asset, direction, price, sl, tp, sqs, "HIGH", list(patterns.keys()), logic,
-                                         volatility, regime, htf_trend, news_score, session, sqs,
-                                         pattern_name, dynamic_min_sqs, signal_type, token)
-            # Queue MongoDB backup
-            if self.mongo.db:
-                self.db_pipeline.queue.put({'type': 'trade_backup', 'data': {'id': trade_id, ...}})
 
-            self.telegram.fire_signal(asset, direction, price, sl, tp, chart, logic, news,
-                                      {"total_score": sqs, "confidence": "HIGH", "num_passed": 11},
-                                      patterns, trade_id, session, rr, regime, signal_type, token)
+            # Asynchronous Mongo Backup
+            if self.mongo.db:
+                backup_data = {
+                    'id': trade_id,
+                    'asset': asset,
+                    'direction': direction,
+                    'entry': price,
+                    'stop_loss': sl,
+                    'take_profit': tp,
+                    'score': sqs,
+                    'status': 'open',
+                    'signal_type': signal_type,
+                    'signal_token': token
+                }
+                self.db_pipeline.queue.put({'type': 'trade', 'args': (), 'data': backup_data})
+
+            self.telegram.fire_signal(
+                asset, direction, price, sl, tp, chart, logic, news,
+                {"total_score": sqs, "confidence": "HIGH", "num_passed": 11},
+                patterns, trade_id, session, rr, regime, signal_type, token
+            )
             self.accepted += 1
             self.last_signal_time[asset] = time.time()
             self.signal_timestamps.append(time.time())
