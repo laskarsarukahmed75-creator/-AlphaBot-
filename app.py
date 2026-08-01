@@ -2016,10 +2016,33 @@ class ActiveTradeLifecycle:
                 gc.collect()
                                 
 # =====================================================================
-# CORE ORCHESTRATOR (CLEAN + SAFETY CAPS + TIME RESET)
+# AlphaBot v6.5 – AIOrchestrator (Ultra-Advance Dynamic Architecture)
 # =====================================================================
+import threading
+import time
+import queue
+import gc
+from collections import deque
+from datetime import datetime
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---- Safe Module Imports with Fallback ----
+try:
+    from modules.oi_fetcher import OIFetcher
+    from modules.websocket_listener import AbsorptionWebSocket
+    from modules.institutional_analyzer import InstitutionalAnalyzer
+except ImportError:
+    from oi_fetcher import OIFetcher
+    from websocket_listener import AbsorptionWebSocket
+    from institutional_analyzer import InstitutionalAnalyzer
+
+logger = logging.getLogger("AI-Orchestrator-v6.5")
+
 class AIOrchestrator:
     def __init__(self):
+        # ---- Core Components ----
         self.topology = CandleTopologyEngine()
         self.news = CryptoNewsScanner()
         self.db = TradeDatabase()
@@ -2058,14 +2081,120 @@ class AIOrchestrator:
         self.rejected = 0
         self.stream = None
 
-        # ---- Institutional Analyzer ----
+        # Persistent metadata & State hydration
+        self._load_or_create_metadata()
+
+        # ---- PER-ASSET STATE MACHINE (Isolated) ----
+        self.asset_states = {a: "SEARCHING_BOTTOM" for a in Config.ASSETS}
+        self.state_cache_ttl = 300
+        self._state_last_written = 0
+        self._load_all_states_from_db()
+
+        # ---- Institutional Async Components ----
         self.oi_fetchers = {}
         self.institutional_analyzers = {}
         self.absorption_listeners = {}
+        self._init_institutional_components()
+
+        # ---- FIX 1: ThreadPoolExecutor dynamic workers based on asset count ----
+        self.bottling_executor = ThreadPoolExecutor(max_workers=len(Config.ASSETS) * 2)
+
+        # ---- Background Threads ----
+        threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
+        threading.Thread(target=self._process_queue, daemon=True).start()
+        threading.Thread(target=self._institutional_bottling_thread, daemon=True).start()
+        threading.Thread(target=self._update_analyzer_loop, daemon=True).start()
+        threading.Thread(target=self._ping_self_loop, daemon=True).start()
+
+        logger.info("🚀 AIOrchestrator initialized with Per-Asset States & Intra-Candle Entry")
+
+    # -----------------------------------------------------------------
+    # 1. Persistent Metadata
+    # -----------------------------------------------------------------
+    def _load_or_create_metadata(self):
+        if self.mongo.db is None:
+            self.start_time = time.time()
+            self.restart_count = 0
+            return
+        try:
+            meta = self.mongo.db.bot_metadata.find_one({"_id": "bot_metadata"})
+            now = int(time.time())
+            if meta is None:
+                self.mongo.db.bot_metadata.insert_one({
+                    "_id": "bot_metadata", "started_at": now,
+                    "last_restart_at": now, "restart_count": 0
+                })
+                self.start_time = now
+                self.restart_count = 0
+            else:
+                self.start_time = meta.get("started_at", now)
+                self.restart_count = meta.get("restart_count", 0) + 1
+                self.mongo.db.bot_metadata.update_one(
+                    {"_id": "bot_metadata"},
+                    {"$set": {"last_restart_at": now}, "$inc": {"restart_count": 1}}
+                )
+        except Exception:
+            self.start_time = time.time()
+            self.restart_count = 0
+
+    # -----------------------------------------------------------------
+    # 2. Per‑Asset State Persistence
+    # -----------------------------------------------------------------
+    def _load_all_states_from_db(self):
+        if self.mongo.db is None:
+            return
+        try:
+            doc = self.mongo.db.bot_state.find_one({"_id": "asset_states"})
+            if doc and "states" in doc:
+                stored = doc["states"]
+                for asset in Config.ASSETS:
+                    if asset in stored:
+                        self.asset_states[asset] = stored[asset]
+                logger.info(f"📌 Loaded per-asset states: {self.asset_states}")
+            else:
+                # Initialize default
+                self.mongo.db.bot_state.insert_one({
+                    "_id": "asset_states",
+                    "states": {a: "SEARCHING_BOTTOM" for a in Config.ASSETS},
+                    "updated_at": int(time.time())
+                })
+        except Exception as e:
+            logger.warning(f"State load warning: {e}")
+
+    def _persist_asset_states(self):
+        if self.mongo.db is None:
+            return
+        now = time.time()
+        if now - self._state_last_written < self.state_cache_ttl:
+            return
+        try:
+            self.mongo.db.bot_state.update_one(
+                {"_id": "asset_states"},
+                {"$set": {"states": self.asset_states, "updated_at": int(now)}},
+                upsert=True
+            )
+            self._state_last_written = now
+            logger.info(f"💾 Asset states saved: {self.asset_states}")
+        except Exception as e:
+            logger.error(f"State save error: {e}")
+
+    def _switch_asset_state(self, asset, new_state):
+        if self.asset_states[asset] == new_state:
+            return
+        old = self.asset_states[asset]
+        self.asset_states[asset] = new_state
+        logger.info(f"🔄 {asset} State Shift: {old} -> {new_state}")
+        self._persist_asset_states()
+
+    # -----------------------------------------------------------------
+    # 3. Institutional Components
+    # -----------------------------------------------------------------
+    def _init_institutional_components(self):
         for asset in Config.ASSETS:
             fetcher = OIFetcher(asset) if OIFetcher is not None and callable(OIFetcher) else None
             if fetcher:
                 self.oi_fetchers[asset] = fetcher
+
             if InstitutionalAnalyzer is not None and callable(InstitutionalAnalyzer):
                 try:
                     analyzer = InstitutionalAnalyzer(asset)
@@ -2073,339 +2202,466 @@ class AIOrchestrator:
                         analyzer.set_oi_fetcher(fetcher)
                     self.institutional_analyzers[asset] = analyzer
                 except Exception as e:
-                    logger.error(f"Failed to init InstitutionalAnalyzer for {asset}: {e}")
+                    logger.error(f"Analyzer init error for {asset}: {e}")
                     self.institutional_analyzers[asset] = None
-            else:
-                self.institutional_analyzers[asset] = None
+
             if AbsorptionWebSocket is not None and callable(AbsorptionWebSocket):
                 try:
                     listener = AbsorptionWebSocket(asset)
                     listener.start()
                     self.absorption_listeners[asset] = listener
                 except Exception as e:
-                    logger.error(f"Failed to start AbsorptionWebSocket for {asset}: {e}")
+                    logger.error(f"WebSocket listener init error for {asset}: {e}")
                     self.absorption_listeners[asset] = None
-            else:
-                self.absorption_listeners[asset] = None
-
-        threading.Thread(target=self._update_analyzer_loop, daemon=True).start()
-
-        # ---- MongoDB Hydration & Self‑Learning Setup ----
-        self.performance = self._hydrate_from_mongodb()
-        # penalty storage: pattern -> (penalty, timestamp)
-        self.penalty_store = {}
-        self.penalty_expiry = 86400  # 24 hours
-        self.MIN_SQS = 60
-        self.MAX_SQS = 75
-
-        threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
-        threading.Thread(target=self._process_queue, daemon=True).start()
 
     # -----------------------------------------------------------------
-    # STATE HYDRATION
+    # 4. Async Bottling Thread (Parallel + Per‑Asset States)
     # -----------------------------------------------------------------
-    def _hydrate_from_mongodb(self):
-        perf = {"total_trades": 0, "winning_trades": 0, "losing_trades": 0,
-                "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0}
-        if self.mongo.db is None:
-            logger.warning("MongoDB not available – skipping state hydration.")
-            return perf
-        try:
-            closed = list(self.mongo.db.trades.find({"status": "closed"}))
-            total = len(closed)
-            wins = sum(1 for t in closed if t.get("pnl", 0) > 0)
-            losses = total - wins
-            total_pnl = sum(t.get("pnl", 0) for t in closed)
-            perf = {"total_trades": total, "winning_trades": wins, "losing_trades": losses,
-                    "win_rate": wins / total if total else 0.0,
-                    "total_pnl": total_pnl, "avg_pnl": total_pnl / total if total else 0.0}
-            logger.info(f"📊 Hydration: {total} closed trades | Win Rate: {perf['win_rate']:.2%}")
-
-            # Restore active trades
-            for doc in self.mongo.db.trades.find({"status": "open"}):
-                tid = doc["id"]
-                self.active_trades[tid] = {
-                    'id': tid, 'asset': doc["asset"], 'direction': doc["direction"],
-                    'entry': doc["entry"], 'sl': doc["stop_loss"], 'tp': doc["take_profit"],
-                    'entry_time': doc["entry_time"],
-                    'breakeven_locked': doc.get("breakeven_locked", False),
-                    'trailing_activated': doc.get("trailing_activated", False),
-                    'hold_sent': doc.get("hold_sent", False),
-                    'initial_score': doc["score"], 'current_score': doc["score"],
-                    'health': 100, 'regime': doc.get("regime", "UNKNOWN"),
-                    'signal_token': doc.get("signal_token", None)
-                }
-                logger.info(f"🔄 Restored active trade #{tid}")
-
-            # Load failed patterns (for penalty)
-            if "failed_patterns" in self.mongo.db.list_collection_names():
-                for doc in self.mongo.db.failed_patterns.find({}):
-                    pattern = doc.get("pattern", "unknown")
-                    count = doc.get("count", 1)
-                    # We'll apply penalty as: penalty = min(10, count * 2)
-                    # But we store base count and compute penalty dynamically with expiry.
-                    self.penalty_store[pattern] = (count, time.time())
-                logger.info(f"📉 Loaded {len(self.penalty_store)} failed patterns.")
-        except Exception as e:
-            logger.error(f"❌ Hydration failed: {e}")
-        return perf
-
-    # -----------------------------------------------------------------
-    # SELF‑LEARNING WITH SAFETY CAPS & TIME RESET
-    # -----------------------------------------------------------------
-    def _log_failed_trade(self, pattern):
-        if self.mongo.db is None:
-            return
-        try:
-            now = time.time()
-            if pattern in self.penalty_store:
-                count, _ = self.penalty_store[pattern]
-                self.penalty_store[pattern] = (count + 1, now)
-            else:
-                self.penalty_store[pattern] = (1, now)
-            self.mongo.db.failed_patterns.update_one(
-                {"pattern": pattern}, {"$inc": {"count": 1}}, upsert=True
-            )
-            logger.info(f"📝 Logged failed pattern: {pattern}")
-        except Exception as e:
-            logger.error(f"Failed to log: {e}")
-
-    def _get_penalty(self, pattern):
-        """Return penalty (0-10) for a pattern, with time‑based decay."""
-        if pattern not in self.penalty_store:
-            return 0
-        count, timestamp = self.penalty_store[pattern]
-        # Reset after 24 hours
-        if time.time() - timestamp > self.penalty_expiry:
-            # Remove from store and from DB (optional)
-            if pattern in self.penalty_store:
-                del self.penalty_store[pattern]
-            # Also delete from MongoDB
-            if self.mongo.db is not None:
-                self.mongo.db.failed_patterns.delete_one({"pattern": pattern})
-            return 0
-        # Penalty = min(10, count * 2)
-        penalty = min(10, count * 2)
-        return penalty
-
-    def _apply_dynamic_sqs(self, base_min_sqs, pattern):
-        penalty = self._get_penalty(pattern)
-        new_sqs = base_min_sqs + penalty
-        # Safety Caps
-        if new_sqs < self.MIN_SQS:
-            new_sqs = self.MIN_SQS
-        elif new_sqs > self.MAX_SQS:
-            new_sqs = self.MAX_SQS
-        return new_sqs
-
-    # -----------------------------------------------------------------
-    # OVERRIDE _close_trade TO LOG FAILURES
-    # -----------------------------------------------------------------
-    def _close_trade(self, tid, price, pnl, reason=""):
-        trade_data = self.active_trades.get(tid, {})
-        pattern = trade_data.get("pattern_name", "unknown")
-
-        self.db.close_trade(tid, price, pnl, reason)
-        self.telegram.send_message(f"🔒 Trade #{tid} closed at {price:.2f} | PnL: {pnl:+.2f} | Reason: {reason}")
-        logger.info(f"Trade {tid} closed. PnL: {pnl:.2f}, Reason: {reason}")
-
-        if self.mongo.db is not None:
+    def _institutional_bottling_thread(self):
+        """Parallel asset‑wise bottling check with per‑asset state isolation."""
+        while True:
             try:
-                self.mongo.db.trades.update_one(
-                    {"id": tid},
-                    {"$set": {"status": "closed", "exit_price": price, "pnl": pnl,
-                              "close_time": int(time.time()), "exit_reason": reason}}
-                )
-            except Exception:
-                pass
+                futures = []
+                for asset in Config.ASSETS:
+                    future = self.bottling_executor.submit(self._analyze_asset_bottling, asset)
+                    futures.append(future)
 
-        if pnl < 0 and pattern and pattern != "unknown":
-            self._log_failed_trade(pattern)
+                for future in as_completed(futures):
+                    # Just to catch exceptions
+                    future.result()
 
-        if tid in self.active_trades:
-            del self.active_trades[tid]
+                time.sleep(1)   # reduced from 3s to 1s for faster detection
+            except Exception as e:
+                logger.error(f"Bottling thread exception: {e}")
+                time.sleep(5)
+
+    def _analyze_asset_bottling(self, asset):
+        """Single asset analysis (runs in thread pool)."""
+        try:
+            analyzer = self.institutional_analyzers.get(asset)
+            if not analyzer:
+                return
+
+            listener = self.absorption_listeners.get(asset)
+            if listener:
+                state = listener.get_state()
+                if state:
+                    # ---- FIX 2: Freshness Check (skip if data older than 3s) ----
+                    last_update = state.get("last_update", 0)
+                    if time.time() - last_update > 3:
+                        logger.debug(f"Stale orderbook data for {asset} (age: {time.time()-last_update:.1f}s), skipping.")
+                        return
+                    analyzer.update_absorption_state(state)
+                    analyzer.update_cvd_state(state)
+
+            price = None
+            if self.topology.history.get(asset):
+                price = self.topology.history[asset][-1]['price']
+            if not price or price <= 0:
+                return
+
+            with self.trade_lock:
+                if any(t['asset'] == asset for t in self.active_trades.values()):
+                    return
+
+            regime = self.regime_detector.current_regime.get(asset, "CHOP")
+            analyzer.set_regime(regime)
+            reversal_confirmed, score, details = analyzer.analyze(price)
+
+            # Per‑asset state check
+            current_state = self.asset_states.get(asset, "SEARCHING_BOTTOM")
+            if current_state == "SEARCHING_BOTTOM" and score >= 60:
+                self._fire_high_reward_signal(asset, "BUY", price, details)
+                self._switch_asset_state(asset, "SEARCHING_TOP")
+            elif current_state == "SEARCHING_TOP" and score < 50:
+                self._fire_high_reward_signal(asset, "SELL", price, details)
+                self._switch_asset_state(asset, "SEARCHING_BOTTOM")
+
+        except Exception as e:
+            logger.error(f"Bottling analyze error for {asset}: {e}")
 
     # -----------------------------------------------------------------
-    # MODIFIED _handle_price_tick (with dynamic SQS)
+    # 5. Dynamic SL/TP based on Liquidity Pools (S/R + ATR)
+    # -----------------------------------------------------------------
+    def _calculate_dynamic_sltp(self, asset, direction, entry, atr, details=None):
+        """Return (sl, tp) using nearest S/R and volatility bands."""
+        sr = self.topology.support_resistance[asset]
+        if direction == "BUY":
+            # Find nearest support below entry
+            supports = [s for s in sr["support"] if s < entry]
+            if supports:
+                nearest_support = max(supports)
+                # SL = support - 0.5*ATR (buffer)
+                sl = nearest_support - 0.5 * atr
+                # Ensure SL not too far: cap at 1.5*ATR from entry
+                if entry - sl > 1.5 * atr:
+                    sl = entry - 1.5 * atr
+            else:
+                sl = entry - 1.2 * atr
+            # TP = nearest resistance + some buffer, or 8-10x risk
+            resistances = [r for r in sr["resistance"] if r > entry]
+            if resistances:
+                nearest_resistance = min(resistances)
+                tp = nearest_resistance
+                # Ensure at least 2x risk
+                if tp - entry < 2 * (entry - sl):
+                    tp = entry + 2 * (entry - sl)
+            else:
+                tp = entry + 8 * (entry - sl)
+        else:  # SELL
+            resistances = [r for r in sr["resistance"] if r > entry]
+            if resistances:
+                nearest_resistance = min(resistances)
+                sl = nearest_resistance + 0.5 * atr
+                if sl - entry > 1.5 * atr:
+                    sl = entry + 1.5 * atr
+            else:
+                sl = entry + 1.2 * atr
+            supports = [s for s in sr["support"] if s < entry]
+            if supports:
+                nearest_support = max(supports)
+                tp = nearest_support
+                if entry - tp < 2 * (sl - entry):
+                    tp = entry - 2 * (sl - entry)
+            else:
+                tp = entry - 8 * (sl - entry)
+
+        # Safety caps: SL within ±10%, TP within ±30% from entry
+        if direction == "BUY":
+            sl = max(sl, entry * 0.90)
+            tp = min(tp, entry * 1.30)
+        else:
+            sl = min(sl, entry * 1.10)
+            tp = max(tp, entry * 0.70)
+
+        return sl, tp
+
+    def _fire_high_reward_signal(self, asset, direction, price, details):
+        atr = self.topology.get_atr(asset) or price * 0.01
+        sl, tp = self._calculate_dynamic_sltp(asset, direction, price, atr, details)
+        risk = abs(price - sl)
+        rr = abs(tp - price) / risk if risk > 0 else 0
+
+        signal_token = self._generate_signal_token(asset)
+        signal_data = {
+            'asset': asset, 'direction': direction, 'entry': price,
+            'sl': sl, 'tp': tp, 'sqs': 80, 'session': "ALWAYS",
+            'patterns': {}, 'logic': f"INSTITUTIONAL_REVERSAL (RR={rr:.1f})",
+            'news': self.news.last_news.get('title', 'No news')[:100],
+            'volatility': self.asset_state[asset]["volatility"],
+            'regime': "BOTTLING", 'htf_trend': self.asset_state[asset]["htf_trend"],
+            'news_score': self.asset_state[asset]["news_sentiment"],
+            'score': 0, 'confidence': 'VERY HIGH', 'num_passed': 11,
+            'signal_type': 'BOTTLING', 'dynamic_min_sqs': 80,
+            'signal_token': signal_token, 'pattern_name': 'bottling'
+        }
+        self._send_final_signal(signal_data)
+        logger.info(f"🎯 INSTITUTIONAL REVERSAL {direction} for {asset} @ {price} (RR={rr:.1f})")
+
+    # -----------------------------------------------------------------
+    # 6. Intra‑Candle Micro‑Structure Entry (Orderbook Imbalance)
+    # -----------------------------------------------------------------
+    def _check_intra_candle_signal(self, asset, price, volume):
+        """Immediate entry if orderbook absorption is strong and price near S/R."""
+        if not self.absorption_listeners.get(asset):
+            return
+
+        listener = self.absorption_listeners[asset]
+        state = listener.get_state()
+        if not state:
+            return
+
+        # ---- FIX 2: Freshness Check (skip if data older than 3s) ----
+        last_update = state.get("last_update", 0)
+        if time.time() - last_update > 3:
+            logger.debug(f"Stale orderbook data for {asset} (age: {time.time()-last_update:.1f}s), skipping intra-candle signal.")
+            return
+
+        # Get absorption ratio (0.5% spread imbalance)
+        ratio = state.get("imbalance_ratio_0_5", 1.0)
+        cvd = state.get("cvd", 0.0)
+        absorption_active = state.get("absorption_active_0_5", False)
+
+        # Skip if already active trade
+        with self.trade_lock:
+            if any(t['asset'] == asset for t in self.active_trades.values()):
+                return
+
+        # Determine direction based on absorption
+        if absorption_active and ratio >= 3.0 and cvd > 0:
+            # Strong buying absorption
+            direction = "BUY"
+        elif absorption_active and ratio <= 0.33 and cvd < 0:
+            # Strong selling absorption
+            direction = "SELL"
+        else:
+            return
+
+        # ATR-based distance check (0.3 * ATR)
+        atr = self.topology.get_atr(asset) or price * 0.01
+        sr = self.topology.support_resistance[asset]
+
+        if direction == "BUY":
+            if sr["support"]:
+                nearest_support = max(sr["support"])
+                if abs(price - nearest_support) < 0.3 * atr:
+                    pass
+                else:
+                    return
+            else:
+                return
+        else:
+            if sr["resistance"]:
+                nearest_resistance = min(sr["resistance"])
+                if abs(price - nearest_resistance) < 0.3 * atr:
+                    pass
+                else:
+                    return
+            else:
+                return
+
+        # Generate signal immediately
+        logger.info(f"⚡ Intra-Candle {direction} signal for {asset} @ {price} (Ratio={ratio:.2f}, CVD={cvd:.0f})")
+        sl, tp = self._calculate_dynamic_sltp(asset, direction, price, atr)
+        risk = abs(price - sl)
+        rr = abs(tp - price) / risk if risk > 0 else 0
+
+        signal_token = self._generate_signal_token(asset)
+        signal_data = {
+            'asset': asset, 'direction': direction, 'entry': price,
+            'sl': sl, 'tp': tp, 'sqs': 75, 'session': "ALWAYS",
+            'patterns': {}, 'logic': f"MICRO_STRUCTURE_ENTRY (RR={rr:.1f})",
+            'news': self.news.last_news.get('title', 'No news')[:100],
+            'volatility': self.asset_state[asset]["volatility"],
+            'regime': "MICRO", 'htf_trend': self.asset_state[asset]["htf_trend"],
+            'news_score': self.asset_state[asset]["news_sentiment"],
+            'score': 0, 'confidence': 'HIGH', 'num_passed': 11,
+            'signal_type': 'MICRO', 'dynamic_min_sqs': 75,
+            'signal_token': signal_token, 'pattern_name': 'micro'
+        }
+        self._send_final_signal(signal_data)
+
+    # -----------------------------------------------------------------
+    # 7. Main Price Tick Handler (with Intra‑Candle Check)
     # -----------------------------------------------------------------
     def _handle_price_tick(self, asset, price, volume):
         try:
             self.topology.process_tick(asset, price, volume)
             self._update_active_trades(asset, price)
 
-            if self.topology.candle_just_closed.get(asset, False):
-                # Priority 0: Pending
-                if self.pending_queue.pending:
-                    self.pending_queue.check_pending(asset)
-                    for signal in self.pending_queue.get_verified_signals():
-                        self._send_final_signal(signal)
+            # ---- Intra‑Candle Micro‑Structure Entry (every tick) ----
+            self._check_intra_candle_signal(asset, price, volume)
 
-                # Priority 1: Sniper
-                exh_result, _ = self.exhaust_filter.evaluate(asset, price)
-                if exh_result:
-                    direction = exh_result["direction"]
-                    score = exh_result["score"]
-                    reason = exh_result["reason"]
-                    logger.info(f"🎯 SNIPER DETECTED: {asset} {direction} (Score: {score})")
-                    atr = self.topology.get_atr(asset) or price * 0.01
-                    sl, tp = self.dynamic_sl.calculate(asset, direction, price, atr)
-                    risk = abs(price - sl)
-                    if direction == "SELL":
-                        tp = max(price - 3 * risk, price * 0.70)
-                    else:
-                        tp = min(price + 3 * risk, price * 1.30)
-                    if abs(tp - price) / risk < 2.5:
-                        tp = price - 2.5 * risk if direction == "SELL" else price + 2.5 * risk
-                    signal_token = self._generate_signal_token(asset)
-                    signal_data = {
-                        'asset': asset, 'direction': direction, 'entry': price,
-                        'sl': sl, 'tp': tp, 'sqs': score,
-                        'session': "ALWAYS", 'patterns': {},
-                        'logic': f"SNIPER_REVERSAL: {reason}",
-                        'news': self.news.last_news.get('title', 'No news')[:100],
-                        'volatility': self.asset_state[asset]["volatility"],
-                        'regime': "SNIPER",
-                        'htf_trend': self.asset_state[asset]["htf_trend"],
-                        'news_score': self.asset_state[asset]["news_sentiment"],
-                        'score': 0, 'confidence': 'VERY HIGH', 'num_passed': 11,
-                        'signal_type': 'SNIPER', 'dynamic_min_sqs': score,
-                        'signal_token': signal_token
-                    }
-                    self._send_final_signal(signal_data)
-                    return
+            # ---- Only process on 15m candle close for standard engines ----
+            if not self.topology.candle_just_closed.get(asset, False):
+                return
 
-                # Priority 2: Scalper
-                self._update_indicators(asset, price)
-                htf_trend = self.asset_state[asset]["htf_trend"]
-                tf_trend = self.asset_state[asset]["trend"]
-                regime, params = self.regime_detector.detect(asset, price, volume, htf_trend, tf_trend)
+            # Priority 0: Pending signals
+            if self.pending_queue.pending:
+                self.pending_queue.check_pending(asset)
+                for signal in self.pending_queue.get_verified_signals():
+                    self._send_final_signal(signal)
 
-                # Gates: Session, News, Market Regime
-                session_ok, session_name, _ = self.session_timer.is_trading_time()
-                if not session_ok:
-                    self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"], regime, "Session Filter", regime)
-                    self.rejected += 1
-                    return
-                now_dt = datetime.now(Config.IST)
-                blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
-                if blackout:
-                    self.db.log_rejected(asset, price, 0, f"News Blackout: {event_name}", self.asset_state[asset]["volatility"], regime, "News Blackout", regime)
-                    self.rejected += 1
-                    return
-                adx_threshold = 22
-                if regime == "STRONG_TREND":
-                    adx_threshold = 18
-                elif regime == "GRADUAL_TREND":
-                    adx_threshold = 20
-                elif regime == "CHOP":
-                    adx_threshold = 25
-                if not self.market_regime.check(asset, price, adx_threshold)[0]:
-                    self.db.log_rejected(asset, price, 0, "Market Regime", self.asset_state[asset]["volatility"], regime, "Market Regime", regime)
-                    self.rejected += 1
-                    return
-
-                # Direction
-                if htf_trend == "BULLISH" and tf_trend == "BULLISH":
-                    direction = "BUY"
-                elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
-                    direction = "SELL"
-                else:
-                    return
-
-                # Institutional Bottling (only for BUY)
-                if direction == "BUY":
-                    analyzer = self.institutional_analyzers.get(asset)
-                    if analyzer:
-                        analyzer.set_regime(regime)
-                        if not analyzer.analyze(price)[0]:
-                            self.db.log_rejected(asset, price, 0, "Bottling Score < 90", self.asset_state[asset]["volatility"], regime, "Institutional Bottling", regime)
-                            self.rejected += 1
-                            return
-
-                # Advanced Engine bonus
-                adv_score, patterns, _, _ = self.advanced_engine.evaluate(asset, price, direction)
-                logger.info(f"Advanced Score: {adv_score}")
-
-                # MTF, Order Flow
-                mtf_tolerance = params.get("mtf_tolerance", 0.02)
-                check_4h = params.get("check_4h_ema", False)
-                if not self.mtf_gate.check(asset, direction, mtf_tolerance, check_4h)[0]:
-                    self.db.log_rejected(asset, price, 0, "MTF", self.asset_state[asset]["volatility"], regime, "MTF Confluence", regime)
-                    self.rejected += 1
-                    return
-                of_strict = params.get("order_flow_strict", True)
-                if not self.orderflow.check(asset, direction, price, of_strict)[0]:
-                    self.db.log_rejected(asset, price, 0, "Order Flow", self.asset_state[asset]["volatility"], regime, "Order Flow", regime)
-                    self.rejected += 1
-                    return
-
-                # SQS with dynamic penalty
-                sr = self.topology.support_resistance[asset]
-                bos = self.topology.bos[asset]
-                choch = self.topology.choch[asset]
-                sweep = self.topology.detect_liquidity_sweep(asset, price) if params.get("use_micro_sweep", True) else ""
-                ob = self.topology.detect_order_block(asset)
-                fvgs = self.topology.detect_fvg(asset)
-                vol_ratio = self.asset_state[asset]["volume_ratio"]
-
-                base_sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, sr,
-                                                   bos, choch, sweep, ob, fvgs, vol_ratio, htf_trend,
-                                                   use_micro_sweep=params.get("use_micro_sweep", True))
-                total_sqs = base_sqs + adv_score
-                pattern_name = list(patterns.keys())[0] if patterns else "unknown"
-                base_min = params.get("min_sqs", Config.MIN_SQS)
-                min_sqs = self._apply_dynamic_sqs(base_min, pattern_name)
-
-                if total_sqs < min_sqs:
-                    self.db.log_rejected(asset, price, total_sqs, f"SQS {total_sqs} < {min_sqs} (Regime {regime})",
-                                         self.asset_state[asset]["volatility"], regime, "SQS", regime)
-                    self.rejected += 1
-                    return
-
-                # SL/TP
+            # Priority 1: Sniper Engine
+            exh_result, _ = self.exhaust_filter.evaluate(asset, price)
+            if exh_result:
+                direction = exh_result["direction"]
+                score = exh_result["score"]
+                reason = exh_result["reason"]
+                logger.info(f"🎯 SNIPER DETECTED: {asset} {direction} (Score: {score})")
                 atr = self.topology.get_atr(asset) or price * 0.01
-                sl, tp = self.dynamic_sl.calculate(asset, direction, price, atr)
+                sl, tp = self._calculate_dynamic_sltp(asset, direction, price, atr)
                 risk = abs(price - sl)
-                rr = abs(tp - price) / risk if risk else 0
-
-                # Cooldown, Daily cap
-                now_ts = time.time()
-                if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
-                    self.db.log_rejected(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"], regime, "Cooldown", regime)
-                    self.rejected += 1
-                    return
-                if len([t for t in self.signal_timestamps if now_ts - t < 86400]) >= Config.MAX_SIGNALS_PER_DAY:
-                    self.db.log_rejected(asset, price, total_sqs, "Daily cap", self.asset_state[asset]["volatility"], regime, "Daily Cap", regime)
-                    self.rejected += 1
-                    return
-
-                # Enqueue
+                rr = abs(tp - price) / risk if risk > 0 else 0
+                if rr < 2.5:
+                    # Force at least 2.5 RR
+                    tp = price - 2.5 * risk if direction == "SELL" else price + 2.5 * risk
                 signal_token = self._generate_signal_token(asset)
                 signal_data = {
                     'asset': asset, 'direction': direction, 'entry': price,
-                    'sl': sl, 'tp': tp, 'sqs': total_sqs,
-                    'session': session_name, 'patterns': patterns,
-                    'logic': f"HTF {htf_trend} + BOS {bos['direction']} + AdvScore {adv_score}",
+                    'sl': sl, 'tp': tp, 'sqs': score, 'session': "ALWAYS",
+                    'patterns': {}, 'logic': f"SNIPER_REVERSAL: {reason} (RR={rr:.1f})",
                     'news': self.news.last_news.get('title', 'No news')[:100],
                     'volatility': self.asset_state[asset]["volatility"],
-                    'regime': regime, 'htf_trend': htf_trend,
+                    'regime': "SNIPER", 'htf_trend': self.asset_state[asset]["htf_trend"],
                     'news_score': self.asset_state[asset]["news_sentiment"],
-                    'score': 0, 'confidence': 'HIGH', 'num_passed': 11,
-                    'pending_candles': params.get('pending_candles', 2),
-                    'volume_decay_threshold': params.get('volume_decay_threshold', 0.6),
-                    'dynamic_min_sqs': min_sqs,
-                    'signal_type': 'STANDARD',
-                    'signal_token': signal_token,
-                    'pattern_name': pattern_name
+                    'score': 0, 'confidence': 'VERY HIGH', 'num_passed': 11,
+                    'signal_type': 'SNIPER', 'dynamic_min_sqs': score,
+                    'signal_token': signal_token
                 }
-                self.pending_queue.add_signal(signal_data)
-                logger.info(f"⏳ Pending: {asset} {direction} @ {price} (SQS: {total_sqs}) Token: {signal_token}")
+                self._send_final_signal(signal_data)
+                return
+
+            # Priority 2: Standard Scalper Engine
+            self._update_indicators(asset, price)
+            htf_trend = self.asset_state[asset]["htf_trend"]
+            tf_trend = self.asset_state[asset]["trend"]
+            regime, params = self.regime_detector.detect(asset, price, volume, htf_trend, tf_trend)
+
+            # ---- DYNAMIC ADX (optimized for CHOP) ----
+            adx_threshold = 22
+            if regime == "STRONG_TREND":
+                adx_threshold = 18
+            elif regime == "GRADUAL_TREND":
+                adx_threshold = 20
+            elif regime == "CHOP":
+                adx_threshold = 20   # practical for range markets
+
+            # Gate 1: Session
+            session_ok, session_name, _ = self.session_timer.is_trading_time()
+            if not session_ok:
+                self.db.log_rejected(asset, price, 0, "Out of Session", self.asset_state[asset]["volatility"], regime, "Session Filter", regime)
+                self.rejected += 1
+                return
+
+            # Gate 2: News Blackout
+            now_dt = datetime.now(Config.IST)
+            blackout, event_name = self.economic_calendar.is_blackout(now_dt, asset)
+            if blackout:
+                self.db.log_rejected(asset, price, 0, f"News Blackout: {event_name}", self.asset_state[asset]["volatility"], regime, "News Blackout", regime)
+                self.rejected += 1
+                return
+
+            # Gate 3: Market Regime
+            regime_ok, regime_reason = self.market_regime.check(asset, price, adx_threshold)
+            if not regime_ok:
+                self.db.log_rejected(asset, price, 0, regime_reason, self.asset_state[asset]["volatility"], regime, "Market Regime", regime)
+                self.rejected += 1
+                return
+
+            # Direction determination
+            if htf_trend == "BULLISH" and tf_trend == "BULLISH":
+                direction = "BUY"
+            elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
+                direction = "SELL"
+            else:
+                return
+
+            # ---- NO SYNCHRONOUS BOTTLING CHECK HERE ----
+
+            # Advanced Engine bonus
+            adv_score, patterns, _, _ = self.advanced_engine.evaluate(asset, price, direction)
+
+            # MTF Confluence
+            mtf_tolerance = params.get("mtf_tolerance", 0.02)
+            check_4h = params.get("check_4h_ema", False)
+            mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction, mtf_tolerance, check_4h)
+            if not mtf_ok:
+                self.db.log_rejected(asset, price, 0, mtf_reason, self.asset_state[asset]["volatility"], regime, "MTF Confluence", regime)
+                self.rejected += 1
+                return
+
+            # Order Flow
+            of_strict = params.get("order_flow_strict", True)
+            of_ok, of_reason = self.orderflow.check(asset, direction, price, of_strict)
+            if not of_ok:
+                self.db.log_rejected(asset, price, 0, of_reason, self.asset_state[asset]["volatility"], regime, "Order Flow", regime)
+                self.rejected += 1
+                return
+
+            # SQS Calculation with adaptive threshold
+            sr = self.topology.support_resistance[asset]
+            bos = self.topology.bos[asset]
+            choch = self.topology.choch[asset]
+            sweep = self.topology.detect_liquidity_sweep(asset, price) if params.get("use_micro_sweep", True) else ""
+            ob = self.topology.detect_order_block(asset)
+            fvgs = self.topology.detect_fvg(asset)
+            vol_ratio = self.asset_state[asset]["volume_ratio"]
+
+            base_sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, sr,
+                                               bos, choch, sweep, ob, fvgs, vol_ratio, htf_trend,
+                                               use_micro_sweep=params.get("use_micro_sweep", True))
+            total_sqs = base_sqs + adv_score
+            pattern_name = list(patterns.keys())[0] if patterns else "unknown"
+
+            # ---- DYNAMIC MIN_SQS based on regime and volatility ----
+            min_sqs = self._get_dynamic_min_sqs(regime, asset, total_sqs)
+
+            if total_sqs < min_sqs:
+                self.db.log_rejected(asset, price, total_sqs, f"SQS {total_sqs} < {min_sqs} (Regime {regime})",
+                                     self.asset_state[asset]["volatility"], regime, "SQS", regime)
+                self.rejected += 1
+                return
+
+            # SL/TP via dynamic liquidity pools
+            atr = self.topology.get_atr(asset) or price * 0.01
+            sl, tp = self._calculate_dynamic_sltp(asset, direction, price, atr)
+            risk = abs(price - sl)
+            rr = abs(tp - price) / risk if risk > 0 else 0
+
+            # Cooldown & Daily cap
+            now_ts = time.time()
+            if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
+                self.db.log_rejected(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"], regime, "Cooldown", regime)
+                self.rejected += 1
+                return
+            if len([t for t in self.signal_timestamps if now_ts - t < 86400]) >= Config.MAX_SIGNALS_PER_DAY:
+                self.db.log_rejected(asset, price, total_sqs, "Daily cap", self.asset_state[asset]["volatility"], regime, "Daily Cap", regime)
+                self.rejected += 1
+                return
+
+            signal_token = self._generate_signal_token(asset)
+            signal_data = {
+                'asset': asset, 'direction': direction, 'entry': price,
+                'sl': sl, 'tp': tp, 'sqs': total_sqs,
+                'session': session_name, 'patterns': patterns,
+                'logic': f"HTF {htf_trend} + BOS {bos['direction']} + AdvScore {adv_score} (RR={rr:.1f})",
+                'news': self.news.last_news.get('title', 'No news')[:100],
+                'volatility': self.asset_state[asset]["volatility"],
+                'regime': regime, 'htf_trend': htf_trend,
+                'news_score': self.asset_state[asset]["news_sentiment"],
+                'score': 0, 'confidence': 'HIGH', 'num_passed': 11,
+                'pending_candles': params.get('pending_candles', 2),
+                'volume_decay_threshold': params.get('volume_decay_threshold', 0.6),
+                'dynamic_min_sqs': min_sqs, 'signal_type': 'STANDARD',
+                'signal_token': signal_token, 'pattern_name': pattern_name
+            }
+            self.pending_queue.add_signal(signal_data)
+            logger.info(f"⏳ Scalper Pending: {asset} {direction} @ {price} (SQS: {total_sqs}) Token: {signal_token}")
 
         except Exception as e:
             logger.error(f"Error in _handle_price_tick: {e}", exc_info=True)
 
     # -----------------------------------------------------------------
-    # HELPER METHODS (unchanged from original, kept clean)
+    # 8. Dynamic SQS Threshold (Adaptive)
+    # -----------------------------------------------------------------
+    def _get_dynamic_min_sqs(self, regime, asset, current_sqs):
+        """Return dynamic min_sqs based on regime, volatility, and recent performance."""
+        # Base values
+        if regime == "STRONG_TREND":
+            base = 70
+        elif regime == "GRADUAL_TREND":
+            base = 65
+        elif regime == "CHOP":
+            base = 60   # CHOP allows lower threshold
+        else:
+            base = 60
+
+        # Adjust based on ATR ratio (volatility)
+        atr_ratio = self.asset_state[asset]["volatility"]  # relative ATR (atr/price)
+        if atr_ratio < 0.005:   # very low volatility
+            base = max(base - 5, 55)
+        elif atr_ratio > 0.02:  # high volatility
+            base = min(base + 5, 75)
+
+        # Safe win_rate lookup
+        win_rate = 0.5
+        try:
+            wr = self.db.get_rolling_win_rate(asset, 20)
+            if wr is not None:
+                win_rate = wr
+        except Exception:
+            pass
+
+        if win_rate > 0.6:
+            base = max(base - 5, 55)
+        elif win_rate < 0.4:
+            base = min(base + 5, 75)
+
+        return max(55, min(75, base))
+
+    # -----------------------------------------------------------------
+    # 9. Helper Methods (unchanged)
     # -----------------------------------------------------------------
     def _update_analyzer_loop(self):
         while True:
@@ -2503,25 +2759,164 @@ class AIOrchestrator:
             self.asset_state[asset]["volatility"] = atr / price
 
     def _update_active_trades(self, asset, price):
-        # (existing code – unchanged)
-        pass
+        with self.trade_lock:
+            to_remove = []
+            for tid, trade in list(self.active_trades.items()):
+                if trade['asset'] != asset:
+                    continue
+                if not trade.get('breakeven_locked', False):
+                    target_dist = abs(trade['tp'] - trade['entry'])
+                    half = trade['entry'] + 0.5 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.5 * target_dist
+                    if (trade['direction'] == 'BUY' and price >= half) or (trade['direction'] == 'SELL' and price <= half):
+                        if self.topology.check_1m_rejection(asset, trade['direction']):
+                            trade['sl'] = trade['entry']
+                            trade['breakeven_locked'] = True
+                            logger.info(f"BE Locked for {tid}")
+                if not trade.get('trailing_activated', False):
+                    target_dist = abs(trade['tp'] - trade['entry'])
+                    trigger = trade['entry'] + 0.7 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.7 * target_dist
+                    if (trade['direction'] == 'BUY' and price >= trigger) or (trade['direction'] == 'SELL' and price <= trigger):
+                        new_sl = trade['entry'] + 0.3 * target_dist if trade['direction'] == 'BUY' else trade['entry'] - 0.3 * target_dist
+                        if (trade['direction'] == 'BUY' and new_sl > trade['sl']) or (trade['direction'] == 'SELL' and new_sl < trade['sl']):
+                            trade['sl'] = new_sl
+                            trade['trailing_activated'] = True
+                            logger.info(f"Trailing activated for {tid}, new SL: {new_sl:.2f}")
+                if trade['direction'] == 'BUY':
+                    if price <= trade['sl']:
+                        pnl = price - trade['entry']
+                        self._close_trade(tid, price, pnl, "SL Hit")
+                        to_remove.append(tid)
+                    elif price >= trade['tp']:
+                        pnl = price - trade['entry']
+                        self._close_trade(tid, price, pnl, "TP Hit")
+                        to_remove.append(tid)
+                else:
+                    if price >= trade['sl']:
+                        pnl = trade['entry'] - price
+                        self._close_trade(tid, price, pnl, "SL Hit")
+                        to_remove.append(tid)
+                    elif price <= trade['tp']:
+                        pnl = trade['entry'] - price
+                        self._close_trade(tid, price, pnl, "TP Hit")
+                        to_remove.append(tid)
+            for tid in to_remove:
+                if tid in self.active_trades:
+                    del self.active_trades[tid]
+            if to_remove:
+                gc.collect()
+
+    def _close_trade(self, tid, price, pnl, reason=""):
+        self.db.close_trade(tid, price, pnl, reason)
+        self.telegram.send_message(f"🔒 Trade #{tid} closed at {price:.2f} | PnL: {pnl:+.2f} | Reason: {reason}")
+        logger.info(f"Trade {tid} closed. PnL: {pnl:.2f}, Reason: {reason}")
+        if self.mongo.db is not None:
+            try:
+                self.mongo.db.trades.update_one(
+                    {"id": tid},
+                    {"$set": {"status": "closed", "exit_price": price, "pnl": pnl,
+                              "close_time": int(time.time()), "exit_reason": reason}}
+                )
+            except Exception:
+                pass
+        if tid in self.active_trades:
+            del self.active_trades[tid]
 
     def _send_final_signal(self, signal):
-        # (existing code – unchanged)
-        pass
+        try:
+            asset = signal['asset']
+            direction = signal['direction']
+            price = signal['entry']
+            sl = signal['sl']
+            tp = signal['tp']
+            sqs = signal['sqs']
+            session = signal['session']
+            patterns = signal['patterns']
+            logic = signal['logic']
+            news = signal['news']
+            volatility = signal['volatility']
+            regime = signal['regime']
+            htf_trend = signal['htf_trend']
+            news_score = signal['news_score']
+            dynamic_min_sqs = signal.get('dynamic_min_sqs', Config.MIN_SQS)
+            signal_type = signal.get('signal_type', 'STANDARD')
+            signal_token = signal.get('signal_token', None)
 
+            if signal_type == "SNIPER":
+                pass
+            else:
+                logic_parts = [f"HTF {htf_trend}"]
+                if self.topology.bos[asset]["direction"]:
+                    logic_parts.append(f"BOS {self.topology.bos[asset]['direction']}")
+                if self.topology.choch[asset]:
+                    logic_parts.append("CHOCH")
+                if self.topology.detect_liquidity_sweep(asset, price):
+                    logic_parts.append("SWEEP")
+                if self.topology.detect_order_block(asset):
+                    logic_parts.append("OB")
+                logic = " + ".join(logic_parts)
+
+            trade_id = self.db.log_trade(
+                asset, direction, price, sl, tp,
+                sqs, "HIGH", list(patterns.keys()), logic,
+                volatility, regime, htf_trend, news_score,
+                session, sqs, list(patterns.keys())[0] if patterns else "unknown",
+                dynamic_min_sqs, signal_type, signal_token
+            )
+
+            chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
+            rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
+
+            self.telegram.fire_signal(
+                asset=asset, direction=direction, price=price, sl=sl, tp=tp,
+                chart=chart, logic=logic, news=news,
+                score={"total_score": sqs, "confidence": "HIGH", "num_passed": 11},
+                patterns=patterns, trade_id=trade_id,
+                session=session, rr=rr, regime=regime, signal_type=signal_type,
+                signal_token=signal_token
+            )
+
+            self.accepted += 1
+            self.last_signal_time[asset] = time.time()
+            self.signal_timestamps.append(time.time())
+
+            with self.trade_lock:
+                self.active_trades[trade_id] = {
+                    'id': trade_id,
+                    'asset': asset,
+                    'direction': direction,
+                    'entry': price,
+                    'sl': sl,
+                    'tp': tp,
+                    'entry_time': int(time.time()),
+                    'breakeven_locked': False,
+                    'trailing_activated': False,
+                    'hold_sent': False,
+                    'initial_score': sqs,
+                    'current_score': sqs,
+                    'health': 100,
+                    'regime': regime,
+                    'signal_token': signal_token
+                }
+        except Exception as e:
+            logger.error(f"Error in _send_final_signal: {e}", exc_info=True)
+
+    # -----------------------------------------------------------------
+    # 10. Run Loop
+    # -----------------------------------------------------------------
     def run(self):
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
-        threading.Thread(target=self._ping_self_loop, daemon=True).start()
+
         logger.info("Loading historical data from MongoDB/Binance in parallel...")
         with ThreadPoolExecutor(max_workers=4) as executor:
             for asset in Config.ASSETS:
                 for tf in [60, 300, 900, 3600, 14400]:
                     executor.submit(self._load_and_backfill, asset, tf)
         logger.info("Data loading complete.")
+
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v6.5 Online – Hydration + Smart Self-Learning Active")
+        self.telegram.send_message("🚀 AI v6.5 Ultra-Advance – Per-Asset States + Intra-Candle Entry")
+
         last_news = 0
         while True:
             try:
@@ -2547,7 +2942,7 @@ class AIOrchestrator:
             self.price_queue.put_nowait((asset, price, volume))
         except queue.Full:
             pass
-
+                    
 # =====================================================================
 # ENTRY POINT
 # =====================================================================
