@@ -356,7 +356,7 @@ class ThinkingOptimizationModel:
         self.last_run = 0
 
     def trigger(self, total_signals):
-        if total_signals % 140 != 0:
+        if total_signals % 30 != 0:
             return
         if time.time() - self.last_run < 300:
             return
@@ -364,18 +364,18 @@ class ThinkingOptimizationModel:
         self._run_analysis()
 
     def _run_analysis(self):
-        logger.info("🧠 140-signal Thinking Model running...")
+        logger.info("🧠 30-signal Thinking Model running...")
         try:
             cur = self.orch.db.conn.cursor()
             cur.execute("""
                 SELECT pattern_name, regime, sqs_score, pnl
                 FROM trades
                 WHERE status='closed' AND pnl IS NOT NULL
-                ORDER BY id DESC LIMIT 140
+                ORDER BY id DESC LIMIT 30
             """)
             rows = cur.fetchall()
             cur.close()
-            if len(rows) < 140:
+            if len(rows) < 30:
                 return
             pattern_stats = {}
             regime_stats = {}
@@ -394,7 +394,7 @@ class ThinkingOptimizationModel:
                 sqs_bands[band] += is_win
             win_rate_140 = total_wins / len(rows)
             worst_pattern = min(pattern_stats.items(), key=lambda x: x[1]["wins"]/x[1]["total"] if x[1]["total"]>=5 else 1)[0] if pattern_stats else "unknown"
-            msg = f"🧠 140-Signal Audit:\n━━━━━━━━━━━━━━━━━━━━\nWin Rate: {win_rate_140:.2%}\nWorst Pattern: {worst_pattern}\nSQS Bands: {sqs_bands}"
+            msg = f"🧠 30-Signal Audit:\n━━━━━━━━━━━━━━━━━━━━\nWin Rate: {win_rate_30:.2%}\nWorst Pattern: {worst_pattern}\nSQS Bands: {sqs_bands}"
             self.orch.telegram.send_message(msg)
             gc.collect()
         except Exception as e:
