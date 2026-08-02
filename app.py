@@ -520,20 +520,23 @@ class DatabasePipeline:
                 pass
 
     def _process_item(self, item):
-        # item: dict with type 'trade' or 'reject'
-        if item['type'] == 'trade':
-            self.db.log_trade(*item['args'])
-            if self.mongo.db:
+        if item.get('type') == 'trade':
+            if 'args' in item and item['args']:
+                self.db.log_trade(*item['args'])
+            if self.mongo.db is not None and 'data' in item:
                 self.mongo.save_trade_backup(item['data'])
-        elif item['type'] == 'reject':
-            self.db.log_rejected(*item['args'])
-            if self.mongo.db:
+        elif item.get('type') == 'reject':
+            if 'args' in item and item['args']:
+                self.db.log_rejected(*item['args'])
+            if self.mongo.db is not None and 'data' in item:
                 self.mongo.save_rejected_backup(item['data'])
 
-    def add_trade(self, *args, data):
+    def add_trade(self, *args, **kwargs):
+        data = kwargs.get('data', args[-1] if args else {})
         self.queue.put({'type': 'trade', 'args': args, 'data': data})
 
-    def add_reject(self, *args, data):
+    def add_reject(self, *args, **kwargs):
+        data = kwargs.get('data', args[-1] if args else {})
         self.queue.put({'type': 'reject', 'args': args, 'data': data})
 
     def shutdown(self):
