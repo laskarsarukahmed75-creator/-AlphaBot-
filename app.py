@@ -1066,50 +1066,198 @@ class MarketRegimeFilter:
         return True, "Pass"
 
 class MTFConfluenceGate:
+    """
+    Advanced Score-Based MTF Gate with Confidence Output.
+    Returns a confidence score (0-100) and detailed breakdown.
+    """
     def __init__(self, cache):
         self.cache = cache
 
-    def check(self, asset, direction, tolerance=0.02, check_4h=False):
-        price = self.cache.topology.history[asset][-1]['price'] if self.cache.topology.history[asset] else 0
-        if price == 0:
-            return False, "No price"
-        if check_4h:
-            ind = self.cache.get(asset, 14400, price)
-            ema50 = ind.get('ema_50')
-            ema200 = ind.get('ema_200')
-            if ema50 and ema200:
-                if direction == "BUY" and price < ema50 and price < ema200:
-                    return False, "4H bearish"
-                if direction == "SELL" and price > ema50 and price > ema200:
-                    return False, "4H bullish"
-        # 1H structure
-        sr = self.cache.get(asset, 3600, price)['resistance']
-        pivots_high = self.cache.topology.pivots[asset]["high"]
-        pivots_low = self.cache.topology.pivots[asset]["low"]
-        if len(pivots_high) >= 2 and len(pivots_low) >= 2:
-            if direction == "BUY" and pivots_high[0] < pivots_high[1]:
-                return False, "1H structure down"
-            if direction == "SELL" and pivots_low[0] > pivots_low[1]:
-                return False, "1H structure up"
-        # 15m OB/FVG
-        ind15 = self.cache.get(asset, 900, price)
-        ob = ind15.get('order_block')
-        fvgs = ind15.get('fvg', [])
-        if not ob and not fvgs:
-            return False, "No OB or FVG on 15m"
-        # 5m S/R
-        sr5 = self.cache.get(asset, 300, price)['support'] if direction=="BUY" else self.cache.get(asset, 300, price)['resistance']
-        if direction == "BUY":
-            if sr5:
-                nearest = max(sr5)
-                if abs(price - nearest) / nearest > tolerance:
-                    return False, f"Not near support (tolerance {tolerance:.2%})"
+    def check(self, asset: str, direction: str, price: float, params: dict):
+        """
+        Evaluate MTF confluence and return confidence.
+        - asset: trading pair
+        - direction: 'BUY' or 'SELL'
+        - price: current price (from tick)
+        - params: regime params (read-only)
+        Returns: (passed: bool, result: dict)
+        """
+        # 1. Load indicators from cache (real keys only)
+        ind_1h = self.cache.get(asset, 3600, price, 0) or {}
+        ind_15m = self.cache.get(asset, 900, price, 0) or {}
+        ind_5m = self.cache.get(asset, 300, price, 0) or {}
+
+        # Safety: if critical data missing, reject immediately
+        if not ind_1h or not ind_15m:
+            return False, {
+                "confidence": 0,
+                "log": "❌ REJECTED: Insufficient indicator data (1H/15M missing)",
+                "passed": False,
+                "reason": "No Data"
+            }
+
+        # 2. Scoring variables
+        earned_score = 0
+        max_possible_score = 0
+        log_parts = []
+
+        # -------- Condition 1: Trend (EMA + ADX) - 35 points --------
+        ema_50 = ind_1h.get('ema_50')
+        ema_200 = ind_1h.get('ema_200')
+        adx = ind_1h.get('adx', 0)
+
+        # EMA must exist
+        if ema_50 is not None and ema_200 is not None:
+            max_possible_score += 35
+            # Direction check: price vs EMA200 and EMA50 vs EMA200
+            bullish = (price > ema_200) and (ema_50 > ema_200)
+            bearish = (price < ema_200) and (ema_50 < ema_200)
+
+            if (direction == "BUY" and bullish) or (direction == "SELL" and bearish):
+                # Bonus for strong trend (ADX > 25)
+                if adx > 25:
+                    earned_score += 35
+                    log_parts.append(f"Trend: ✅ Strong (+35) | ADX={adx:.1f}")
+                else:
+                    earned_score += 25  # weak trend but direction correct
+                    log_parts.append(f"Trend: ✅ Weak (+25) | ADX={adx:.1f}")
+            else:
+                # Direction mismatch – check if ADX is very low (chop)
+                if adx < 20:
+                    # In chop, direction less strict – give half points
+                    earned_score += 15
+                    log_parts.append(f"Trend: ⚠️ Chop (+15) | ADX={adx:.1f}")
+                else:
+                    log_parts.append(f"Trend: ❌ (+0) | ADX={adx:.1f} | EMA50={ema_50:.0f} EMA200={ema_200:.0f}")
         else:
-            if sr5:
-                nearest = min(sr5)
-                if abs(price - nearest) / nearest > tolerance:
-                    return False, f"Not near resistance (tolerance {tolerance:.2%})"
-        return True, "Pass"
+            log_parts.append("Trend: ⚠️ No EMA data (skipped)")
+
+        # -------- Condition 2: Support/Resistance Proximity - 30 points --------
+        supports = ind_15m.get('support', [])
+        resistances = ind_15m.get('resistance', [])
+
+        # Only consider if lists are non-empty
+        if supports or resistances:
+            max_possible_score += 30
+            nearest_level = None
+
+            if direction == "BUY" and supports:
+                # Find nearest support below price (most recent/valid)
+                valid_supports = [s for s in supports if isinstance(s, (int, float)) and s < price]
+                if valid_supports:
+                    nearest_level = max(valid_supports)  # closest below
+            elif direction == "SELL" and resistances:
+                valid_resistances = [r for r in resistances if isinstance(r, (int, float)) and r > price]
+                if valid_resistances:
+                    nearest_level = min(valid_resistances)  # closest above
+
+            if nearest_level:
+                dist_pct = abs(price - nearest_level) / price
+                if dist_pct <= 0.015:
+                    earned_score += 30
+                    log_parts.append(f"S/R: ✅ (+30) | Dist={dist_pct:.2%}")
+                elif dist_pct <= 0.030:
+                    earned_score += 20
+                    log_parts.append(f"S/R: ✅ (+20) | Dist={dist_pct:.2%}")
+                else:
+                    earned_score += 5
+                    log_parts.append(f"S/R: ⚠️ Far (+5) | Dist={dist_pct:.2%}")
+            else:
+                log_parts.append("S/R: ❌ (+0) | No valid level")
+        else:
+            log_parts.append("S/R: ⚠️ No data (skipped)")
+
+        # -------- Condition 3: Order Block / FVG (with direction) - 35 points --------
+        # Real keys: 'order_block' and 'fvg' – each should be a list of dicts with keys: price, type, direction
+        obs = ind_15m.get('order_block', [])
+        fvgs = ind_15m.get('fvg', [])
+
+        # Collect valid levels with direction info
+        level_candidates = []
+
+        if isinstance(obs, list):
+            for ob in obs:
+                if isinstance(ob, dict):
+                    ob_price = ob.get('price') or ob.get('level')
+                    ob_type = ob.get('type', '').lower()      # 'bullish' or 'bearish'
+                    if ob_price and isinstance(ob_price, (int, float)) and ob_price > 0:
+                        level_candidates.append((ob_price, ob_type))
+        if isinstance(fvgs, list):
+            for fvg in fvgs:
+                if isinstance(fvg, dict):
+                    fvg_price = fvg.get('price') or fvg.get('level')
+                    fvg_type = fvg.get('type', '').lower()
+                    if fvg_price and isinstance(fvg_price, (int, float)) and fvg_price > 0:
+                        level_candidates.append((fvg_price, fvg_type))
+
+        if level_candidates:
+            max_possible_score += 35
+            # Find the nearest level and check its direction
+            min_dist = float('inf')
+            best_match = None
+
+            for lvl_price, lvl_type in level_candidates:
+                dist = abs(price - lvl_price) / price
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match = (lvl_price, lvl_type)
+
+            if best_match and min_dist <= 0.020:  # within 2%
+                lvl_price, lvl_type = best_match
+                # Check direction alignment
+                if (direction == "BUY" and lvl_type == 'bullish') or (direction == "SELL" and lvl_type == 'bearish'):
+                    earned_score += 35
+                    log_parts.append(f"OB/FVG: ✅ (+35) | {lvl_type} at {lvl_price:.2f} | Dist={min_dist:.2%}")
+                else:
+                    # opposite direction – still give some credit if very close
+                    if min_dist <= 0.010:
+                        earned_score += 20
+                        log_parts.append(f"OB/FVG: ⚠️ (+20) | Direction mismatch but very close")
+                    else:
+                        log_parts.append(f"OB/FVG: ❌ (+0) | Direction mismatch")
+            else:
+                log_parts.append(f"OB/FVG: ❌ (+0) | No level within 2%")
+        else:
+            log_parts.append("OB/FVG: ⚠️ No data (skipped)")
+
+        # 3. Final confidence calculation
+        if max_possible_score == 0:
+            # No indicators at all – reject
+            return False, {
+                "confidence": 0,
+                "log": "❌ REJECTED: No indicator data available",
+                "passed": False,
+                "reason": "No Data"
+            }
+
+        confidence = (earned_score / max_possible_score) * 100
+
+        # 4. Dynamic threshold from regime (read from params)
+        regime = params.get('regime', 'GRADUAL_TREND')
+        if regime == "STRONG_TREND":
+            threshold = 75
+        elif regime == "GRADUAL_TREND":
+            threshold = 65
+        else:  # CHOP
+            threshold = 60
+
+        passed = confidence >= threshold
+
+        # 5. Build final log
+        status = "✅ PASSED" if passed else "❌ REJECTED"
+        full_log = (f"{status} | Confidence: {confidence:.1f}% "
+                    f"(Earned: {earned_score}/{max_possible_score}) | "
+                    f"Threshold: {threshold} | " + " | ".join(log_parts))
+
+        return passed, {
+            "confidence": round(confidence, 1),
+            "earned": earned_score,
+            "max_possible": max_possible_score,
+            "threshold": threshold,
+            "log": full_log,
+            "passed": passed,
+            "regime": regime
+        }
 
 class OrderFlowAnalyzer:
     def __init__(self, futures_stream):
