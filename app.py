@@ -972,40 +972,73 @@ class CandleTopologyEngine:
 # =====================================================================
 # 12. GATES (Use IndicatorCache)
 # =====================================================================
-class RegimeDetector:
+class AdvanceRegimeDetector:
     def __init__(self, cache):
         self.cache = cache
         self.current_regime = {}
         self.params = {}
 
     def detect(self, asset, price, volume, htf_trend, tf_trend):
-        ind = self.cache.get(asset, 900, price, volume)
-        adx_15 = ind['adx']
-        adx_1h = self.cache.get(asset, 3600, price, volume)['adx']
-        atr = ind['atr']
-        atr_pct = atr / price if price > 0 else 0.01
-        vol_ma = ind['volume_ma']
-        vol_ratio = volume / vol_ma if vol_ma > 0 else 1.0
-        trend_aligned = (htf_trend == tf_trend and htf_trend != "NEUTRAL")
+        ind_15m = self.cache.get(asset, 900, price, volume)
+        ind_1h  = self.cache.get(asset, 3600, price, volume)
 
-        if adx_15 > 35 and vol_ratio > 1.5 and atr_pct > 0.005 and trend_aligned:
+        if ind_1h is None:
+            ind_1h = ind_15m
+
+        adx_15m = ind_15m.get('adx', 20)
+        adx_1h  = ind_1h.get('adx', 20)
+        atr_15m = ind_15m.get('atr', price * 0.01)
+        vol_ma  = ind_15m.get('volume_ma', 1.0)
+
+        vol_ratio = volume / vol_ma if vol_ma > 0 else 1.0
+        composite_adx = (0.6 * adx_15m) + (0.4 * adx_1h)
+        atr_pct = (atr_15m / price) if price > 0 else 0.01
+
+        if composite_adx > 32 and vol_ratio > 1.3:
             regime = "STRONG_TREND"
-            params = {"min_sqs": 70, "use_micro_sweep": True, "mtf_tolerance": 0.015,
-                      "volume_decay_threshold": 0.5, "pending_candles": 2,
-                      "order_flow_strict": True, "check_4h_ema": True}
-        elif adx_15 >= 20 and adx_15 <= 35 and 0.8 <= vol_ratio <= 1.5 and 0.003 <= atr_pct <= 0.005 and trend_aligned:
+            min_sqs = 70
+            atr_multiplier = 0.8
+            pending_candles = 2
+            order_flow_strict = True
+            check_4h_ema = True
+            use_micro_sweep = False
+
+        elif composite_adx >= 18:
             regime = "GRADUAL_TREND"
-            params = {"min_sqs": 58, "use_micro_sweep": False, "mtf_tolerance": 0.025,
-                      "volume_decay_threshold": 0.7, "pending_candles": 1,
-                      "order_flow_strict": False, "check_4h_ema": False}
+            min_sqs = 60
+            atr_multiplier = 1.5
+            pending_candles = 1
+            order_flow_strict = False
+            check_4h_ema = True
+            use_micro_sweep = True
+
         else:
             regime = "CHOP"
-            params = {"min_sqs": 75, "use_micro_sweep": True, "mtf_tolerance": 0.05,
-                      "volume_decay_threshold": 0.7, "pending_candles": 2,
-                      "order_flow_strict": True, "check_4h_ema": False}
+            min_sqs = 65
+            atr_multiplier = 2.5
+            pending_candles = 1
+            order_flow_strict = False
+            check_4h_ema = False
+            use_micro_sweep = True
+
+        dynamic_mtf_tol = round(atr_pct * atr_multiplier, 4)
+        clamped_tolerance = max(0.01, min(dynamic_mtf_tol, 0.08))
+
+        params = {
+            "min_sqs": min_sqs,
+            "use_micro_sweep": use_micro_sweep,
+            "mtf_tolerance": clamped_tolerance,
+            "volume_decay_threshold": 0.6,
+            "pending_candles": pending_candles,
+            "order_flow_strict": order_flow_strict,
+            "check_4h_ema": check_4h_ema,
+            "composite_adx": composite_adx,
+            "regime": regime
+        }
 
         self.current_regime[asset] = regime
         self.params[asset] = params
+
         return regime, params
 
 class MarketRegimeFilter:
