@@ -392,7 +392,7 @@ class ThinkingOptimizationModel:
                 regime_stats[regime]["wins"] += is_win
                 band = "55-65" if sqs <= 65 else "66-75" if sqs <= 75 else "76-85" if sqs <= 85 else "86-100"
                 sqs_bands[band] += is_win
-            win_rate_140 = total_wins / len(rows)
+            win_rate_30 = total_wins / len(rows)
             worst_pattern = min(pattern_stats.items(), key=lambda x: x[1]["wins"]/x[1]["total"] if x[1]["total"]>=5 else 1)[0] if pattern_stats else "unknown"
             msg = f"🧠 30-Signal Audit:\n━━━━━━━━━━━━━━━━━━━━\nWin Rate: {win_rate_30:.2%}\nWorst Pattern: {worst_pattern}\nSQS Bands: {sqs_bands}"
             self.orch.telegram.send_message(msg)
@@ -430,6 +430,7 @@ class IndicatorCache:
         if len(completed) >= 20:
             closes = [c['close'] for c in completed]
             data['ema_9'] = self.topology._ema(closes, 9)[-1] if len(closes)>=9 else None
+            data['ema_20'] = self.topology._ema(closes, 20)[-1] if len(closes)>=20 else None
             data['ema_21'] = self.topology._ema(closes, 21)[-1] if len(closes)>=21 else None
             data['ema_50'] = self.topology._ema(closes, 50)[-1] if len(closes)>=50 else None
             data['ema_200'] = self.topology._ema(closes, 200)[-1] if len(closes)>=200 else None
