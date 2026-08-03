@@ -14,14 +14,13 @@ class AbsorptionWebSocket:
     """
     Real-time Order Book (Depth) + CVD (Aggregate Trades) via Binance WebSocket.
     Features:
-    - Dynamic imbalance ratio for 0.5% and 1% spread levels.
+    - Dynamic imbalance ratio for 0.5% and 1% spread levels (Bullish & Bearish).
     - Auto-reconnect with exponential backoff.
     - Ping-pong keep-alive.
     """
 
     def __init__(self, symbol: str = "BTCUSDT"):
         self.symbol = symbol.lower()
-        # FIXED: Correct Binance Combined Streams URL format
         self.ws_url = (
             f"wss://fstream.binance.com/stream?streams="
             f"{self.symbol}@depth20@100ms/{self.symbol}@aggTrade"
@@ -44,7 +43,7 @@ class AbsorptionWebSocket:
             "last_cvd_update": time.time()
         }
         self.lock = threading.Lock()
-        self._cvd_history = deque(maxlen=10)
+        self._cvd_history = deque(maxlen=20)
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -83,8 +82,6 @@ class AbsorptionWebSocket:
     def _on_message(self, ws, message):
         try:
             raw_msg = json.loads(message)
-            
-            # Extract payload from Binance Combined Streams wrapper
             data = raw_msg.get("data", raw_msg)
             
             with self.lock:
@@ -123,17 +120,17 @@ class AbsorptionWebSocket:
                                 ask_vol += qty
                         return bid_vol, ask_vol
 
-                    # 0.5% spread
+                    # 0.5% spread (Bullish & Bearish Both)
                     bid_vol_05, ask_vol_05 = vol_within_spread(0.005)
                     ratio_05 = bid_vol_05 / (ask_vol_05 + 1e-8)
                     self.state["imbalance_ratio_0_5"] = ratio_05
-                    self.state["absorption_active_0_5"] = ratio_05 >= 3.0
+                    self.state["absorption_active_0_5"] = (ratio_05 >= 3.0 or ratio_05 <= 0.33)
 
-                    # 1.0% spread
+                    # 1.0% spread (Bullish & Bearish Both)
                     bid_vol_10, ask_vol_10 = vol_within_spread(0.01)
                     ratio_10 = bid_vol_10 / (ask_vol_10 + 1e-8)
                     self.state["imbalance_ratio_1_0"] = ratio_10
-                    self.state["absorption_active_1_0"] = ratio_10 >= 2.5
+                    self.state["absorption_active_1_0"] = (ratio_10 >= 2.5 or ratio_10 <= 0.40)
                     self.state["last_update"] = now
 
                 # ---- Aggregate Trades (CVD) ----
@@ -155,7 +152,8 @@ class AbsorptionWebSocket:
                         if dt > 1e-6:
                             self.state["cvd_slope"] = (cvd1 - cvd0) / dt
 
-                    if len(self._cvd_history) >= 5:
+                    # Safe Indexing & Accurate Exhaustion Detection
+                    if len(self._cvd_history) >= 6:
                         slopes = []
                         for i in range(1, 5):
                             t0, c0 = self._cvd_history[-i-1]
@@ -163,9 +161,9 @@ class AbsorptionWebSocket:
                             dt = t1 - t0
                             if dt > 1e-6:
                                 slopes.append((c1 - c0) / dt)
-                        if len(slopes) >= 3:
+                        if slopes:
                             avg_slope = sum(slopes) / len(slopes)
-                            self.state["cvd_exhaustion"] = (avg_slope > -0.5)
+                            self.state["cvd_exhaustion"] = abs(avg_slope) < 0.1
                     else:
                         self.state["cvd_exhaustion"] = False
 
