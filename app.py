@@ -1670,7 +1670,7 @@ class AIOrchestrator:
         self.futures_stream = BinanceFuturesStream()
         self.futures_stream.start()
 
-        self.regime_detector = RegimeDetector(self.cache)
+        self.regime_detector = AdvanceRegimeDetector(self.cache)
         self.advanced_engine = AdvancedSignalEngine(self.cache)
         self.exhaust_filter = RallyExhaustionFilter(self.cache)
 
