@@ -2018,12 +2018,29 @@ class AIOrchestrator:
                 return
             # Advanced bonus
             adv_score, patterns, _, _ = self.advanced_engine.evaluate(asset, price, direction)
-            # MTF
-            mtf_tol = params.get("mtf_tolerance",0.02)
-            check_4h = params.get("check_4h_ema", False)
-            if not self.mtf_gate.check(asset, direction, mtf_tol, check_4h)[0]:
-                self.db_pipeline.add_reject(asset, price, 0, "MTF", self.asset_state[asset]["volatility"], regime, "MTF", regime)
-                self.rejected+=1; return
+            # MTF (Score-Based Gate)
+            mtf_passed, mtf_result = self.mtf_gate.check(
+                asset=asset,
+                direction=direction,
+                price=price,
+                params=params
+            )
+            if not mtf_passed:
+                logger.info(mtf_result['log'])
+                self.db_pipeline.add_reject(
+                    asset, 
+                    price, 
+                    mtf_result.get('confidence', 0), 
+                    "MTF", 
+                    self.asset_state[asset]["volatility"], 
+                    regime, 
+                    "MTF"
+                )
+                self.rejected += 1
+                return
+            
+            logger.info(mtf_result['log'])
+
             # Order flow
             of_strict = params.get("order_flow_strict", True)
             if not self.orderflow.check(asset, direction, price, of_strict)[0]:
