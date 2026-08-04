@@ -523,13 +523,15 @@ class DatabasePipeline:
     def _process_item(self, item):
         if item.get('type') == 'trade':
             if 'args' in item and item['args']:
-                self.db.log_trade(*item['args'])
-            if self.mongo.db is not None and 'data' in item:
+                if self.db is not None:
+                    self.db.log_trade(*item['args'])
+            if self.mongo is not None and getattr(self.mongo, 'db', None) is not None and 'data' in item:
                 self.mongo.save_trade_backup(item['data'])
         elif item.get('type') == 'reject':
             if 'args' in item and item['args']:
-                self.db.log_rejected(*item['args'])
-            if self.mongo.db is not None and 'data' in item:
+                if self.db is not None:
+                    self.db.log_rejected(*item['args'])
+            if self.mongo is not None and getattr(self.mongo, 'db', None) is not None and 'data' in item:
                 self.mongo.save_rejected_backup(item['data'])
 
     def add_trade(self, *args, **kwargs):
