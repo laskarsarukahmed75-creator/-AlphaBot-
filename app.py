@@ -1310,7 +1310,7 @@ class SQS_Calculator:
         self.cache = cache
 
     def calculate(self, asset, price, direction, session_ok, patterns, bos, choch,
-                  liquidity_sweep, ob, fvgs, vol_ratio, htf_trend, mtf_passed=False, use_micro_sweep=True):
+                  liquidity_sweep, ob, fvgs, vol_ratio, htf_trend, use_micro_sweep=True):
         score = 0
         if bos and bos.get("direction"):
             score += 15
@@ -1330,11 +1330,6 @@ class SQS_Calculator:
             score += 15
         if session_ok:
             score += 10
-        
-        # ✅ नया MTF बोनस अंक (अगर MTF Pass होगा तो +15 अंक मिलेंगे, Fail होगा तो 0 मिलेंगे पर कोड रुकेगा नहीं)
-        if mtf_passed:
-            score += 15
-            
         return score
 
 class DynamicStopLoss:
