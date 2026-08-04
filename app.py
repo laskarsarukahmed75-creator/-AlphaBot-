@@ -1610,8 +1610,8 @@ class HealthSnapshot:
             mem_state = self.orchestrator.memory.get_or_create_state()
             total_uptime = mem_state.get("total_run_seconds", 0)
             uptime_str = f"{total_uptime//86400}d {(total_uptime%86400)//3600}h {(total_uptime%3600)//60}m"
-            rejected = self.orchestrator.rejected
-            accepted = self.orchestrator.accepted
+            accepted_all_time = mem_state.get("accepted_signals_count", 0)
+            rejected_all_time = mem_state.get("rejected_signals_count", 0)
             self.snapshot = {
                 "status": "online",
                 "uptime": uptime_str,
@@ -1619,8 +1619,8 @@ class HealthSnapshot:
                 "memory": mem,
                 "active_trades_count": len(active_trades),
                 "active_trades": active_trades,
-                "accepted_signals": accepted,
-                "rejected_signals": rejected,
+                "accepted_signals": accepted_all_time,
+                "rejected_signals": rejected_all_time,
                 "performance": perf,
                 "dynamic_sqs_base": self.orchestrator.score_governor.current_base,
                 "total_signals_all_time": mem_state.get("total_signals_generated", 0)
@@ -1839,8 +1839,9 @@ class AIOrchestrator:
         self.cache = IndicatorCache(self.topology)
 
         self.news = CryptoNewsScanner()
-        self.db = TradeDatabase()
         self.mongo = MongoDatabase()
+        self.memory = PersistentMemoryEngine(self.mongo.db)
+        self.db = TradeDatabase(memory_engine=self.memory)
         self.telegram = TelegramPipeline()
 
         self.futures_stream = BinanceFuturesStream()
@@ -1871,7 +1872,6 @@ class AIOrchestrator:
         self.stream = None
 
         # Persistent Memory & Governor
-        self.memory = PersistentMemoryEngine(self.mongo.db)
         self._sync_initial_metadata()
         self.score_governor = DynamicScoreGovernor(self.memory)
         self.token_manager = TokenManager()
