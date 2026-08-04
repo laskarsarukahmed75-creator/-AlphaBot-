@@ -247,9 +247,9 @@ class TradeDatabase:
         finally:
             cur.close()
 
-# =====================================================================
-# 2. PERSISTENT MEMORY ENGINE
-# =====================================================================
+# ==============================================================================
+# 2. PERSISTENT MEMORY ENGINE (Optimized for Persistent Signal Tracking)
+# ==============================================================================
 class PersistentMemoryEngine:
     def __init__(self, mongo_db):
         self.db = mongo_db
@@ -258,7 +258,8 @@ class PersistentMemoryEngine:
             try:
                 if self.collection not in self.db.list_collection_names():
                     self.db.create_collection(self.collection)
-            except Exception: pass
+            except Exception:
+                pass
 
     def get_or_create_state(self):
         if self.db is None:
@@ -275,9 +276,18 @@ class PersistentMemoryEngine:
             return self._default_state()
 
     def _default_state(self):
-        return {"total_run_seconds": 0, "restart_count": 0, "total_signals_generated": 0,
-                "total_trades_closed": 0, "total_wins": 0, "total_losses": 0, "total_pnl": 0.0,
-                "last_update": int(time.time())}
+        return {
+            "total_run_seconds": 0,
+            "restart_count": 0,
+            "total_signals_generated": 0,
+            "accepted_signals_count": 0,  # ✅ ऑल-टाइम पास सिग्नल (Persistent)
+            "rejected_signals_count": 0,  # ✅ ऑल-टाइम रिजेक्टेड सिग्नल (Persistent)
+            "total_trades_closed": 0,
+            "total_wins": 0,
+            "total_losses": 0,
+            "total_pnl": 0.0,
+            "last_update": int(time.time())
+        }
 
     def update_state(self, updates: dict):
         if self.db is None:
@@ -285,17 +295,21 @@ class PersistentMemoryEngine:
         try:
             inc_fields = {k: v for k, v in updates.items() if isinstance(v, (int, float))}
             set_fields = {k: v for k, v in updates.items() if not isinstance(v, (int, float))}
+            
             if inc_fields:
                 inc_fields["last_update"] = 1
             else:
                 set_fields["last_update"] = int(time.time())
+                
             update_doc = {}
             if inc_fields:
                 update_doc["$inc"] = inc_fields
             if set_fields:
                 update_doc["$set"] = set_fields
+                
             self.db[self.collection].update_one({"_id": "global_state"}, update_doc, upsert=True)
-        except Exception: pass
+        except Exception:
+            pass
 
 # =====================================================================
 # 3. DYNAMIC SCORE GOVERNOR
@@ -1296,9 +1310,9 @@ class SQS_Calculator:
         self.cache = cache
 
     def calculate(self, asset, price, direction, session_ok, patterns, bos, choch,
-                  liquidity_sweep, ob, fvgs, vol_ratio, htf_trend, use_micro_sweep=True):
+                  liquidity_sweep, ob, fvgs, vol_ratio, htf_trend, mtf_passed=False, use_micro_sweep=True):
         score = 0
-        if bos and bos["direction"]:
+        if bos and bos.get("direction"):
             score += 15
         if choch:
             score += 10
@@ -1316,6 +1330,11 @@ class SQS_Calculator:
             score += 15
         if session_ok:
             score += 10
+        
+        # ✅ नया MTF बोनस अंक (अगर MTF Pass होगा तो +15 अंक मिलेंगे, Fail होगा तो 0 मिलेंगे पर कोड रुकेगा नहीं)
+        if mtf_passed:
+            score += 15
+            
         return score
 
 class DynamicStopLoss:
