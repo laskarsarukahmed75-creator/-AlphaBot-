@@ -135,8 +135,9 @@ class MongoDatabase:
         except Exception: pass
 
 class TradeDatabase:
-    def __init__(self):
+    def __init__(self, memory_engine=None):
         self.conn = sqlite3.connect(Config.DB_PATH, check_same_thread=False)
+        self.memory_engine = memory_engine  # ✅ MongoDB Engine कनेक्ट किया
         self._create_tables()
 
     def _create_tables(self):
@@ -165,7 +166,7 @@ class TradeDatabase:
             cur.execute('''CREATE TABLE IF NOT EXISTS performance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 date TEXT, win_rate REAL, profit_factor REAL, sharpe REAL,
-                total_trades INTEGER, winning_trades INTEGER, losing_trades INTEGER, total_pnl REAL
+                total_trades INTEGER, winning_trades INTEGER, losing_trades INTEGER
             )''')
             try:
                 cur.execute("ALTER TABLE trades ADD COLUMN signal_type TEXT DEFAULT 'STANDARD'")
@@ -181,26 +182,36 @@ class TradeDatabase:
                   dynamic_min_sqs, signal_type="STANDARD", signal_token=None):
         cur = self.conn.cursor()
         try:
-            cur.execute('''INSERT INTO trades 
+            cur.execute('''INSERT INTO trades
                 (asset, direction, entry, stop_loss, take_profit, score, confidence, patterns, logic,
-                 timestamp, volatility, market_regime, htf_trend, news_score, entry_time, status,
-                 session, sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type, signal_token)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                 timestamp, volatility, regime, htf_trend, news_score, session, sqs_score, pattern_name,
+                 dynamic_min_sqs, signal_type, signal_token)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (asset, direction, entry, sl, tp, score, confidence, json.dumps(patterns), logic,
-                 int(time.time()), volatility, regime, htf_trend, news_score, int(time.time()), 'open',
-                 session, sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type, signal_token))
+                 int(time.time()), volatility, regime, htf_trend, news_score, session,
+                 sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type, signal_token))
             self.conn.commit()
+            
+            # ✅ जब भी नया ट्रेड एक्सेप्ट होगा, MongoDB में 1 काउंट जुड़ जाएगा (Clear Cache पर रीसेट नहीं होगा)
+            if self.memory_engine:
+                self.memory_engine.update_state({"accepted_signals_count": 1})
+                
             return cur.lastrowid
         finally:
             cur.close()
 
-    def log_rejected(self, asset, price, score, reason, volatility, regime, gate_name="", dynamic_regime=""):
+    def log_rejected(self, asset, price, score, reason, volatility, regime, gate_name=""):
         cur = self.conn.cursor()
         try:
-            cur.execute('''INSERT INTO rejected_signals (asset, price, score, reason, timestamp, volatility, market_regime, gate_name, regime)
-                VALUES (?,?,?,?,?,?,?,?,?)''',
-                (asset, price, score, reason, int(time.time()), volatility, regime, gate_name, dynamic_regime))
+            cur.execute('''INSERT INTO rejected_signals (asset, price, score, reason, timestamp, volatility, regime, gate_name)
+                           VALUES (?,?,?,?,?,?,?,?)''',
+                        (asset, price, score, reason, int(time.time()), volatility, regime, gate_name))
             self.conn.commit()
+            
+            # ✅ जब भी कोई सिग्नल रिजेक्ट होगा, MongoDB में 1 रिजेक्शन जुड़ जाएगा (Clear Cache पर रीसेट नहीं होगा)
+            if self.memory_engine:
+                self.memory_engine.update_state({"rejected_signals_count": 1})
+                
         finally:
             cur.close()
 
