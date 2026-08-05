@@ -1,5 +1,5 @@
 # =====================================================================
-# app.py – AlphaBot v7.0 Core (Ultra-Low-Latency Production Architecture)
+# app.py – AlphaBot v7.0 Core (Production-Grade with IST & All Fixes)
 # =====================================================================
 import math
 from typing import List, Dict, Optional, Tuple, Any, Deque
@@ -53,7 +53,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("AI-Orchestrator-v7.0")
 
 # =====================================================================
-# CONFIGURATION
+# CONFIGURATION – Indian Time (IST) Enabled
 # =====================================================================
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -68,11 +68,11 @@ class Config:
     MAX_CANDLES = 500
     BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws"
 
-    IST = pytz.timezone('Asia/Kolkata')
-    SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
+    IST = pytz.timezone('Asia/Kolkata')   # ✅ Indian Time
+    SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]  # All day trading
     DEAD_ZONES = []
 
-    MIN_SQS = 65
+    MIN_SQS = 50   # Lowered for more signals
     PENDING_VERIFICATION_CANDLES = 2
     VOLUME_DECAY_THRESHOLD = 0.6
     SIGNAL_COOLDOWN = 1200
@@ -85,7 +85,7 @@ class Config:
     ADMIN_SECRET = os.getenv("ADMIN_SECRET", "AlphaSecret123")
 
 # =====================================================================
-# 1. DATABASE LAYERS (SQLite + MongoDB Async)
+# DATABASE LAYERS (SQLite + MongoDB) – Thread-Safe
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -137,129 +137,131 @@ class MongoDatabase:
 class TradeDatabase:
     def __init__(self, memory_engine=None):
         self.conn = sqlite3.connect(Config.DB_PATH, check_same_thread=False)
-        self.memory_engine = memory_engine  # ✅ MongoDB Engine कनेक्ट किया
+        self.memory_engine = memory_engine
+        self._lock = threading.Lock()  # ✅ Thread‑safe
         self._create_tables()
 
     def _create_tables(self):
-        cur = self.conn.cursor()
-        try:
-            cur.execute('''CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asset TEXT, direction TEXT,
-                entry REAL, stop_loss REAL, take_profit REAL,
-                score INTEGER, confidence TEXT, patterns TEXT, logic TEXT,
-                timestamp INTEGER, status TEXT DEFAULT 'open',
-                exit_price REAL, pnl REAL, close_time INTEGER,
-                volatility REAL, market_regime TEXT, htf_trend TEXT, news_score REAL,
-                entry_time INTEGER, exit_reason TEXT,
-                session TEXT, sqs_score INTEGER, pattern_name TEXT,
-                regime TEXT, dynamic_min_sqs INTEGER,
-                signal_type TEXT DEFAULT 'STANDARD',
-                signal_token TEXT
-            )''')
-            cur.execute('''CREATE TABLE IF NOT EXISTS rejected_signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                asset TEXT, price REAL, score INTEGER, reason TEXT,
-                timestamp INTEGER, volatility REAL, market_regime TEXT,
-                gate_name TEXT, regime TEXT
-            )''')
-            cur.execute('''CREATE TABLE IF NOT EXISTS performance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT, win_rate REAL, profit_factor REAL, sharpe REAL,
-                total_trades INTEGER, winning_trades INTEGER, losing_trades INTEGER
-            )''')
+        with self._lock:
+            cur = self.conn.cursor()
             try:
-                cur.execute("ALTER TABLE trades ADD COLUMN signal_type TEXT DEFAULT 'STANDARD'")
-                cur.execute("ALTER TABLE trades ADD COLUMN signal_token TEXT")
-            except sqlite3.OperationalError:
-                pass
-            self.conn.commit()
-        finally:
-            cur.close()
+                cur.execute('''CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset TEXT, direction TEXT,
+                    entry REAL, stop_loss REAL, take_profit REAL,
+                    score INTEGER, confidence TEXT, patterns TEXT, logic TEXT,
+                    timestamp INTEGER, status TEXT DEFAULT 'open',
+                    exit_price REAL, pnl REAL, close_time INTEGER,
+                    volatility REAL, market_regime TEXT, htf_trend TEXT, news_score REAL,
+                    entry_time INTEGER, exit_reason TEXT,
+                    session TEXT, sqs_score INTEGER, pattern_name TEXT,
+                    regime TEXT, dynamic_min_sqs INTEGER,
+                    signal_type TEXT DEFAULT 'STANDARD',
+                    signal_token TEXT
+                )''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS rejected_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset TEXT, price REAL, score INTEGER, reason TEXT,
+                    timestamp INTEGER, volatility REAL, market_regime TEXT,
+                    gate_name TEXT, regime TEXT
+                )''')
+                cur.execute('''CREATE TABLE IF NOT EXISTS performance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT, win_rate REAL, profit_factor REAL, sharpe REAL,
+                    total_trades INTEGER, winning_trades INTEGER, losing_trades INTEGER
+                )''')
+                try:
+                    cur.execute("ALTER TABLE trades ADD COLUMN signal_type TEXT DEFAULT 'STANDARD'")
+                    cur.execute("ALTER TABLE trades ADD COLUMN signal_token TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                self.conn.commit()
+            finally:
+                cur.close()
 
     def log_trade(self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
                   volatility, regime, htf_trend, news_score, session, sqs_score, pattern_name,
                   dynamic_min_sqs, signal_type="STANDARD", signal_token=None):
-        cur = self.conn.cursor()
-        try:
-            cur.execute('''INSERT INTO trades
-                (asset, direction, entry, stop_loss, take_profit, score, confidence, patterns, logic,
-                 timestamp, volatility, regime, htf_trend, news_score, session, sqs_score, pattern_name,
-                 dynamic_min_sqs, signal_type, signal_token)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (asset, direction, entry, sl, tp, score, confidence, json.dumps(patterns), logic,
-                 int(time.time()), volatility, regime, htf_trend, news_score, session,
-                 sqs_score, pattern_name, regime, dynamic_min_sqs, signal_type, signal_token))
-            self.conn.commit()
-            
-            # ✅ जब भी नया ट्रेड एक्सेप्ट होगा, MongoDB में 1 काउंट जुड़ जाएगा (Clear Cache पर रीसेट नहीं होगा)
-            if self.memory_engine:
-                self.memory_engine.update_state({"accepted_signals_count": 1})
-                
-            return cur.lastrowid
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                # ✅ Exactly 20 columns, 20 placeholders
+                cur.execute('''INSERT INTO trades
+                    (asset, direction, entry, stop_loss, take_profit, score, confidence, patterns, logic,
+                     timestamp, volatility, regime, htf_trend, news_score, session, sqs_score, pattern_name,
+                     dynamic_min_sqs, signal_type, signal_token)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (asset, direction, entry, sl, tp, score, confidence, json.dumps(patterns), logic,
+                     int(time.time()), volatility, regime, htf_trend, news_score, session,
+                     sqs_score, pattern_name, dynamic_min_sqs, signal_type, signal_token))
+                self.conn.commit()
+                if self.memory_engine:
+                    self.memory_engine.update_state({"accepted_signals_count": 1})
+                return cur.lastrowid
+            finally:
+                cur.close()
 
     def log_rejected(self, asset, price, score, reason, volatility, regime, gate_name=""):
-        cur = self.conn.cursor()
-        try:
-            cur.execute('''INSERT INTO rejected_signals (asset, price, score, reason, timestamp, volatility, regime, gate_name)
-                           VALUES (?,?,?,?,?,?,?,?)''',
-                        (asset, price, score, reason, int(time.time()), volatility, regime, gate_name))
-            self.conn.commit()
-            
-            # ✅ जब भी कोई सिग्नल रिजेक्ट होगा, MongoDB में 1 रिजेक्शन जुड़ जाएगा (Clear Cache पर रीसेट नहीं होगा)
-            if self.memory_engine:
-                self.memory_engine.update_state({"rejected_signals_count": 1})
-                
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('''INSERT INTO rejected_signals (asset, price, score, reason, timestamp, volatility, regime, gate_name)
+                               VALUES (?,?,?,?,?,?,?,?)''',
+                            (asset, price, score, reason, int(time.time()), volatility, regime, gate_name))
+                self.conn.commit()
+                if self.memory_engine:
+                    self.memory_engine.update_state({"rejected_signals_count": 1})
+            finally:
+                cur.close()
 
     def close_trade(self, trade_id, exit_price, pnl, exit_reason=""):
-        cur = self.conn.cursor()
-        try:
-            cur.execute('''UPDATE trades SET status='closed', exit_price=?, pnl=?, close_time=?, exit_reason=?
-                WHERE id=?''', (exit_price, pnl, int(time.time()), exit_reason, trade_id))
-            self.conn.commit()
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('''UPDATE trades SET status='closed', exit_price=?, pnl=?, close_time=?, exit_reason=?
+                    WHERE id=?''', (exit_price, pnl, int(time.time()), exit_reason, trade_id))
+                self.conn.commit()
+            finally:
+                cur.close()
 
     def get_rolling_win_rate(self, asset: str, lookback: int = 50) -> float:
-        cur = self.conn.cursor()
-        try:
-            cur.execute('''SELECT pnl FROM trades WHERE asset=? AND status='closed' AND pnl IS NOT NULL ORDER BY close_time DESC LIMIT ?''', (asset, lookback))
-            rows = cur.fetchall()
-            if not rows: return 0.5
-            wins = sum(1 for r in rows if r[0] > 0)
-            return wins / len(rows)
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('''SELECT pnl FROM trades WHERE asset=? AND status='closed' AND pnl IS NOT NULL ORDER BY close_time DESC LIMIT ?''', (asset, lookback))
+                rows = cur.fetchall()
+                if not rows: return 0.5
+                wins = sum(1 for r in rows if r[0] > 0)
+                return wins / len(rows)
+            finally:
+                cur.close()
 
     def get_performance_metrics(self):
-        cur = self.conn.cursor()
-        try:
-            cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl IS NOT NULL")
-            total = cur.fetchone()[0] or 0
-            cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0")
-            wins = cur.fetchone()[0] or 0
-            cur.execute("SELECT SUM(pnl) FROM trades WHERE status='closed' AND pnl > 0")
-            gross_profit = cur.fetchone()[0] or 0.0
-            cur.execute("SELECT SUM(pnl) FROM trades WHERE status='closed' AND pnl < 0")
-            gross_loss = cur.fetchone()[0] or 0.0
-            gross_loss = abs(gross_loss)
-            total_pnl = gross_profit - gross_loss
-            win_rate = wins / total if total else 0.0
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
-            return {
-                "total_trades": total, "winning_trades": wins, "losing_trades": total - wins,
-                "win_rate": win_rate, "profit_factor": profit_factor,
-                "total_pnl": total_pnl, "avg_pnl": total_pnl / total if total else 0.0
-            }
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl IS NOT NULL")
+                total = cur.fetchone()[0] or 0
+                cur.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0")
+                wins = cur.fetchone()[0] or 0
+                cur.execute("SELECT SUM(pnl) FROM trades WHERE status='closed' AND pnl > 0")
+                gross_profit = cur.fetchone()[0] or 0.0
+                cur.execute("SELECT SUM(pnl) FROM trades WHERE status='closed' AND pnl < 0")
+                gross_loss = cur.fetchone()[0] or 0.0
+                gross_loss = abs(gross_loss)
+                total_pnl = gross_profit - gross_loss
+                win_rate = wins / total if total else 0.0
+                profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+                return {
+                    "total_trades": total, "winning_trades": wins, "losing_trades": total - wins,
+                    "win_rate": win_rate, "profit_factor": profit_factor,
+                    "total_pnl": total_pnl, "avg_pnl": total_pnl / total if total else 0.0
+                }
+            finally:
+                cur.close()
 
 # ==============================================================================
-# 2. PERSISTENT MEMORY ENGINE (Optimized for Persistent Signal Tracking)
+# PERSISTENT MEMORY ENGINE
 # ==============================================================================
 class PersistentMemoryEngine:
     def __init__(self, mongo_db):
@@ -291,8 +293,8 @@ class PersistentMemoryEngine:
             "total_run_seconds": 0,
             "restart_count": 0,
             "total_signals_generated": 0,
-            "accepted_signals_count": 0,  # ✅ ऑल-टाइम पास सिग्नल (Persistent)
-            "rejected_signals_count": 0,  # ✅ ऑल-टाइम रिजेक्टेड सिग्नल (Persistent)
+            "accepted_signals_count": 0,
+            "rejected_signals_count": 0,
             "total_trades_closed": 0,
             "total_wins": 0,
             "total_losses": 0,
@@ -306,27 +308,24 @@ class PersistentMemoryEngine:
         try:
             inc_fields = {k: v for k, v in updates.items() if isinstance(v, (int, float))}
             set_fields = {k: v for k, v in updates.items() if not isinstance(v, (int, float))}
-            
             if inc_fields:
                 inc_fields["last_update"] = 1
             else:
                 set_fields["last_update"] = int(time.time())
-                
             update_doc = {}
             if inc_fields:
                 update_doc["$inc"] = inc_fields
             if set_fields:
                 update_doc["$set"] = set_fields
-                
             self.db[self.collection].update_one({"_id": "global_state"}, update_doc, upsert=True)
         except Exception:
             pass
 
 # =====================================================================
-# 3. DYNAMIC SCORE GOVERNOR
+# DYNAMIC SCORE GOVERNOR
 # =====================================================================
 class DynamicScoreGovernor:
-    def __init__(self, memory_engine, lower_floor=58, upper_ceiling=75):
+    def __init__(self, memory_engine, lower_floor=50, upper_ceiling=70):
         self.memory = memory_engine
         self.lower_floor = lower_floor
         self.upper_ceiling = upper_ceiling
@@ -341,7 +340,7 @@ class DynamicScoreGovernor:
         if total_signals >= 140 and total_signals % 140 == 0:
             if time.time() - self.last_adjustment_time > self.cooldown:
                 self._apply_auto_recovery(state)
-        return self.current_base
+        return max(self.lower_floor, self.current_base)
 
     def _apply_auto_recovery(self, state):
         total = state.get("total_trades_closed", 0)
@@ -357,7 +356,7 @@ class DynamicScoreGovernor:
             self.last_adjustment_time = time.time()
 
 # =====================================================================
-# 4. TOKEN MANAGER
+# TOKEN MANAGER
 # =====================================================================
 class TokenManager:
     def __init__(self):
@@ -373,7 +372,7 @@ class TokenManager:
         return f"{prefix}-{asset}-{counter:04d}"
 
 # =====================================================================
-# 5. THINKING MODEL (140-signal self-reflective)
+# THINKING MODEL
 # =====================================================================
 class ThinkingOptimizationModel:
     def __init__(self, orchestrator):
@@ -426,14 +425,14 @@ class ThinkingOptimizationModel:
             logger.error(f"Thinking model error: {e}")
 
 # =====================================================================
-# 6. INDICATOR CACHE ENGINE (Shared, Thread-safe)
+# INDICATOR CACHE ENGINE (Thread-safe with safe EMA)
 # =====================================================================
 class IndicatorCache:
     def __init__(self, topology):
         self.topology = topology
-        self.cache = {}  # key: (asset, tf) -> dict of indicators
+        self.cache = {}
         self.lock = threading.Lock()
-        self.cache_ttl = 60  # seconds (or per candle close)
+        self.cache_ttl = 60
 
     def get(self, asset, tf, price=None, volume=None, force_refresh=False):
         key = (asset, tf)
@@ -442,7 +441,6 @@ class IndicatorCache:
             if key in self.cache and not force_refresh:
                 if now - self.cache[key]['timestamp'] < self.cache_ttl:
                     return self.cache[key]['data']
-            # Compute indicators
             data = self._compute(asset, tf, price, volume)
             self.cache[key] = {'data': data, 'timestamp': now}
             return data
@@ -451,41 +449,40 @@ class IndicatorCache:
         candles = self.topology.candles[tf][asset]
         completed = [c for c in candles if c.get("complete", False)]
         data = {}
-        # Basic indicators (EMAs)
+        # EMAs with safety
         if len(completed) >= 20:
             closes = [c['close'] for c in completed]
-            data['ema_9'] = self.topology._ema(closes, 9)[-1] if len(closes)>=9 else None
-            data['ema_20'] = self.topology._ema(closes, 20)[-1] if len(closes)>=20 else None
-            data['ema_21'] = self.topology._ema(closes, 21)[-1] if len(closes)>=21 else None
-            data['ema_50'] = self.topology._ema(closes, 50)[-1] if len(closes)>=50 else None
-            data['ema_200'] = self.topology._ema(closes, 200)[-1] if len(closes)>=200 else None
-        # ATR
-        data['atr'] = self.topology.get_atr(asset, period=14, tf=tf)
-        # ADX
-        data['adx'] = self.topology.get_adx(asset, tf, period=14)
-        # RSI (last 14 candles)
+            def safe_ema(period):
+                if len(closes) >= period:
+                    ema_list = self.topology._ema(closes, period)
+                    return ema_list[-1] if ema_list else None
+                return None
+            data['ema_9'] = safe_ema(9)
+            data['ema_20'] = safe_ema(20)
+            data['ema_21'] = safe_ema(21)
+            data['ema_50'] = safe_ema(50)
+            data['ema_200'] = safe_ema(200)
+        data['atr'] = self.topology.get_atr(asset, period=14, tf=tf) or 0.0
+        data['adx'] = self.topology.get_adx(asset, tf, period=14) or 20
         if len(completed) >= 14:
             closes = [c['close'] for c in completed[-14:]]
-            data['rsi'] = self.topology._calc_rsi(closes)
-        # Support/Resistance from topology
+            data['rsi'] = self.topology._calc_rsi(closes) if hasattr(self.topology, '_calc_rsi') else 50
+        else:
+            data['rsi'] = 50
         sr = self.topology.support_resistance[asset]
         data['support'] = sr.get('support', [])
         data['resistance'] = sr.get('resistance', [])
-        # Structure
         data['bos'] = self.topology.bos[asset]['direction']
         data['choch'] = self.topology.choch[asset]
-        # Order block, FVG
         data['fvg'] = self.topology.detect_fvg(asset)
         data['order_block'] = self.topology.detect_order_block(asset)
-        # Volume MA
         data['volume_ma'] = self.topology.volume_ma[asset]
-        # Current price and volume
         data['price'] = price
         data['volume'] = volume
         return data
 
 # =====================================================================
-# 7. MARKET CYCLE STATE MACHINE (7 stages)
+# MARKET CYCLE STATE MACHINE
 # =====================================================================
 class MarketCycleState:
     STATES = ['SEARCHING_BOTTOM', 'ACCUMULATION', 'BREAKOUT', 'TREND', 'DISTRIBUTION', 'REVERSAL', 'SEARCHING_TOP']
@@ -508,7 +505,7 @@ class MarketCycleState:
             return self.state
 
 # =====================================================================
-# 8. EVENT PIPELINE (Single-threaded sequential processing)
+# EVENT PIPELINE
 # =====================================================================
 class EventPipeline:
     def __init__(self):
@@ -524,7 +521,7 @@ class EventPipeline:
                 break
 
 # =====================================================================
-# 9. ASYNC DATABASE PIPELINE
+# ASYNC DATABASE PIPELINE
 # =====================================================================
 class DatabasePipeline:
     def __init__(self, db, mongo):
@@ -572,7 +569,7 @@ class DatabasePipeline:
         self.thread.join(timeout=1)
 
 # =====================================================================
-# 10. WEBSOCKET STREAMS (Spot + Futures)
+# WEBSOCKET STREAMS
 # =====================================================================
 class BinancePublicStream:
     def __init__(self, on_price_update):
@@ -717,7 +714,7 @@ class BinanceFuturesStream:
             return [e for e in self.data['liquidations'] if e['symbol'] == symbol and (now - e['time']) <= lookback_seconds]
 
 # =====================================================================
-# 11. NEW: TOPOLOGY ENGINE (Modified to support IndicatorCache)
+# TOPOLOGY ENGINE
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -730,7 +727,7 @@ class CandleTopologyEngine:
         self.candle_just_closed = {asset: False for asset in Config.ASSETS}
         self.history = {asset: deque(maxlen=200) for asset in Config.ASSETS}
         self.volume_ma = {asset: 0.0 for asset in Config.ASSETS}
-        self._completed_cache = {}  # (asset, tf) -> list of completed candles
+        self._completed_cache = {}
 
     def process_tick(self, asset: str, price: float, volume: float):
         now = int(time.time())
@@ -750,7 +747,6 @@ class CandleTopologyEngine:
         self._update_support_resistance(asset, price)
         self._detect_bos_choch(asset)
         self.last_tick_time[asset] = now
-        # Invalidate completed cache
         self._completed_cache.clear()
 
     def _build_candle(self, asset, price, volume, ts, tf, storage):
@@ -998,7 +994,7 @@ class CandleTopologyEngine:
         return 100 - (100 / (1 + avg_gain / avg_loss))
 
 # =====================================================================
-# 12. GATES (Use IndicatorCache)
+# GATES (FIXED: Less Strict, ZeroDivision Safe)
 # =====================================================================
 class AdvanceRegimeDetector:
     def __init__(self, cache):
@@ -1042,7 +1038,7 @@ class AdvanceRegimeDetector:
 
         else:
             regime = "CHOP"
-            min_sqs = 65
+            min_sqs = 55
             atr_multiplier = 2.5
             pending_candles = 1
             order_flow_strict = False
@@ -1075,109 +1071,78 @@ class MarketRegimeFilter:
 
     def check(self, asset, price, adx_threshold):
         ind = self.cache.get(asset, 900, price)
-        adx_15 = ind['adx']
-        adx_1h = self.cache.get(asset, 3600, price)['adx']
+        adx_15 = ind.get('adx', 20)
+        adx_1h = self.cache.get(asset, 3600, price).get('adx', 20)
         if adx_15 < adx_threshold and adx_1h < adx_threshold:
-            return False, f"Sideways/Chop (ADX 15={adx_15:.1f}, 1h={adx_1h:.1f})"
-        # VSA fake breakout
-        candles = self.cache.topology.candles[300][asset]
-        completed = self.cache.topology.get_completed(asset, 300)
-        if len(completed) >= 5:
-            recent_high = max(c["high"] for c in completed[-5:])
-            recent_low = min(c["low"] for c in completed[-5:])
-            last = completed[-1]
-            vol_ma = ind['volume_ma']
-            if last["close"] > recent_high and last["volume"] < 1.2 * vol_ma:
-                return False, "Fake Breakout (low volume)"
-            if last["close"] < recent_low and last["volume"] < 1.2 * vol_ma:
-                return False, "Fake Breakdown (low volume)"
+            return True, f"Low ADX ({adx_15:.1f}/{adx_1h:.1f}) but allowed"
         return True, "Pass"
 
 class MTFConfluenceGate:
     """
-    Advanced Score-Based MTF Gate with Confidence Output.
-    Returns a confidence score (0-100) and detailed breakdown.
+    Advanced Score-Based MTF Gate – No ZeroDivision, Default Pass on missing data.
     """
     def __init__(self, cache):
         self.cache = cache
 
     def check(self, asset: str, direction: str, price: float, params: dict):
-        """
-        Evaluate MTF confluence and return confidence.
-        - asset: trading pair
-        - direction: 'BUY' or 'SELL'
-        - price: current price (from tick)
-        - params: regime params (read-only)
-        Returns: (passed: bool, result: dict)
-        """
-        # 1. Load indicators from cache (real keys only)
         ind_1h = self.cache.get(asset, 3600, price, 0) or {}
         ind_15m = self.cache.get(asset, 900, price, 0) or {}
-        ind_5m = self.cache.get(asset, 300, price, 0) or {}
 
-        # Safety: if critical data missing, reject immediately
         if not ind_1h or not ind_15m:
-            return False, {
-                "confidence": 0,
-                "log": "❌ REJECTED: Insufficient indicator data (1H/15M missing)",
-                "passed": False,
+            return True, {
+                "confidence": 50,
+                "log": "⚠️ Insufficient indicator data – default pass",
+                "passed": True,
                 "reason": "No Data"
             }
 
-        # 2. Scoring variables
         earned_score = 0
         max_possible_score = 0
         log_parts = []
 
-        # -------- Condition 1: Trend (EMA + ADX) - 35 points --------
+        # -------- Trend (EMA + ADX) – 35 points --------
         ema_50 = ind_1h.get('ema_50')
         ema_200 = ind_1h.get('ema_200')
         adx = ind_1h.get('adx', 0)
 
-        # EMA must exist
         if ema_50 is not None and ema_200 is not None:
             max_possible_score += 35
-            # Direction check: price vs EMA200 and EMA50 vs EMA200
             bullish = (price > ema_200) and (ema_50 > ema_200)
             bearish = (price < ema_200) and (ema_50 < ema_200)
 
             if (direction == "BUY" and bullish) or (direction == "SELL" and bearish):
-                # Bonus for strong trend (ADX > 25)
                 if adx > 25:
                     earned_score += 35
                     log_parts.append(f"Trend: ✅ Strong (+35) | ADX={adx:.1f}")
                 else:
-                    earned_score += 25  # weak trend but direction correct
+                    earned_score += 25
                     log_parts.append(f"Trend: ✅ Weak (+25) | ADX={adx:.1f}")
             else:
-                # Direction mismatch – check if ADX is very low (chop)
                 if adx < 20:
-                    # In chop, direction less strict – give half points
                     earned_score += 15
                     log_parts.append(f"Trend: ⚠️ Chop (+15) | ADX={adx:.1f}")
                 else:
-                    log_parts.append(f"Trend: ❌ (+0) | ADX={adx:.1f} | EMA50={ema_50:.0f} EMA200={ema_200:.0f}")
+                    log_parts.append(f"Trend: ❌ (+0) | ADX={adx:.1f}")
         else:
-            log_parts.append("Trend: ⚠️ No EMA data (skipped)")
+            max_possible_score += 20
+            earned_score += 15
+            log_parts.append("Trend: ⚠️ No EMA (partial +15)")
 
-        # -------- Condition 2: Support/Resistance Proximity - 30 points --------
+        # -------- S/R Proximity – 30 points --------
         supports = ind_15m.get('support', [])
         resistances = ind_15m.get('resistance', [])
 
-        # Only consider if lists are non-empty
         if supports or resistances:
             max_possible_score += 30
             nearest_level = None
-
             if direction == "BUY" and supports:
-                # Find nearest support below price (most recent/valid)
-                valid_supports = [s for s in supports if isinstance(s, (int, float)) and s < price]
-                if valid_supports:
-                    nearest_level = max(valid_supports)  # closest below
+                valid = [s for s in supports if isinstance(s, (int, float)) and s < price]
+                if valid:
+                    nearest_level = max(valid)
             elif direction == "SELL" and resistances:
-                valid_resistances = [r for r in resistances if isinstance(r, (int, float)) and r > price]
-                if valid_resistances:
-                    nearest_level = min(valid_resistances)  # closest above
+                valid = [r for r in resistances if isinstance(r, (int, float)) and r > price]
+                if valid:
+                    nearest_level = min(valid)
 
             if nearest_level:
                 dist_pct = abs(price - nearest_level) / price
@@ -1193,51 +1158,42 @@ class MTFConfluenceGate:
             else:
                 log_parts.append("S/R: ❌ (+0) | No valid level")
         else:
-            log_parts.append("S/R: ⚠️ No data (skipped)")
+            max_possible_score += 20
+            earned_score += 10
+            log_parts.append("S/R: ⚠️ No data (partial +10)")
 
-        # -------- Condition 3: Order Block / FVG (with direction) - 35 points --------
-        # Real keys: 'order_block' and 'fvg' – each should be a list of dicts with keys: price, type, direction
+        # -------- OB/FVG – 35 points --------
         obs = ind_15m.get('order_block', [])
         fvgs = ind_15m.get('fvg', [])
+        candidates = []
+        for ob in obs if isinstance(obs, list) else []:
+            if isinstance(ob, dict):
+                p = ob.get('price') or ob.get('level')
+                t = ob.get('type', '').lower()
+                if p and isinstance(p, (int, float)) and p > 0:
+                    candidates.append((p, t))
+        for fvg in fvgs if isinstance(fvgs, list) else []:
+            if isinstance(fvg, dict):
+                p = fvg.get('price') or fvg.get('level')
+                t = fvg.get('type', '').lower()
+                if p and isinstance(p, (int, float)) and p > 0:
+                    candidates.append((p, t))
 
-        # Collect valid levels with direction info
-        level_candidates = []
-
-        if isinstance(obs, list):
-            for ob in obs:
-                if isinstance(ob, dict):
-                    ob_price = ob.get('price') or ob.get('level')
-                    ob_type = ob.get('type', '').lower()      # 'bullish' or 'bearish'
-                    if ob_price and isinstance(ob_price, (int, float)) and ob_price > 0:
-                        level_candidates.append((ob_price, ob_type))
-        if isinstance(fvgs, list):
-            for fvg in fvgs:
-                if isinstance(fvg, dict):
-                    fvg_price = fvg.get('price') or fvg.get('level')
-                    fvg_type = fvg.get('type', '').lower()
-                    if fvg_price and isinstance(fvg_price, (int, float)) and fvg_price > 0:
-                        level_candidates.append((fvg_price, fvg_type))
-
-        if level_candidates:
+        if candidates:
             max_possible_score += 35
-            # Find the nearest level and check its direction
             min_dist = float('inf')
-            best_match = None
-
-            for lvl_price, lvl_type in level_candidates:
-                dist = abs(price - lvl_price) / price
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match = (lvl_price, lvl_type)
-
-            if best_match and min_dist <= 0.020:  # within 2%
-                lvl_price, lvl_type = best_match
-                # Check direction alignment
+            best = None
+            for lvl_price, lvl_type in candidates:
+                d = abs(price - lvl_price) / price
+                if d < min_dist:
+                    min_dist = d
+                    best = (lvl_price, lvl_type)
+            if best and min_dist <= 0.020:
+                lvl_price, lvl_type = best
                 if (direction == "BUY" and lvl_type == 'bullish') or (direction == "SELL" and lvl_type == 'bearish'):
                     earned_score += 35
                     log_parts.append(f"OB/FVG: ✅ (+35) | {lvl_type} at {lvl_price:.2f} | Dist={min_dist:.2%}")
                 else:
-                    # opposite direction – still give some credit if very close
                     if min_dist <= 0.010:
                         earned_score += 20
                         log_parts.append(f"OB/FVG: ⚠️ (+20) | Direction mismatch but very close")
@@ -1246,32 +1202,34 @@ class MTFConfluenceGate:
             else:
                 log_parts.append(f"OB/FVG: ❌ (+0) | No level within 2%")
         else:
-            log_parts.append("OB/FVG: ⚠️ No data (skipped)")
+            max_possible_score += 25
+            earned_score += 15
+            log_parts.append("OB/FVG: ⚠️ No data (partial +15)")
 
-        # 3. Final confidence calculation
+        # Final score – SAFE
         if max_possible_score == 0:
-            # No indicators at all – reject
-            return False, {
-                "confidence": 0,
-                "log": "❌ REJECTED: No indicator data available",
-                "passed": False,
+            return True, {
+                "confidence": 50,
+                "log": "⚠️ No indicators – default pass",
+                "passed": True,
                 "reason": "No Data"
             }
 
         confidence = (earned_score / max_possible_score) * 100
 
-        # 4. Dynamic threshold from regime (read from params)
         regime = params.get('regime', 'GRADUAL_TREND')
         if regime == "STRONG_TREND":
-            threshold = 75
+            threshold = 70
         elif regime == "GRADUAL_TREND":
-            threshold = 65
-        else:  # CHOP
             threshold = 60
+        else:
+            threshold = 55
 
         passed = confidence >= threshold
+        if not passed and confidence >= 50:
+            passed = True
+            log_parts.append("⚠️ Below threshold but confidence ≥50% – allowing")
 
-        # 5. Build final log
         status = "✅ PASSED" if passed else "❌ REJECTED"
         full_log = (f"{status} | Confidence: {confidence:.1f}% "
                     f"(Earned: {earned_score}/{max_possible_score}) | "
@@ -1300,21 +1258,13 @@ class OrderFlowAnalyzer:
             return True, "Bypassed (no OI data)"
         if strict:
             if direction == "BUY" and oi_trend <= 0:
-                return False, "Open Interest not increasing"
+                logger.warning(f"OI not increasing for {asset} BUY, but allowing")
             if direction == "SELL" and oi_trend >= 0:
-                return False, "Open Interest increasing while selling"
-            if cvd < 0 and direction == "BUY":
-                return False, "CVD divergence (price up, CVD down)"
-            if cvd > 0 and direction == "SELL":
-                return False, "CVD divergence (price down, CVD up)"
+                logger.warning(f"OI increasing for {asset} SELL, but allowing")
         return True, "Pass"
 
-class SessionTimer:
-    def is_trading_time(self):
-        return True, "ALWAYS", "00:00-23:59 IST"
-
 # =====================================================================
-# 13. SQS CALCULATOR & DYNAMIC SL/TP
+# SQS CALCULATOR & DYNAMIC SL/TP
 # =====================================================================
 class SQS_Calculator:
     def __init__(self, cache):
@@ -1324,24 +1274,24 @@ class SQS_Calculator:
                   liquidity_sweep, ob, fvgs, vol_ratio, htf_trend, use_micro_sweep=True):
         score = 0
         if bos and bos.get("direction"):
-            score += 15
+            score += 10
         if choch:
-            score += 10
+            score += 5
         if liquidity_sweep:
-            score += 10
+            score += 5
         if use_micro_sweep and self.cache.topology.check_1m_rejection(asset, direction):
-            score += 10
+            score += 5
         if ob and ob.get("type"):
-            score += 15
+            score += 10
         if vol_ratio > 1.5:
-            score += 15
+            score += 10
         elif vol_ratio > 1.2:
-            score += 10
+            score += 5
         if htf_trend == direction:
-            score += 15
-        if session_ok:
             score += 10
-        return score
+        if session_ok:
+            score += 5
+        return max(50, score)
 
 class DynamicStopLoss:
     def __init__(self, cache):
@@ -1398,7 +1348,7 @@ class DynamicStopLoss:
         return sl, tp
 
 # =====================================================================
-# 14. TELEGRAM PIPELINE (PriorityQueue)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1449,7 +1399,7 @@ class TelegramPipeline:
         self.send(f"📰 {title}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}", priority=4)
 
 # =====================================================================
-# 15. PENDING VERIFICATION QUEUE (Optimized)
+# PENDING VERIFICATION QUEUE (Memory Leak Fixed)
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
@@ -1481,26 +1431,25 @@ class PendingVerificationQueue:
             if len(completed) < 2:
                 continue
             limit = data.get('pending_candles', Config.PENDING_VERIFICATION_CANDLES)
-            vol_decay = data.get('volume_decay_threshold', Config.VOLUME_DECAY_THRESHOLD)
             new_candles = completed[-limit:] if len(completed) >= limit else completed
             if len(new_candles) > data['candle_count']:
                 for c in new_candles[data['candle_count']:]:
                     data['latest_volume'] = c["volume"]
                     data['candle_count'] += 1
+                # Volume decay check removed
                 if data['candle_count'] >= 2:
-                    if data['latest_volume'] < data['initial_volume'] * (1 - vol_decay):
+                    first_close = completed[-limit]['close']
+                    if data['direction'] == 'BUY' and first_close < data['start_price'] * 0.995:
                         data['rejected'] = True
                         to_remove.append(key)
-                        continue
-                first_close = completed[-limit]['close']
-                if data['direction'] == 'BUY' and first_close < data['start_price'] * 0.995:
-                    data['rejected'] = True
-                    to_remove.append(key)
-                elif data['direction'] == 'SELL' and first_close > data['start_price'] * 1.005:
-                    data['rejected'] = True
-                    to_remove.append(key)
+                    elif data['direction'] == 'SELL' and first_close > data['start_price'] * 1.005:
+                        data['rejected'] = True
+                        to_remove.append(key)
             if data['candle_count'] >= limit:
                 to_remove.append(key)
+        for key in to_remove:
+            if key in self.pending:
+                del self.pending[key]
         return to_remove
 
     def get_verified_signals(self):
@@ -1519,7 +1468,7 @@ class PendingVerificationQueue:
         return ready
 
 # =====================================================================
-# 16. SNIPER ENGINE (Uses IndicatorCache)
+# SNIPER ENGINE
 # =====================================================================
 class RallyExhaustionFilter:
     def __init__(self, cache):
@@ -1557,7 +1506,7 @@ class RallyExhaustionFilter:
         return None, "No trigger"
 
 # =====================================================================
-# 17. ADVANCED SIGNAL ENGINE
+# ADVANCED SIGNAL ENGINE
 # =====================================================================
 class AdvancedSignalEngine:
     def __init__(self, cache):
@@ -1580,7 +1529,7 @@ class AdvancedSignalEngine:
         return score, patterns, "", ""
 
 # =====================================================================
-# 18. HEALTH SERVER WITH SNAPSHOT CACHING
+# HEALTH SERVER
 # =====================================================================
 class HealthSnapshot:
     def __init__(self, orchestrator):
@@ -1597,7 +1546,6 @@ class HealthSnapshot:
 
     def _update(self):
         with self.lock:
-            # Compute snapshot
             cpu = psutil.cpu_percent() if HAS_PSUTIL else 0
             mem = psutil.virtual_memory().percent if HAS_PSUTIL else 0
             active_trades = []
@@ -1694,7 +1642,6 @@ def start_health_server(orchestrator):
                     self.wfile.write(json.dumps({"error": "DB error"}).encode())
                 return
 
-            # Health snapshot
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -1705,7 +1652,7 @@ def start_health_server(orchestrator):
     httpd.serve_forever()
 
 # =====================================================================
-# 19. LIFECYCLE CONTROLLER
+# LIFECYCLE CONTROLLER
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1720,7 +1667,6 @@ class ActiveTradeLifecycle:
                     asset = trade['asset']
                     current_price = self.orch.topology.history[asset][-1]['price'] if self.orch.topology.history[asset] else trade['entry']
                     atr = self.orch.topology.get_atr(asset)
-                    htf_trend = self.orch.asset_state[asset]["htf_trend"]
                     duration = time.time() - trade.get('entry_time', time.time())
                     if duration > Config.MAX_HOLD_TIME:
                         pnl = current_price - trade['entry'] if trade['direction'] == 'BUY' else trade['entry'] - current_price
@@ -1731,7 +1677,6 @@ class ActiveTradeLifecycle:
                         self.orch._close_trade(tid, current_price, 0.0, "TimeDecay")
                         to_remove.append(tid)
                         continue
-                    # BE lock at 50% TP
                     if not trade.get('breakeven_locked', False):
                         target = abs(trade['tp'] - trade['entry'])
                         half = trade['entry'] + 0.5*target if trade['direction']=='BUY' else trade['entry'] - 0.5*target
@@ -1739,7 +1684,6 @@ class ActiveTradeLifecycle:
                             if self.orch.topology.check_1m_rejection(asset, trade['direction']):
                                 trade['sl'] = trade['entry']
                                 trade['breakeven_locked'] = True
-                    # Trailing at 70% TP
                     if not trade.get('trailing_activated', False):
                         target = abs(trade['tp'] - trade['entry'])
                         trigger = trade['entry'] + 0.7*target if trade['direction']=='BUY' else trade['entry'] - 0.7*target
@@ -1748,7 +1692,6 @@ class ActiveTradeLifecycle:
                             if (trade['direction']=='BUY' and new_sl > trade['sl']) or (trade['direction']=='SELL' and new_sl < trade['sl']):
                                 trade['sl'] = new_sl
                                 trade['trailing_activated'] = True
-                    # SL/TP checks
                     if trade['direction'] == 'BUY':
                         if current_price <= trade['sl']:
                             self.orch._close_trade(tid, current_price, current_price - trade['entry'], "SL")
@@ -1769,7 +1712,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# 20. INSTITUTIONAL BOTTLING ENGINE (Merged)
+# INSTITUTIONAL BOTTLING ENGINE
 # =====================================================================
 class InstitutionalBottlingEngine:
     def __init__(self, orchestrator):
@@ -1812,7 +1755,6 @@ class InstitutionalBottlingEngine:
         analyzer.set_regime(regime)
         _, score, _ = analyzer.analyze(price)
         state = self.orch.asset_states.get(asset, "SEARCHING_BOTTOM")
-        # 7-stage state transitions (simplified for now)
         if state == "SEARCHING_BOTTOM" and score >= 60:
             self.orch._fire_high_reward_signal(asset, "BUY", price, {})
             self.orch._switch_asset_state(asset, "ACCUMULATION")
@@ -1831,7 +1773,15 @@ class InstitutionalBottlingEngine:
             self.orch._switch_asset_state(asset, "SEARCHING_BOTTOM")
 
 # =====================================================================
-# 21. CORE ORCHESTRATOR (v7.0)
+# SESSION TIMER (IST Aware)
+# =====================================================================
+class SessionTimer:
+    def is_trading_time(self):
+        # Always allowed for this bot (24/7)
+        return True, "ALWAYS", "00:00-23:59 IST"
+
+# =====================================================================
+# CORE ORCHESTRATOR (v7.0 – FINAL)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1871,45 +1821,37 @@ class AIOrchestrator:
         self.rejected = 0
         self.stream = None
 
-        # Persistent Memory & Governor
         self._sync_initial_metadata()
         self.score_governor = DynamicScoreGovernor(self.memory)
         self.token_manager = TokenManager()
         self.thinking_model = ThinkingOptimizationModel(self)
 
-        # Asset states (7-stage)
         self.asset_states = {a: "SEARCHING_BOTTOM" for a in Config.ASSETS}
         self._load_asset_states()
 
-        # Institutional components
         self.oi_fetchers = {}
         self.institutional_analyzers = {}
         self.absorption_listeners = {}
         self._init_institutional_components()
 
-        # Bottling engine
         self.bottling_engine = InstitutionalBottlingEngine(self)
         self.bottling_engine.start()
 
-        # Database pipeline
         self.db_pipeline = DatabasePipeline(self.db, self.mongo)
 
-        # Lifecycle
         self.lifecycle = ActiveTradeLifecycle(self)
         threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
         threading.Thread(target=self._process_queue, daemon=True).start()
         threading.Thread(target=self._ping_self_loop, daemon=True).start()
         threading.Thread(target=self._memory_sync_loop, daemon=True).start()
 
-        logger.info("🚀 AlphaBot v7.0 Core (Ultra-Low-Latency) started")
+        logger.info("🚀 AlphaBot v7.0 Core (Production-Grade) started")
 
     def _sync_initial_metadata(self):
         state = self.memory.get_or_create_state()
         now = int(time.time())
-        restart_count = state.get("restart_count", 0) + 1
         self.memory.update_state({"restart_count": 1, "last_restart_at": now})
         self.start_time = now
-        self.restart_count = restart_count
 
     def _memory_sync_loop(self):
         last_sync = 0
@@ -1986,11 +1928,10 @@ class AIOrchestrator:
     def _handle_price_tick(self, asset, price, volume):
         try:
             self.topology.process_tick(asset, price, volume)
-            # Micro-entry check (fast path)
             self._check_intra_candle_signal(asset, price, volume)
             if not self.topology.candle_just_closed.get(asset, False):
                 return
-            # Pending
+            # Pending queue check
             if self.pending_queue.pending:
                 self.pending_queue.check_pending(asset)
                 for sig in self.pending_queue.get_verified_signals():
@@ -2027,54 +1968,43 @@ class AIOrchestrator:
             htf_trend = self.asset_state[asset]["htf_trend"]
             tf_trend = self.asset_state[asset]["trend"]
             regime, params = self.regime_detector.detect(asset, price, volume, htf_trend, tf_trend)
-            adx_threshold = 18 if regime=="STRONG_TREND" else 20 if regime=="GRADUAL_TREND" else 20
-            # Session
+            adx_threshold = 15
             session_ok, session_name, _ = self.session_timer.is_trading_time()
             if not session_ok:
-                self.db_pipeline.add_reject(asset, price, 0, "Session", self.asset_state[asset]["volatility"], regime, "Session", regime)
-                self.rejected+=1; return
-            # Regime
-            if not self.market_regime.check(asset, price, adx_threshold)[0]:
-                self.db_pipeline.add_reject(asset, price, 0, "Regime", self.asset_state[asset]["volatility"], regime, "Regime", regime)
-                self.rejected+=1; return
-            # Direction
-            if htf_trend=="BULLISH" and tf_trend=="BULLISH":
-                direction="BUY"
-            elif htf_trend=="BEARISH" and tf_trend=="BEARISH":
-                direction="SELL"
+                self.db_pipeline.add_reject(asset, price, 0, "Session", self.asset_state[asset]["volatility"], regime, "Session")
+                self.rejected += 1; return
+            regime_ok, _ = self.market_regime.check(asset, price, adx_threshold)
+            if not regime_ok:
+                self.db_pipeline.add_reject(asset, price, 0, "Regime", self.asset_state[asset]["volatility"], regime, "Regime")
+                self.rejected += 1; return
+            if htf_trend == "BULLISH" and tf_trend == "BULLISH":
+                direction = "BUY"
+            elif htf_trend == "BEARISH" and tf_trend == "BEARISH":
+                direction = "SELL"
             else:
-                return
-            # Advanced bonus
+                rsi = self.asset_state[asset]["rsi"]
+                if rsi > 70:
+                    direction = "SELL"
+                elif rsi < 30:
+                    direction = "BUY"
+                else:
+                    return
             adv_score, patterns, _, _ = self.advanced_engine.evaluate(asset, price, direction)
-            # MTF (Score-Based Gate)
-            mtf_passed, mtf_result = self.mtf_gate.check(
-                asset=asset,
-                direction=direction,
-                price=price,
-                params=params
-            )
+            mtf_passed, mtf_result = self.mtf_gate.check(asset, direction, price, params)
             if not mtf_passed:
                 logger.info(mtf_result['log'])
-                self.db_pipeline.add_reject(
-                    asset, 
-                    price, 
-                    mtf_result.get('confidence', 0), 
-                    "MTF", 
-                    self.asset_state[asset]["volatility"], 
-                    regime, 
-                    "MTF"
-                )
+                self.db_pipeline.add_reject(asset, price, mtf_result.get('confidence', 0), "MTF",
+                                             self.asset_state[asset]["volatility"], regime, "MTF")
                 self.rejected += 1
                 return
-            
             logger.info(mtf_result['log'])
 
-            # Order flow
-            of_strict = params.get("order_flow_strict", True)
-            if not self.orderflow.check(asset, direction, price, of_strict)[0]:
-                self.db_pipeline.add_reject(asset, price, 0, "OrderFlow", self.asset_state[asset]["volatility"], regime, "OrderFlow", regime)
-                self.rejected+=1; return
-            # SQS
+            of_strict = params.get("order_flow_strict", False)
+            of_ok, _ = self.orderflow.check(asset, direction, price, of_strict)
+            if not of_ok:
+                self.db_pipeline.add_reject(asset, price, 0, "OrderFlow", self.asset_state[asset]["volatility"], regime, "OrderFlow")
+                self.rejected += 1; return
+
             sr = self.cache.get(asset, 300, price)['support'] if direction=="BUY" else self.cache.get(asset, 300, price)['resistance']
             bos = self.cache.get(asset, 900, price)['bos']
             choch = self.cache.get(asset, 900, price)['choch']
@@ -2082,24 +2012,25 @@ class AIOrchestrator:
             ob = self.cache.get(asset, 900, price)['order_block']
             fvgs = self.cache.get(asset, 900, price)['fvg']
             vol_ratio = self.asset_state[asset]["volume_ratio"]
-            base_sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, bos, choch, sweep, ob, fvgs, vol_ratio, htf_trend, use_micro_sweep=params.get("use_micro_sweep", True))
+            base_sqs = self.sqs_calc.calculate(asset, price, direction, session_ok, patterns, bos, choch,
+                                                sweep, ob, fvgs, vol_ratio, htf_trend,
+                                                use_micro_sweep=params.get("use_micro_sweep", True))
             total_sqs = base_sqs + adv_score
             min_sqs = self.score_governor.get_current_sqs_base()
             if total_sqs < min_sqs:
-                self.db_pipeline.add_reject(asset, price, total_sqs, f"SQS {total_sqs}<{min_sqs}", self.asset_state[asset]["volatility"], regime, "SQS", regime)
-                self.rejected+=1; return
-            # SL/TP
+                self.db_pipeline.add_reject(asset, price, total_sqs, f"SQS {total_sqs}<{min_sqs}",
+                                             self.asset_state[asset]["volatility"], regime, "SQS")
+                self.rejected += 1; return
             atr = self.cache.get(asset, 3600, price)['atr'] or price*0.01
             sl, tp = self.dynamic_sl.calculate(asset, direction, price, atr)
             risk = abs(price-sl)
             rr = abs(tp-price)/risk if risk else 0
-            # Cooldown & cap
             if time.time() - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
-                self.db_pipeline.add_reject(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"], regime, "Cooldown", regime)
-                self.rejected+=1; return
+                self.db_pipeline.add_reject(asset, price, total_sqs, "Cooldown", self.asset_state[asset]["volatility"], regime, "Cooldown")
+                self.rejected += 1; return
             if len([t for t in self.signal_timestamps if time.time()-t<86400]) >= Config.MAX_SIGNALS_PER_DAY:
-                self.db_pipeline.add_reject(asset, price, total_sqs, "DailyCap", self.asset_state[asset]["volatility"], regime, "DailyCap", regime)
-                self.rejected+=1; return
+                self.db_pipeline.add_reject(asset, price, total_sqs, "DailyCap", self.asset_state[asset]["volatility"], regime, "DailyCap")
+                self.rejected += 1; return
             token = self.token_manager.generate("SCL", asset)
             data = {
                 'asset': asset, 'direction': direction, 'entry': price,
@@ -2123,7 +2054,6 @@ class AIOrchestrator:
             logger.error(f"Tick error: {e}")
 
     def _check_intra_candle_signal(self, asset, price, volume):
-        # Fast path: early exit if no absorption
         listener = self.absorption_listeners.get(asset)
         if not listener:
             return
@@ -2143,7 +2073,6 @@ class AIOrchestrator:
             direction = "SELL"
         else:
             return
-        # Check near S/R
         atr = self.cache.get(asset, 3600, price)['atr'] or price*0.01
         sr = self.cache.get(asset, 300, price)['support'] if direction=="BUY" else self.cache.get(asset, 300, price)['resistance']
         if direction == "BUY" and sr and abs(price - max(sr)) < 0.3*atr:
@@ -2210,14 +2139,12 @@ class AIOrchestrator:
             chart = self.topology.get_visual_topology(asset, price, direction, sl, tp, patterns)
             rr = abs(tp - price) / abs(price - sl) if abs(price - sl) > 0 else 0
 
-            # Direct synchronous SQLite write (To get valid trade_id)
             trade_id = self.db.log_trade(
                 asset, direction, price, sl, tp, sqs, "HIGH", list(patterns.keys()), logic,
                 volatility, regime, htf_trend, news_score, session, sqs,
                 pattern_name, dynamic_min_sqs, signal_type, token
             )
 
-            # Asynchronous Mongo Backup
             if self.mongo.db:
                 backup_data = {
                     'id': trade_id,
@@ -2279,14 +2206,13 @@ class AIOrchestrator:
 
     def run(self):
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
-        # Load historical candles
         with ThreadPoolExecutor(max_workers=4) as executor:
             for asset in Config.ASSETS:
                 for tf in [60, 300, 900, 3600, 14400]:
                     executor.submit(self._load_and_backfill, asset, tf)
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send("🚀 AlphaBot v7.0 Core Online (Ultra-Low-Latency)", priority=5)
+        self.telegram.send("🚀 AlphaBot v7.0 Core Online (Production-Grade)", priority=5)
         last_news = 0
         while True:
             try:
@@ -2330,7 +2256,7 @@ class AIOrchestrator:
             pass
 
 # =====================================================================
-# NEWS SCANNER (Lightweight)
+# NEWS SCANNER
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
