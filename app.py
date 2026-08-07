@@ -31,7 +31,7 @@ except ImportError:
 
 # ---- Logging Setup ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v5.2.3-Final")
+logger = logging.getLogger("AI-Orchestrator-v5.2.4-Dashboard")
 
 # =====================================================================
 # CONFIGURATION
@@ -77,7 +77,7 @@ class Config:
     CLEANUP_INTERVAL = 600  # 10 minutes
 
 # =====================================================================
-# MONGODB DATABASE MANAGER (with retry)
+# MONGODB DATABASE MANAGER (fixed truth-value checks)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -105,13 +105,15 @@ class MongoDatabase:
         self.db = None
 
     def _create_indexes(self):
-        if not self.db: return
+        if self.db is None:   # FIXED
+            return
         self.db.candles.create_index([("asset", ASCENDING), ("timeframe", ASCENDING), ("timestamp", ASCENDING)], unique=True)
         self.db.trades.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
         self.db.rejected.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
 
     def save_candle(self, asset, timeframe, candle):
-        if not self.db: return
+        if self.db is None:   # FIXED
+            return
         try:
             doc = {**candle, "asset": asset, "timeframe": timeframe}
             self.db.candles.update_one(
@@ -123,7 +125,8 @@ class MongoDatabase:
             logger.debug(f"Mongo save_candle error: {e}")
 
     def load_candles(self, asset, timeframe, limit=500, since=None):
-        if not self.db: return []
+        if self.db is None:   # FIXED
+            return []
         try:
             query = {"asset": asset, "timeframe": timeframe}
             if since:
@@ -135,7 +138,8 @@ class MongoDatabase:
             return []
 
     def get_latest_timestamp(self, asset, timeframe):
-        if not self.db: return 0
+        if self.db is None:   # FIXED
+            return 0
         try:
             doc = self.db.candles.find_one(
                 {"asset": asset, "timeframe": timeframe},
@@ -146,21 +150,23 @@ class MongoDatabase:
             return 0
 
     def save_trade_backup(self, trade_data):
-        if not self.db: return
+        if self.db is None:   # FIXED
+            return
         try:
             self.db.trades.update_one({"id": trade_data["id"]}, {"$set": trade_data}, upsert=True)
         except Exception as e:
             logger.debug(f"Mongo save_trade error: {e}")
 
     def save_rejected_backup(self, rejected_data):
-        if not self.db: return
+        if self.db is None:   # FIXED
+            return
         try:
             self.db.rejected.insert_one(rejected_data)
         except Exception as e:
             logger.debug(f"Mongo save_rejected error: {e}")
 
 # =====================================================================
-# SQLite DATABASE (with thread-safe explicit cursor handling)
+# SQLite DATABASE (thread-safe explicit cursor)
 # =====================================================================
 class TradeDatabase:
     def __init__(self):
@@ -252,14 +258,23 @@ class TradeDatabase:
             finally:
                 cur.close()
 
+    def get_recent_trades(self, limit=5):
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT id, asset, direction, entry, stop_loss, take_profit, score, confidence, status, timestamp FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+                return cur.fetchall()
+            finally:
+                cur.close()
+
 # =====================================================================
-# NEWS SCANNER (with summary, source quality, duplicate filtering)
+# NEWS SCANNER (improved)
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
         self.last_news = {}
         self.fear_greed = 50
-        self.seen_titles = set()  # for duplicate filtering
+        self.seen_titles = set()
 
     def fetch_latest(self) -> Dict[str, Any]:
         try:
@@ -271,16 +286,14 @@ class CryptoNewsScanner:
                 if data.get("Data"):
                     for article in data["Data"][:5]:
                         title = article.get("title", "")
-                        # Duplicate filtering
                         if title in self.seen_titles:
                             continue
                         self.seen_titles.add(title)
-                        # Source quality (simple: treat known sources higher)
                         source = article.get("source", "")
                         quality = 1.0
                         if source in ["Cointelegraph", "CoinDesk", "Bloomberg", "Reuters"]:
                             quality = 1.5
-                        summary = article.get("body", "")[:200]  # summary snippet
+                        summary = article.get("body", "")[:200]
                         sentiment = self._analyze_sentiment(title + " " + summary)
                         articles.append({
                             "title": title,
@@ -298,7 +311,6 @@ class CryptoNewsScanner:
                     self.fear_greed = int(fg_data["data"][0]["value"])
 
             if articles:
-                # Weighted average sentiment by quality
                 total_quality = sum(a["quality"] for a in articles)
                 if total_quality > 0:
                     avg_sent = sum(a["sentiment"] * a["quality"] for a in articles) / total_quality
@@ -318,7 +330,6 @@ class CryptoNewsScanner:
         return {"articles": [], "fresh": False, "fear_greed": 50, "sentiment": 0}
 
     def _analyze_sentiment(self, text: str) -> float:
-        # Expanded weighted word lists (same as before)
         bullish_words = {
             "bullish": 2, "breakout": 3, "surge": 3, "buy": 1, "accumulate": 2,
             "rally": 2, "green": 1, "positive": 2, "gain": 2, "up": 1,
@@ -340,28 +351,23 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 10))
 
 # =====================================================================
-# ORDER BLOCK ENGINE (with BOS confirmation, mitigation, retest, invalidation)
+# ORDER BLOCK ENGINE
 # =====================================================================
 class OrderBlockEngine:
     def __init__(self):
-        self.blocks = {}  # asset -> list of dicts with full details
+        self.blocks = {}
         self.lookback = 100
 
     def detect_order_blocks(self, asset, candles_15m, bos_direction):
-        """
-        Detect and update order blocks.
-        Returns list of active OBs.
-        """
         if len(candles_15m) < 20:
             return
-        # Find strong candles
         new_blocks = []
         for i in range(5, len(candles_15m)-2):
             c = candles_15m[i]
             body = abs(c["close"] - c["open"])
             avg_body = sum(abs(candles_15m[j]["close"] - candles_15m[j]["open"]) for j in range(i-5, i)) / 5
-            if body > avg_body * 1.8:  # strong candle
-                if c["close"] > c["open"]:  # bullish
+            if body > avg_body * 1.8:
+                if c["close"] > c["open"]:
                     if bos_direction in ["UP", "BULLISH"]:
                         ob = {
                             "type": "BULLISH",
@@ -374,7 +380,7 @@ class OrderBlockEngine:
                             "mitigation_count": 0
                         }
                         new_blocks.append(ob)
-                else:  # bearish
+                else:
                     if bos_direction in ["DOWN", "BEARISH"]:
                         ob = {
                             "type": "BEARISH",
@@ -388,34 +394,25 @@ class OrderBlockEngine:
                         }
                         new_blocks.append(ob)
 
-        # Merge with existing blocks, update statuses
         existing = self.blocks.get(asset, [])
-        # Keep only recent and not invalidated
         active = [b for b in existing if not b.get("invalidated", False) and 
-                  (time.time() - b["created_at"] < 3600*24)]  # 24h expiry
-
-        # Add new blocks
+                  (time.time() - b["created_at"] < 3600*24)]
         active.extend(new_blocks)
-
-        # Update mitigation and retest based on current price (will be called periodically)
-        self.blocks[asset] = active[-10:]  # keep last 10
+        self.blocks[asset] = active[-10:]
         return active
 
     def update_ob_status(self, asset, price):
-        """Check mitigation, retest, invalidation based on price action."""
         if asset not in self.blocks:
             return
         for ob in self.blocks[asset]:
             if ob.get("invalidated"): continue
-            # Mitigation: price crosses the OB level
             if ob["type"] == "BULLISH":
                 if price <= ob["level"] and not ob.get("mitigated", False):
                     ob["mitigated"] = True
                     ob["mitigation_count"] = ob.get("mitigation_count", 0) + 1
-                # Invalidation: price goes above OB level by a significant margin
                 if price > ob["level"] * 1.01:
                     ob["invalidated"] = True
-            else:  # BEARISH
+            else:
                 if price >= ob["level"] and not ob.get("mitigated", False):
                     ob["mitigated"] = True
                     ob["mitigation_count"] = ob.get("mitigation_count", 0) + 1
@@ -423,7 +420,6 @@ class OrderBlockEngine:
                     ob["invalidated"] = True
 
     def get_ob_zone(self, asset, price, direction):
-        """Return the nearest valid OB level that aligns with direction."""
         if asset not in self.blocks:
             return None
         best_ob = None
@@ -444,7 +440,7 @@ class OrderBlockEngine:
         return best_ob
 
 # =====================================================================
-# INSTITUTIONAL LIQUIDITY ENGINE (improved with sweep volume confirmation)
+# INSTITUTIONAL LIQUIDITY ENGINE
 # =====================================================================
 class InstitutionalLiquidityEngine:
     def __init__(self, lookback=800):
@@ -452,15 +448,11 @@ class InstitutionalLiquidityEngine:
         self.proximity_pct = 0.005
 
     def analyze(self, candles_1h, candles_5m, candle_1m, ltp, atr, bsl, ssl, volume_ratio):
-        """
-        Enhanced with volume confirmation for liquidity sweeps.
-        """
         if bsl == 0 or ssl == 0 or atr == 0:
             return {"trigger": "WAIT"}
         m1_high, m1_low = candle_1m["high"], candle_1m["low"]
-        # Check for sweep with volume spike
         if m1_high >= bsl and ltp >= bsl * (1 - self.proximity_pct):
-            if volume_ratio > 1.2:  # volume confirmation
+            if volume_ratio > 1.2:
                 return {"trigger": "SELL", "strength": "HIGH"}
             else:
                 return {"trigger": "SELL", "strength": "LOW"}
@@ -472,7 +464,7 @@ class InstitutionalLiquidityEngine:
         return {"trigger": "WAIT"}
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (with FVG fill tracking, memory cleanup)
+# CANDLE TOPOLOGY ENGINE
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -484,7 +476,7 @@ class CandleTopologyEngine:
         self.last_tick_time = {asset: 0 for asset in Config.ASSETS}
         self.candle_just_closed = {asset: False for asset in Config.ASSETS}
         self.history = {asset: deque(maxlen=200) for asset in Config.ASSETS}
-        self.fvg_cache = {asset: [] for asset in Config.ASSETS}   # list of FVG dicts with fill status
+        self.fvg_cache = {asset: [] for asset in Config.ASSETS}
         self.last_cleanup = time.time()
 
     def process_tick(self, asset: str, price: float, volume: float):
@@ -508,19 +500,16 @@ class CandleTopologyEngine:
         self._detect_bos_choch(asset)
         self.last_tick_time[asset] = now
 
-        # Periodic cleanup
         if time.time() - self.last_cleanup > Config.CLEANUP_INTERVAL:
             self._cleanup_old_data()
             self.last_cleanup = time.time()
 
     def _cleanup_old_data(self):
-        """Remove stale candles and history to manage memory."""
         for tf in self.candles:
             for asset in Config.ASSETS:
                 if len(self.candles[tf][asset]) > Config.MAX_CANDLES:
                     self.candles[tf][asset] = self.candles[tf][asset][-Config.MAX_CANDLES:]
         for asset in Config.ASSETS:
-            # Keep only last 500 history entries
             if len(self.history[asset]) > 500:
                 self.history[asset] = deque(list(self.history[asset])[-500:], maxlen=200)
 
@@ -578,12 +567,7 @@ class CandleTopologyEngine:
         self.support_resistance[asset]["support"] = [l for l in clusters if l < price * 0.99]
         self.support_resistance[asset]["resistance"] = [r for r in clusters if r > price * 1.01]
 
-    # IMPROVED FVG DETECTION with fill tracking
     def detect_fvg(self, asset, tf=300):
-        """
-        Detect FVGs and update their fill status.
-        Returns list of fresh (unfilled) FVGs first.
-        """
         candles = self.candles[tf][asset]
         if len(candles) < 3:
             return []
@@ -593,7 +577,6 @@ class CandleTopologyEngine:
         new_fvgs = []
         for i in range(len(complete)-2):
             c0, c1, c2 = complete[i], complete[i+1], complete[i+2]
-            # Bullish FVG
             if c0["high"] < c2["low"] and c1["low"] > c0["high"]:
                 fvg = {
                     "type": "BULLISH",
@@ -604,7 +587,6 @@ class CandleTopologyEngine:
                     "partial_fill": False
                 }
                 new_fvgs.append(fvg)
-            # Bearish FVG
             if c0["low"] > c2["high"] and c1["high"] < c0["low"]:
                 fvg = {
                     "type": "BEARISH",
@@ -616,16 +598,10 @@ class CandleTopologyEngine:
                 }
                 new_fvgs.append(fvg)
 
-        # Merge with existing FVGs and update fill status
         existing = self.fvg_cache.get(asset, [])
-        # Remove old FVGs (older than 24h)
         now = int(time.time())
         existing = [f for f in existing if (now - f["created_at"]) < 86400 and not f.get("filled", False)]
-        # Update fill status based on current price (passed separately)
-        # We'll do that in a separate method update_fvg_status
-        # Combine new and existing, keeping fresh ones (unfilled)
         all_fvgs = new_fvgs + existing
-        # Remove duplicates
         unique = []
         seen = set()
         for f in all_fvgs:
@@ -633,13 +609,10 @@ class CandleTopologyEngine:
             if key not in seen:
                 seen.add(key)
                 unique.append(f)
-        # Keep last 10
         self.fvg_cache[asset] = unique[-10:]
-        # Return fresh (unfilled) first
         return [f for f in self.fvg_cache[asset] if not f.get("filled", False)]
 
     def update_fvg_status(self, asset, price):
-        """Check if price has filled any FVG."""
         if asset not in self.fvg_cache:
             return
         for fvg in self.fvg_cache[asset]:
@@ -649,7 +622,7 @@ class CandleTopologyEngine:
                     fvg["partial_fill"] = True
                 if price < fvg["bottom"]:
                     fvg["filled"] = True
-            else:  # BEARISH
+            else:
                 if price <= fvg["top"] and price >= fvg["bottom"]:
                     fvg["partial_fill"] = True
                 if price > fvg["top"]:
@@ -746,7 +719,7 @@ class CandleTopologyEngine:
         return "\n".join(chart_lines)
 
 # =====================================================================
-# SIGNAL SCORING ENGINE (with adaptive weights)
+# SIGNAL SCORING ENGINE (adaptive weights)
 # =====================================================================
 class SignalScoringEngine:
     def __init__(self):
@@ -757,11 +730,10 @@ class SignalScoringEngine:
         }
         self.weights = self.base_weights.copy()
         self.min_pass_layers = Config.MIN_LAYER_PASS
-        self.layer_win_rates = {}   # dynamic per layer
+        self.layer_win_rates = {}
         self.last_update = 0
 
     def update_layer_performance(self, db):
-        """Refresh win rates per layer and adapt weights."""
         with db.conn.cursor() as cur:
             cur.execute("SELECT logic, pnl FROM trades WHERE status='closed' ORDER BY id DESC LIMIT 200")
             rows = cur.fetchall()
@@ -777,10 +749,8 @@ class SignalScoringEngine:
         for layer, (wins, total) in layer_wins.items():
             self.layer_win_rates[layer] = wins / total if total > 0 else 0.5
 
-        # Adapt weights: multiply base weight by performance ratio relative to 0.5
-        # Clamp weight between 50% and 200% of base
         for layer, wr in self.layer_win_rates.items():
-            ratio = wr / 0.5  # 1.0 means neutral
+            ratio = wr / 0.5
             ratio = max(0.5, min(2.0, ratio))
             self.weights[layer] = self.base_weights[layer] * ratio
         self.last_update = time.time()
@@ -789,7 +759,6 @@ class SignalScoringEngine:
                  rsi, adx, volatility, htf_trend, bos, choch, fvgs, order_block, liquidity_sweep,
                  news_importance, hunt_confirmed=False, inst_liquidity_trigger=None):
         passed = []; score = 0
-        # Use adaptive weights
         w = self.weights
         if htf_trend == trend and htf_trend != "NEUTRAL": score += w["htf_trend"]; passed.append("htf_trend")
         if choch: score += w["market_structure"]; passed.append("market_structure")
@@ -810,7 +779,6 @@ class SignalScoringEngine:
             score += w["order_block"]; passed.append("order_block")
 
         total_score = min(100, score)
-        # Probability based on average win rate of passed layers
         if passed:
             avg_wr = sum(self.layer_win_rates.get(l, 0.5) for l in passed) / len(passed)
             prob = avg_wr * 100
@@ -824,7 +792,7 @@ class SignalScoringEngine:
                 "enough": len(passed) >= self.min_pass_layers}
 
 # =====================================================================
-# TELEGRAM PIPELINE (unchanged)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -862,7 +830,7 @@ class TelegramPipeline:
         self.queue.put(f"📰 {title}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}")
 
 # =====================================================================
-# BINANCE WEBSOCKET (with exponential backoff and heartbeat)
+# BINANCE WEBSOCKET (exponential backoff)
 # =====================================================================
 class BinancePublicStream:
     def __init__(self, on_price_update):
@@ -892,7 +860,6 @@ class BinancePublicStream:
                                     ping_payload="ping")
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
-            # Exponential backoff
             if self.running:
                 self.reconnect_count += 1
                 self.delay = min(Config.WS_RECONNECT_MAX_DELAY, self.delay * 1.5)
@@ -925,26 +892,169 @@ class BinancePublicStream:
             self.ws.close()
 
 # =====================================================================
-# HEALTH SERVER (unchanged)
+# HEALTH SERVER with Dashboard
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-type","application/json")
+    
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def _send_response(self, status=200, content_type="application/json", data=None):
+            self.send_response(status)
+            self.send_header("Content-type", content_type)
             self.end_headers()
-            self.wfile.write(json.dumps({
-                "status":"online",
-                "version":"5.2.3-Final",
-                "active_trades":len(orchestrator.active_trades)
-            }).encode())
-    httpd = HTTPServer(("0.0.0.0", port), H)
-    logger.info(f"Health server started on port {port}")
+            if data is not None:
+                self.wfile.write(data.encode() if isinstance(data, str) else data)
+
+        def do_GET(self):
+            if self.path == "/":
+                self._serve_dashboard()
+            elif self.path == "/status":
+                self._serve_status()
+            elif self.path == "/recent":
+                self._serve_recent()
+            else:
+                self._send_response(404, "text/plain", "Not Found")
+
+        def do_HEAD(self):
+            # Render health check requires HEAD support
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+
+        def _serve_dashboard(self):
+            html = '''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>AI Trading Bot Dashboard</title>
+                <style>
+                    body { font-family: Arial, sans-serif; background: #f4f6f9; margin: 20px; }
+                    .container { max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+                    .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 15px; margin: 20px 0; }
+                    .card { background: #ecf0f1; padding: 15px; border-radius: 5px; text-align: center; }
+                    .card .label { font-size: 12px; color: #7f8c8d; text-transform: uppercase; }
+                    .card .value { font-size: 24px; font-weight: bold; color: #2c3e50; }
+                    .toggle-btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+                    .btn-on { background: #2ecc71; color: white; }
+                    .btn-off { background: #e74c3c; color: white; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+                    th, td { padding: 8px; border-bottom: 1px solid #ddd; text-align: left; }
+                    th { background: #3498db; color: white; }
+                    .status-open { color: #2ecc71; font-weight: bold; }
+                    .status-closed { color: #95a5a6; }
+                    #uptime { font-size: 14px; color: #7f8c8d; }
+                    .footer { margin-top: 20px; font-size: 12px; color: #bdc3c7; text-align: center; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🤖 AI Trading Bot Dashboard</h1>
+                    <div id="uptime">Uptime: <span id="uptime_span">--</span></div>
+                    <div class="status-grid">
+                        <div class="card"><div class="label">Version</div><div class="value">v5.2.4</div></div>
+                        <div class="card"><div class="label">Active Trades</div><div class="value" id="active_trades">--</div></div>
+                        <div class="card"><div class="label">Accepted Signals</div><div class="value" id="accepted">--</div></div>
+                        <div class="card"><div class="label">Rejected Signals</div><div class="value" id="rejected">--</div></div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 20px; margin: 15px 0;">
+                        <span style="font-weight: bold;">Signal Generation:</span>
+                        <span id="signal_status">--</span>
+                        <button id="toggle_btn" class="toggle-btn" onclick="toggleSignal()">Toggle</button>
+                    </div>
+                    <h3>Recent Trades</h3>
+                    <table>
+                        <thead><tr><th>ID</th><th>Asset</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP</th><th>Score</th><th>Confidence</th><th>Status</th><th>Time</th></tr></thead>
+                        <tbody id="recent_trades">
+                            <tr><td colspan="10">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                    <div class="footer">Data refreshes every 10 seconds.</div>
+                </div>
+                <script>
+                    function fetchStatus() {
+                        fetch('/status')
+                            .then(res => res.json())
+                            .then(data => {
+                                document.getElementById('active_trades').innerText = data.active_trades;
+                                document.getElementById('accepted').innerText = data.accepted;
+                                document.getElementById('rejected').innerText = data.rejected;
+                                document.getElementById('uptime_span').innerText = data.uptime || '--';
+                                const status = data.signal_enabled ? 'ON' : 'OFF';
+                                document.getElementById('signal_status').innerText = status;
+                                document.getElementById('signal_status').style.color = data.signal_enabled ? '#2ecc71' : '#e74c3c';
+                                const btn = document.getElementById('toggle_btn');
+                                btn.innerText = data.signal_enabled ? 'Turn OFF' : 'Turn ON';
+                                btn.className = 'toggle-btn ' + (data.signal_enabled ? 'btn-on' : 'btn-off');
+                            })
+                            .catch(err => console.error('Status fetch error', err));
+                    }
+
+                    function fetchRecent() {
+                        fetch('/recent')
+                            .then(res => res.json())
+                            .then(data => {
+                                const tbody = document.getElementById('recent_trades');
+                                if (data.length === 0) {
+                                    tbody.innerHTML = '<tr><td colspan="10">No trades yet.</td></tr>';
+                                    return;
+                                }
+                                let rows = '';
+                                data.forEach(t => {
+                                    const status_class = t.status === 'open' ? 'status-open' : 'status-closed';
+                                    rows += `<tr><td>#${t.id}</td><td>${t.asset}</td><td>${t.direction}</td><td>${t.entry}</td><td>${t.sl}</td><td>${t.tp}</td><td>${t.score}</td><td>${t.confidence}</td><td class="${status_class}">${t.status}</td><td>${new Date(t.timestamp*1000).toLocaleTimeString()}</td></tr>`;
+                                });
+                                tbody.innerHTML = rows;
+                            })
+                            .catch(err => console.error('Recent fetch error', err));
+                    }
+
+                    function toggleSignal() {
+                        fetch('/toggle', { method: 'POST' })
+                            .then(res => res.json())
+                            .then(data => {
+                                if (data.success) {
+                                    fetchStatus();
+                                } else {
+                                    alert('Toggle failed');
+                                }
+                            })
+                            .catch(err => alert('Error toggling signal: ' + err));
+                    }
+
+                    // Initial load and periodic refresh
+                    fetchStatus();
+                    fetchRecent();
+                    setInterval(() => { fetchStatus(); fetchRecent(); }, 10000);
+                </script>
+            </body>
+            </html>
+            '''
+            self._send_response(200, "text/html", html)
+
+        def _serve_status(self):
+            status = orchestrator.get_status()
+            self._send_response(200, "application/json", json.dumps(status))
+
+        def _serve_recent(self):
+            recent = orchestrator.get_recent_trades(limit=5)
+            self._send_response(200, "application/json", json.dumps(recent))
+
+        def do_POST(self):
+            if self.path == "/toggle":
+                orchestrator.toggle_signal()
+                self._send_response(200, "application/json", json.dumps({"success": True}))
+            else:
+                self._send_response(404, "text/plain", "Not Found")
+
+    httpd = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    logger.info(f"Health server started on port {port} (Dashboard available)")
     httpd.serve_forever()
 
 # =====================================================================
-# LIFECYCLE CONTROLLER (with market structure revalidation)
+# LIFECYCLE CONTROLLER
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -966,14 +1076,12 @@ class ActiveTradeLifecycle:
                     htf_trend = self.orch.asset_state[asset]["htf_trend"]
                     trade_duration = now - trade.get('entry_time', now)
 
-                    # Time decay check
                     if trade_duration > Config.TIME_DECAY_SECONDS and abs(current_price - trade['entry']) / trade['entry'] < Config.TIME_DECAY_THRESHOLD_PCT:
                         self.orch._close_trade(tid, current_price, 0.0, "Time-Decay (Consolidation)")
                         to_remove.append(tid)
                         self.orch.telegram.send_message(f"⏳ <b>Time-Decay Exit:</b> Trade #{tid} closed.")
                         continue
 
-                    # === INTELLIGENT HEALTH SCORE ===
                     health = 100
                     if trade['direction'] == 'BUY':
                         if trade['entry'] != trade['sl']:
@@ -1006,15 +1114,12 @@ class ActiveTradeLifecycle:
                     health = max(0, min(100, health))
                     trade['health'] = health
 
-                    # === Market structure revalidation ===
-                    # If BOS/CHOCH changes against trade direction, reduce health
                     bos_dir = self.orch.topology.bos[asset]["direction"]
                     if trade['direction'] == 'BUY' and bos_dir == 'DOWN':
                         health -= 15
                     elif trade['direction'] == 'SELL' and bos_dir == 'UP':
                         health -= 15
                     if self.orch.topology.choch[asset]:
-                        # CHOCH indicates potential reversal
                         health -= 10
 
                     if health < Config.HEALTH_EMERGENCY_THRESHOLD:
@@ -1038,7 +1143,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# TRADE JOURNAL AI (unchanged)
+# TRADE JOURNAL AI
 # =====================================================================
 class TradeJournalAI:
     def __init__(self, db_connection):
@@ -1074,7 +1179,7 @@ class TradeJournalAI:
                     f"• Worst Logic: {worst_logic} (Success: {logic_performance[worst_logic]['wins']}/{logic_performance[worst_logic]['confluences']})")
 
 # =====================================================================
-# CORE ORCHESTRATOR (with all patches integrated and thread safety)
+# CORE ORCHESTRATOR
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1094,19 +1199,63 @@ class AIOrchestrator:
         self.start_time = time.time()
         self.last_signal_time = {a:0 for a in Config.ASSETS}
         self.signal_timestamps = deque(maxlen=100)
-        # Shared state with lock
         self.asset_state_lock = threading.Lock()
         self.asset_state = {a: {"trend":"NEUTRAL","htf_trend":"NEUTRAL","volume_ratio":1.0,
                                 "rsi":50,"adx":20,"volatility":0.01,"news_sentiment":0,"news_importance":0.5,
                                 "volume_spike":False} for a in Config.ASSETS}
         self.accepted = 0
         self.rejected = 0
+        # Signal toggle flag
+        self.signal_enabled = True   # NEW
 
         self.lifecycle = ActiveTradeLifecycle(self)
         self.journal_ai = TradeJournalAI(self.db.conn)
         threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
         threading.Thread(target=self._process_queue, daemon=True).start()
 
+    # ---- API for Dashboard ----
+    def get_status(self):
+        with self.asset_state_lock:
+            return {
+                "version": "v5.2.4",
+                "uptime": self._format_uptime(),
+                "active_trades": len(self.active_trades),
+                "accepted": self.accepted,
+                "rejected": self.rejected,
+                "signal_enabled": self.signal_enabled
+            }
+
+    def _format_uptime(self):
+        elapsed = int(time.time() - self.start_time)
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours}h {minutes}m {seconds}s"
+
+    def get_recent_trades(self, limit=5):
+        rows = self.db.get_recent_trades(limit)
+        result = []
+        for row in rows:
+            result.append({
+                "id": row[0],
+                "asset": row[1],
+                "direction": row[2],
+                "entry": row[3],
+                "sl": row[4],
+                "tp": row[5],
+                "score": row[6],
+                "confidence": row[7],
+                "status": row[8],
+                "timestamp": row[9]
+            })
+        return result
+
+    def toggle_signal(self):
+        self.signal_enabled = not self.signal_enabled
+        status = "ON" if self.signal_enabled else "OFF"
+        self.telegram.send_message(f"🔄 Signal generation toggled to {status}")
+        logger.info(f"Signal generation toggled to {status}")
+
+    # ---- Price processing ----
     def _process_queue(self):
         while True:
             try:
@@ -1116,7 +1265,6 @@ class AIOrchestrator:
 
     # --- Data Loading with Parallel Execution ---
     def _load_and_backfill(self, asset, tf):
-        """Load from MongoDB, if insufficient fetch from Binance (parallel safe)"""
         logger.info(f"Loading {asset} TF={tf}...")
         candles = self.mongo.load_candles(asset, tf, limit=Config.MAX_CANDLES)
         if len(candles) >= Config.MAX_CANDLES * 0.9:
@@ -1163,15 +1311,12 @@ class AIOrchestrator:
 
     # --- REAL ADX (Welles Wilder) - Corrected ---
     def _calc_adx(self, highs, lows, closes, period=14):
-        """Correct Welles Wilder ADX calculation."""
         if len(closes) < period + 1:
             return 20
-        # True Range
         tr = [max(highs[i] - lows[i],
                   abs(highs[i] - closes[i-1]),
                   abs(lows[i] - closes[i-1]))
               for i in range(1, len(closes))]
-        # +DM and -DM
         plus_dm = []
         minus_dm = []
         for i in range(1, len(highs)):
@@ -1186,7 +1331,6 @@ class AIOrchestrator:
             else:
                 minus_dm.append(0)
 
-        # Smooth using Wilder's method (exponential with smoothing factor 1/period)
         atr = [0] * len(tr)
         atr[0] = tr[0]
         for i in range(1, len(tr)):
@@ -1200,13 +1344,11 @@ class AIOrchestrator:
             plus_di[i] = 100 * ((plus_di[i-1] * (period-1) + plus_dm[i]) / (atr[i] * period))
             minus_di[i] = 100 * ((minus_di[i-1] * (period-1) + minus_dm[i]) / (atr[i] * period))
 
-        # Directional Movement Index (DX)
         dx = [0] * len(plus_di)
         for i in range(len(dx)):
             denom = plus_di[i] + minus_di[i]
             dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / denom if denom != 0 else 0
 
-        # ADX is smoothed DX (Wilder's)
         adx = [0] * len(dx)
         adx[0] = dx[0]
         for i in range(1, len(dx)):
@@ -1215,7 +1357,6 @@ class AIOrchestrator:
 
     # --- REAL RSI (Wilder) with edge case handling ---
     def _calc_rsi(self, closes, period=14):
-        """Wilder's RSI with safe zero handling."""
         if len(closes) < period + 1:
             return 50
         gains = 0.0
@@ -1237,12 +1378,11 @@ class AIOrchestrator:
                 avg_gain = (avg_gain * (period - 1) + 0) / period
                 avg_loss = (avg_loss * (period - 1) - diff) / period
         if avg_loss == 0:
-            return 100  # no losses, strong uptrend
+            return 100
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
     def _update_indicators(self, asset, price):
-        # 15m trend
         c15 = [c["close"] for c in self.topology.candles[900][asset] if c.get("complete", False)][-30:]
         if len(c15) > 10:
             e9, e21 = self.topology._ema(c15,9), self.topology._ema(c15,21)
@@ -1253,14 +1393,12 @@ class AIOrchestrator:
                 rsi_val = self._calc_rsi(c15)
                 with self.asset_state_lock:
                     self.asset_state[asset]["rsi"] = rsi_val
-        # HTF trend
         c1h = [c["close"] for c in self.topology.candles[3600][asset] if c.get("complete", False)][-30:]
         if len(c1h)>10:
             e9,e21 = self.topology._ema(c1h,9), self.topology._ema(c1h,21)
             if len(e9)>1 and len(e21)>1:
                 with self.asset_state_lock:
                     self.asset_state[asset]["htf_trend"] = "BULLISH" if e9[-1]>e21[-1] else "BEARISH"
-        # Real ADX
         if len(c1h) >= 30:
             highs = [c["high"] for c in self.topology.candles[3600][asset] if c.get("complete", False)][-30:]
             lows  = [c["low"]  for c in self.topology.candles[3600][asset] if c.get("complete", False)][-30:]
@@ -1272,7 +1410,6 @@ class AIOrchestrator:
             with self.asset_state_lock:
                 self.asset_state[asset]["adx"] = 20
 
-        # Institutional Volume Analysis
         vols_15m = [c["volume"] for c in self.topology.candles[900][asset] if c.get("complete", False)]
         if len(vols_15m) >= 20:
             avg_vol = sum(vols_15m[-20:]) / 20
@@ -1297,7 +1434,7 @@ class AIOrchestrator:
         self.db.close_trade(tid, price, pnl, reason)
         self.telegram.send_message(f"🔒 Trade #{tid} closed at {price:.2f} | PnL: {pnl:+.2f} | Reason: {reason}")
         logger.info(f"Trade {tid} closed. PnL: {pnl:.2f}, Reason: {reason}")
-        if self.mongo.db:
+        if self.mongo.db is not None:   # FIXED
             try:
                 self.mongo.db.trades.update_one(
                     {"id": tid},
@@ -1338,17 +1475,15 @@ class AIOrchestrator:
                 if tid in self.active_trades: del self.active_trades[tid]
             if to_remove: gc.collect()
 
-    # ---- MAIN PRICE TICK HANDLER (with all patches) ----
+    # ---- MAIN PRICE TICK HANDLER ----
     def _handle_price_tick(self, asset, price, volume):
         self.topology.process_tick(asset, price, volume)
         self._update_active_trades(asset, price)
 
-        # Update FVG and OB statuses
         self.topology.update_fvg_status(asset, price)
         self.ob_engine.update_ob_status(asset, price)
 
         if self.topology.candle_just_closed[asset]:
-            # Save completed 15m candle to MongoDB
             candles_15m = self.topology.candles[900][asset]
             if candles_15m and candles_15m[-1].get("complete", False):
                 self.mongo.save_candle(asset, 900, candles_15m[-1])
@@ -1357,7 +1492,6 @@ class AIOrchestrator:
                 if c_list and c_list[-1].get("complete", False):
                     self.mongo.save_candle(asset, tf, c_list[-1])
 
-            # Detect order blocks with BOS confirmation
             bos_dir = self.topology.bos[asset]["direction"]
             self.ob_engine.detect_order_blocks(asset, candles_15m, bos_dir)
 
@@ -1376,9 +1510,14 @@ class AIOrchestrator:
             return
 
         if not self.topology.candle_just_closed[asset]: return
+
+        # ---- SIGNAL GENERATION GATE ----
+        if not self.signal_enabled:
+            logger.debug("Signal generation disabled by user")
+            return
+
         self._update_indicators(asset, price)
 
-        # Get asset state safely
         with self.asset_state_lock:
             asset_state = self.asset_state[asset].copy()
         c1h = [c for c in self.topology.candles[3600][asset] if c.get("complete", False)]
@@ -1392,15 +1531,10 @@ class AIOrchestrator:
         hunt = (sweep=="SELL_SWEEP" and self.topology.check_1m_rejection(asset,"BUY")) or (sweep=="BUY_SWEEP" and self.topology.check_1m_rejection(asset,"SELL"))
 
         patterns = self.topology.detect_candle_patterns(asset)
-
-        # Get FVGs (fresh ones)
         fvgs = self.topology.detect_fvg(asset, tf=300)
-
-        # Get Order Block
         trend = asset_state["trend"]
         ob_level = self.ob_engine.get_ob_zone(asset, price, trend) if trend in ["BULLISH", "BEARISH"] else None
 
-        # Update layer performance and adapt weights
         if self.accepted % 10 == 0 and self.accepted > 0:
             self.scoring.update_layer_performance(self.db)
 
@@ -1413,7 +1547,7 @@ class AIOrchestrator:
         if not score["enough"] or score["total_score"] < Config.MIN_CONFLUENCE_SCORE:
             self.db.log_rejected(asset, price, score["total_score"], "Low score", asset_state["volatility"], "medium")
             self.rejected+=1
-            if self.mongo.db:
+            if self.mongo.db is not None:   # FIXED
                 try:
                     self.mongo.db.rejected.insert_one({"asset": asset, "price": price, "score": score["total_score"], "reason": "Low score", "timestamp": int(time.time())})
                 except: pass
@@ -1466,7 +1600,7 @@ class AIOrchestrator:
                                 list(patterns.keys()), logic, asset_state["volatility"],
                                 regime, asset_state["htf_trend"], asset_state["news_sentiment"])
         
-        if self.mongo.db:
+        if self.mongo.db is not None:   # FIXED
             try:
                 trade_doc = {
                     "id": tid, "asset": asset, "direction": direction, "entry": price, "stop_loss": sl, "take_profit": tp,
@@ -1500,10 +1634,8 @@ class AIOrchestrator:
 
     # ---- RUN ----
     def run(self):
-        # Start health server immediately
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
 
-        # Parallel data loading
         logger.info("Loading historical data from MongoDB/Binance in parallel...")
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
@@ -1514,10 +1646,9 @@ class AIOrchestrator:
                 pass
         logger.info("Data loading complete.")
 
-        # Start WebSocket
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v5.2.3 Final - Institutional Grade Patches Applied")
+        self.telegram.send_message("🚀 AI v5.2.4 Dashboard Enabled - Signal Toggle Available")
         
         last_news = 0
         while True:
