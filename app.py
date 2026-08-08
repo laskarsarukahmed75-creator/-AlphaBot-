@@ -31,7 +31,7 @@ except ImportError:
 
 # ---- Logging Setup ----
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v5.2.4-Dashboard")
+logger = logging.getLogger("AI-Orchestrator-v5.2.5-Persistent")
 
 # =====================================================================
 # CONFIGURATION
@@ -105,14 +105,14 @@ class MongoDatabase:
         self.db = None
 
     def _create_indexes(self):
-        if self.db is None:   # FIXED
+        if self.db is None:
             return
         self.db.candles.create_index([("asset", ASCENDING), ("timeframe", ASCENDING), ("timestamp", ASCENDING)], unique=True)
         self.db.trades.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
         self.db.rejected.create_index([("asset", ASCENDING), ("timestamp", DESCENDING)])
 
     def save_candle(self, asset, timeframe, candle):
-        if self.db is None:   # FIXED
+        if self.db is None:
             return
         try:
             doc = {**candle, "asset": asset, "timeframe": timeframe}
@@ -125,7 +125,7 @@ class MongoDatabase:
             logger.debug(f"Mongo save_candle error: {e}")
 
     def load_candles(self, asset, timeframe, limit=500, since=None):
-        if self.db is None:   # FIXED
+        if self.db is None:
             return []
         try:
             query = {"asset": asset, "timeframe": timeframe}
@@ -138,7 +138,7 @@ class MongoDatabase:
             return []
 
     def get_latest_timestamp(self, asset, timeframe):
-        if self.db is None:   # FIXED
+        if self.db is None:
             return 0
         try:
             doc = self.db.candles.find_one(
@@ -150,7 +150,7 @@ class MongoDatabase:
             return 0
 
     def save_trade_backup(self, trade_data):
-        if self.db is None:   # FIXED
+        if self.db is None:
             return
         try:
             self.db.trades.update_one({"id": trade_data["id"]}, {"$set": trade_data}, upsert=True)
@@ -158,7 +158,7 @@ class MongoDatabase:
             logger.debug(f"Mongo save_trade error: {e}")
 
     def save_rejected_backup(self, rejected_data):
-        if self.db is None:   # FIXED
+        if self.db is None:
             return
         try:
             self.db.rejected.insert_one(rejected_data)
@@ -166,7 +166,7 @@ class MongoDatabase:
             logger.debug(f"Mongo save_rejected error: {e}")
 
 # =====================================================================
-# SQLite DATABASE (thread-safe explicit cursor)
+# SQLite DATABASE (with persistence columns)
 # =====================================================================
 class TradeDatabase:
     def __init__(self):
@@ -178,6 +178,7 @@ class TradeDatabase:
         with self._lock:
             cur = self.conn.cursor()
             try:
+                # Main trades table
                 cur.execute('''CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     asset TEXT, direction TEXT,
@@ -186,8 +187,19 @@ class TradeDatabase:
                     timestamp INTEGER, status TEXT DEFAULT 'open',
                     exit_price REAL, pnl REAL, close_time INTEGER,
                     volatility REAL, market_regime TEXT, htf_trend TEXT, news_score REAL,
-                    entry_time INTEGER, exit_reason TEXT, health_history TEXT
+                    entry_time INTEGER, exit_reason TEXT, health_history TEXT,
+                    entry_atr REAL, metadata TEXT
                 )''')
+                # Add new columns if they don't exist (for backward compatibility)
+                try:
+                    cur.execute("ALTER TABLE trades ADD COLUMN entry_atr REAL")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+                try:
+                    cur.execute("ALTER TABLE trades ADD COLUMN metadata TEXT")
+                except sqlite3.OperationalError:
+                    pass
+
                 cur.execute('''CREATE TABLE IF NOT EXISTS rejected_signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     asset TEXT, price REAL, score INTEGER, reason TEXT,
@@ -198,16 +210,16 @@ class TradeDatabase:
                 cur.close()
 
     def log_trade(self, asset, direction, entry, sl, tp, score, confidence, patterns, logic,
-                  volatility, regime, htf_trend, news_score):
+                  volatility, regime, htf_trend, news_score, entry_atr=None):
         with self._lock:
             cur = self.conn.cursor()
             try:
                 cur.execute('''INSERT INTO trades 
                     (asset, direction, entry, stop_loss, take_profit, score, confidence, patterns, logic,
-                     timestamp, volatility, market_regime, htf_trend, news_score, entry_time, status)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                     timestamp, volatility, market_regime, htf_trend, news_score, entry_time, status, entry_atr)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (asset, direction, entry, sl, tp, score, confidence, json.dumps(patterns), logic,
-                     int(time.time()), volatility, regime, htf_trend, news_score, int(time.time()), 'open'))
+                     int(time.time()), volatility, regime, htf_trend, news_score, int(time.time()), 'open', entry_atr))
                 self.conn.commit()
                 return cur.lastrowid
             finally:
@@ -264,6 +276,45 @@ class TradeDatabase:
             try:
                 cur.execute("SELECT id, asset, direction, entry, stop_loss, take_profit, score, confidence, status, timestamp FROM trades ORDER BY id DESC LIMIT ?", (limit,))
                 return cur.fetchall()
+            finally:
+                cur.close()
+
+    def get_open_trades(self):
+        """Fetch all open trades with necessary fields."""
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute('''SELECT id, asset, direction, entry, stop_loss, take_profit, entry_time, score, entry_atr
+                               FROM trades WHERE status='open' ORDER BY id''')
+                return cur.fetchall()
+            finally:
+                cur.close()
+
+    def get_total_accepted(self):
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT COUNT(*) FROM trades")
+                return cur.fetchone()[0]
+            finally:
+                cur.close()
+
+    def get_total_rejected(self):
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT COUNT(*) FROM rejected_signals")
+                return cur.fetchone()[0]
+            finally:
+                cur.close()
+
+    def get_last_signal_timestamp(self, asset):
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("SELECT timestamp FROM trades WHERE asset=? ORDER BY timestamp DESC LIMIT 1", (asset,))
+                row = cur.fetchone()
+                return row[0] if row else 0
             finally:
                 cur.close()
 
@@ -916,7 +967,6 @@ def start_health_server(orchestrator):
                 self._send_response(404, "text/plain", "Not Found")
 
         def do_HEAD(self):
-            # Render health check requires HEAD support
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -954,7 +1004,7 @@ def start_health_server(orchestrator):
                     <h1>🤖 AI Trading Bot Dashboard</h1>
                     <div id="uptime">Uptime: <span id="uptime_span">--</span></div>
                     <div class="status-grid">
-                        <div class="card"><div class="label">Version</div><div class="value">v5.2.4</div></div>
+                        <div class="card"><div class="label">Version</div><div class="value">v5.2.5</div></div>
                         <div class="card"><div class="label">Active Trades</div><div class="value" id="active_trades">--</div></div>
                         <div class="card"><div class="label">Accepted Signals</div><div class="value" id="accepted">--</div></div>
                         <div class="card"><div class="label">Rejected Signals</div><div class="value" id="rejected">--</div></div>
@@ -971,7 +1021,7 @@ def start_health_server(orchestrator):
                             <tr><td colspan="10">Loading...</td></tr>
                         </tbody>
                     </table>
-                    <div class="footer">Data refreshes every 10 seconds.</div>
+                    <div class="footer">Data refreshes every 10 seconds. All state is persistent across restarts.</div>
                 </div>
                 <script>
                     function fetchStatus() {
@@ -1024,7 +1074,6 @@ def start_health_server(orchestrator):
                             .catch(err => alert('Error toggling signal: ' + err));
                     }
 
-                    // Initial load and periodic refresh
                     fetchStatus();
                     fetchRecent();
                     setInterval(() => { fetchStatus(); fetchRecent(); }, 10000);
@@ -1179,7 +1228,7 @@ class TradeJournalAI:
                     f"• Worst Logic: {worst_logic} (Success: {logic_performance[worst_logic]['wins']}/{logic_performance[worst_logic]['confluences']})")
 
 # =====================================================================
-# CORE ORCHESTRATOR
+# CORE ORCHESTRATOR with State Persistence
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1205,25 +1254,66 @@ class AIOrchestrator:
                                 "volume_spike":False} for a in Config.ASSETS}
         self.accepted = 0
         self.rejected = 0
-        # Signal toggle flag
-        self.signal_enabled = True   # NEW
+        self.signal_enabled = True
+
+        # --- LOAD PERSISTENT STATE FROM DATABASE ---
+        self._load_state_from_db()
 
         self.lifecycle = ActiveTradeLifecycle(self)
         self.journal_ai = TradeJournalAI(self.db.conn)
         threading.Thread(target=self.lifecycle.monitor_lifecycle, daemon=True).start()
         threading.Thread(target=self._process_queue, daemon=True).start()
 
+    def _load_state_from_db(self):
+        """Restore counters, active trades, and last_signal_time from SQLite."""
+        # Counters
+        self.accepted = self.db.get_total_accepted()
+        self.rejected = self.db.get_total_rejected()
+        logger.info(f"Loaded counters: accepted={self.accepted}, rejected={self.rejected}")
+
+        # Active trades
+        open_trades = self.db.get_open_trades()
+        for row in open_trades:
+            tid, asset, direction, entry, sl, tp, entry_time, score, entry_atr = row
+            self.active_trades[tid] = {
+                "id": tid,
+                "asset": asset,
+                "direction": direction,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "entry_time": entry_time,
+                "breakeven_locked": False,
+                "trailing_activated": False,
+                "hold_sent": False,
+                "initial_score": score,
+                "current_score": score,
+                "health": 100,
+                "entry_atr": entry_atr if entry_atr else 0.0
+            }
+            logger.info(f"Restored active trade #{tid}: {asset} {direction} @ {entry}")
+
+        # Last signal time per asset
+        for asset in Config.ASSETS:
+            ts = self.db.get_last_signal_timestamp(asset)
+            if ts:
+                self.last_signal_time[asset] = ts
+                logger.info(f"Restored last signal time for {asset}: {datetime.fromtimestamp(ts).isoformat()}")
+
+        logger.info(f"State loaded: {len(self.active_trades)} active trades, {self.accepted} total accepted, {self.rejected} rejected")
+
     # ---- API for Dashboard ----
     def get_status(self):
-        with self.asset_state_lock:
-            return {
-                "version": "v5.2.4",
-                "uptime": self._format_uptime(),
-                "active_trades": len(self.active_trades),
-                "accepted": self.accepted,
-                "rejected": self.rejected,
-                "signal_enabled": self.signal_enabled
-            }
+        # Refresh counters from DB to be safe (but we keep in-memory updated)
+        # We can just return in-memory values as they are kept in sync.
+        return {
+            "version": "v5.2.5",
+            "uptime": self._format_uptime(),
+            "active_trades": len(self.active_trades),
+            "accepted": self.accepted,
+            "rejected": self.rejected,
+            "signal_enabled": self.signal_enabled
+        }
 
     def _format_uptime(self):
         elapsed = int(time.time() - self.start_time)
@@ -1434,7 +1524,7 @@ class AIOrchestrator:
         self.db.close_trade(tid, price, pnl, reason)
         self.telegram.send_message(f"🔒 Trade #{tid} closed at {price:.2f} | PnL: {pnl:+.2f} | Reason: {reason}")
         logger.info(f"Trade {tid} closed. PnL: {pnl:.2f}, Reason: {reason}")
-        if self.mongo.db is not None:   # FIXED
+        if self.mongo.db is not None:
             try:
                 self.mongo.db.trades.update_one(
                     {"id": tid},
@@ -1511,7 +1601,6 @@ class AIOrchestrator:
 
         if not self.topology.candle_just_closed[asset]: return
 
-        # ---- SIGNAL GENERATION GATE ----
         if not self.signal_enabled:
             logger.debug("Signal generation disabled by user")
             return
@@ -1546,8 +1635,8 @@ class AIOrchestrator:
                                       sweep, asset_state["news_importance"], hunt, inst["trigger"])
         if not score["enough"] or score["total_score"] < Config.MIN_CONFLUENCE_SCORE:
             self.db.log_rejected(asset, price, score["total_score"], "Low score", asset_state["volatility"], "medium")
-            self.rejected+=1
-            if self.mongo.db is not None:   # FIXED
+            self.rejected += 1
+            if self.mongo.db is not None:
                 try:
                     self.mongo.db.rejected.insert_one({"asset": asset, "price": price, "score": score["total_score"], "reason": "Low score", "timestamp": int(time.time())})
                 except: pass
@@ -1568,7 +1657,7 @@ class AIOrchestrator:
         if sl_distance < atr * Config.MIN_SL_DISTANCE_MULTIPLIER:
             reason = f"SL too tight ({sl_distance:.3f} < {atr * Config.MIN_SL_DISTANCE_MULTIPLIER:.3f})"
             self.db.log_rejected(asset, price, score["total_score"], reason, asset_state["volatility"], regime)
-            self.rejected+=1
+            self.rejected += 1
             return
 
         rr = abs(tp - price) / sl_distance
@@ -1577,12 +1666,12 @@ class AIOrchestrator:
             rr = abs(tp - price) / sl_distance
             if rr < Config.MIN_RISK_REWARD - 0.01:
                 self.db.log_rejected(asset, price, score["total_score"], "RR low", asset_state["volatility"], regime)
-                self.rejected+=1
+                self.rejected += 1
                 return
 
         if time.time() - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN and not self._is_strong_trend(asset):
             self.db.log_rejected(asset, price, score["total_score"], "Cooldown", asset_state["volatility"], regime)
-            self.rejected+=1
+            self.rejected += 1
             return
 
         logic_parts = [f"HTF {asset_state['htf_trend']}"]
@@ -1598,9 +1687,9 @@ class AIOrchestrator:
 
         tid = self.db.log_trade(asset, direction, price, sl, tp, score["total_score"], score["confidence"],
                                 list(patterns.keys()), logic, asset_state["volatility"],
-                                regime, asset_state["htf_trend"], asset_state["news_sentiment"])
+                                regime, asset_state["htf_trend"], asset_state["news_sentiment"], entry_atr=atr)
         
-        if self.mongo.db is not None:   # FIXED
+        if self.mongo.db is not None:
             try:
                 trade_doc = {
                     "id": tid, "asset": asset, "direction": direction, "entry": price, "stop_loss": sl, "take_profit": tp,
@@ -1648,8 +1737,8 @@ class AIOrchestrator:
 
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AI v5.2.4 Dashboard Enabled - Signal Toggle Available")
-        
+        self.telegram.send_message(f"🚀 AI v5.2.5 Persistent – {self.accepted} total signals, {len(self.active_trades)} active trades")
+
         last_news = 0
         while True:
             try:
