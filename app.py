@@ -1702,7 +1702,7 @@ class AIOrchestrator:
 
             self.db.log_trade(trade_id, asset, direction, price, sl, tp, sqs, "HIGH", list(patterns.keys()), logic,
                               volatility, regime, htf_trend, news_score, session, sqs, pattern_name, dm, st, token)
-            if self.mongo.db:
+            if self.mongo.db is not None:
                 self.mongo.save_trade_backup({
                     'id': trade_id, 'asset': asset, 'direction': direction,
                     'entry': price, 'stop_loss': sl, 'take_profit': tp,
