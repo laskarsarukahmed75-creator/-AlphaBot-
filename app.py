@@ -66,7 +66,7 @@ class Config:
     TIME_DECAY_THRESHOLD_PCT = 0.002
     HEALTH_EMERGENCY_THRESHOLD = 55
     TRADE_HEALTH_STALE_MINUTES = 25
-    WS_HEALTH_CHECK_TIMEOUT = 600
+    WS_HEALTH_CHECK_TIMEOUT = 1800  # बढ़ाकर 30 मिनट किया
 
 # =====================================================================
 # DATA VALIDATION LAYER
@@ -133,7 +133,8 @@ class MongoDatabase:
             pass
 
     def save_candle(self, asset, timeframe, candle):
-        if self.db is None: return
+        if self.db is None:
+            return
         try:
             doc = {**candle, "asset": asset, "timeframe": timeframe}
             self.db.candles.update_one(
@@ -144,7 +145,8 @@ class MongoDatabase:
             pass
 
     def load_candles(self, asset, timeframe, limit=500):
-        if self.db is None: return []
+        if self.db is None:
+            return []
         try:
             return list(self.db.candles.find({"asset": asset, "timeframe": timeframe})
                         .sort("timestamp", 1).limit(limit))
@@ -152,21 +154,24 @@ class MongoDatabase:
             return []
 
     def save_trade_backup(self, trade_data):
-        if self.db is None: return
+        if self.db is None:
+            return
         try:
             self.db.trades.replace_one({"id": trade_data["id"]}, trade_data, upsert=True)
         except Exception:
             pass
 
     def update_trade_sl(self, trade_id, new_sl):
-        if self.db is None: return
+        if self.db is None:
+            return
         try:
             self.db.trades.update_one({"id": trade_id}, {"$set": {"stop_loss": new_sl}})
         except Exception:
             pass
 
     def close_trade_mongo(self, trade_id, exit_price, pnl, exit_reason):
-        if self.db is None: return
+        if self.db is None:
+            return
         try:
             self.db.trades.update_one({"id": trade_id}, {"$set": {
                 "status": "closed",
@@ -179,14 +184,16 @@ class MongoDatabase:
             pass
 
     def get_open_trades(self):
-        if self.db is None: return []
+        if self.db is None:
+            return []
         try:
             return list(self.db.trades.find({"status": "open"}))
         except Exception:
             return []
 
     def save_rejected_backup(self, rejected_data):
-        if self.db is None: return
+        if self.db is None:
+            return
         try:
             self.db.rejected.insert_one(rejected_data)
         except Exception:
@@ -415,11 +422,10 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 20))
 
 # =====================================================================
-# WEBSOCKET STREAMS (timer reset fix)
+# WEBSOCKET STREAMS (FIXED – REPLACED CLASS)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
-        self.ws_url = Config.BINANCE_FUTURES_WS_URL
         self.symbols = [s.lower() for s in Config.ASSETS]
         self.ws = None
         self.running = False
@@ -442,66 +448,68 @@ class BinanceFuturesStream:
     def stop(self):
         self.running = False
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
     def _ws_loop(self):
         while self.running:
             try:
-                self.ws = websocket.WebSocketApp(self.ws_url,
-                                                 on_open=self._on_open,
-                                                 on_message=self._on_message,
-                                                 on_error=self._on_error,
-                                                 on_close=self._on_close)
-                self.ws.run_forever(ping_interval=15, ping_timeout=10)
-            except Exception:
+                streams = []
+                for s in self.symbols:
+                    streams.extend([f"{s}@aggTrade", f"{s}@forceOrder"])
+                ws_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+                self.ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                logger.error(f"Futures WS Loop Error: {e}")
                 self.reconnect_count += 1
                 time.sleep(5)
 
     def _on_open(self, ws):
-        streams = []
-        for s in self.symbols:
-            streams.extend([f"{s}@openInterest", f"{s}@forceOrder", f"{s}@aggTrade"])
-        ws.send(json.dumps({"method": "SUBSCRIBE", "params": streams, "id": 1}))
         self.reconnect_count = 0
         self.last_ping = time.time()
+        logger.info("✅ Futures Combined WS connected successfully.")
 
     def _on_message(self, ws, message):
-        self.last_ping = time.time()
+        self.last_ping = time.time()  # हर टिक पर टाइमर तुरंत रीसेट
         try:
-            data = json.loads(message)
-            if 'e' not in data:
+            raw = json.loads(message)
+            data = raw.get("data", raw)
+            if not isinstance(data, dict) or 'e' not in data:
                 return
             e = data['e']
-            if e == 'openInterest':
-                symbol = data['s']
-                oi = float(data['o'])
-                with self.lock:
-                    self.data['open_interest'][symbol] = oi
-                    self.oi_history[symbol].append(oi)
-                    if self.on_data:
-                        self.on_data('open_interest', symbol, oi)
-            elif e == 'forceOrder':
-                order = data['o']
-                symbol = order['s']
-                with self.lock:
-                    self.data['liquidations'].append({
-                        'symbol': symbol, 'side': order['S'],
-                        'price': float(order['p']), 'qty': float(order['q']),
-                        'time': time.time()
-                    })
-                    if self.on_data:
-                        self.on_data('liquidation', symbol, {'side': order['S'], 'price': float(order['p']), 'qty': float(order['q'])})
+            if e == 'forceOrder':
+                order = data.get('o', {})
+                symbol = order.get('s')
+                if symbol:
+                    with self.lock:
+                        self.data['liquidations'].append({
+                            'symbol': symbol, 'side': order.get('S'),
+                            'price': float(order.get('p', 0)), 'qty': float(order.get('q', 0)),
+                            'time': time.time()
+                        })
+                        if self.on_data:
+                            self.on_data('liquidation', symbol, {'side': order.get('S'), 'price': float(order.get('p', 0)), 'qty': float(order.get('q', 0))})
             elif e == 'aggTrade':
-                symbol = data['s']
-                price = float(data['p'])
-                qty = float(data['q'])
-                last = self.data['last_trade'].get(symbol, price)
-                delta = qty if price >= last else -qty
-                with self.lock:
-                    self.data['cvd'][symbol] = self.data['cvd'].get(symbol, 0) + delta
-                    self.data['last_trade'][symbol] = price
-                    if self.on_data:
-                        self.on_data('cvd', symbol, self.data['cvd'][symbol])
+                symbol = data.get('s')
+                if symbol:
+                    price = float(data.get('p', 0))
+                    qty = float(data.get('q', 0))
+                    with self.lock:
+                        last = self.data['last_trade'].get(symbol, price)
+                        delta = qty if price >= last else -qty
+                        self.data['cvd'][symbol] = self.data['cvd'].get(symbol, 0) + delta
+                        self.data['last_trade'][symbol] = price
+                        if self.on_data:
+                            self.on_data('cvd', symbol, self.data['cvd'][symbol])
         except Exception:
             pass
 
@@ -510,14 +518,18 @@ class BinanceFuturesStream:
 
     def _on_close(self, ws, close_status_code, close_msg):
         self.reconnect_count += 1
+        logger.warning("Futures WS closed. Auto-reconnecting...")
 
     def _health_check(self):
         while self.running:
             time.sleep(30)
             if time.time() - self.last_ping > Config.WS_HEALTH_CHECK_TIMEOUT:
-                logger.warning("Futures WS no data >600s, forcing reconnect")
+                logger.warning(f"Futures WS no data >{Config.WS_HEALTH_CHECK_TIMEOUT}s, forcing reconnect")
                 if self.ws:
-                    self.ws.close()
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
                 self.reconnect_count += 1
 
     def get_open_interest(self, symbol):
@@ -1702,6 +1714,7 @@ class AIOrchestrator:
 
             self.db.log_trade(trade_id, asset, direction, price, sl, tp, sqs, "HIGH", list(patterns.keys()), logic,
                               volatility, regime, htf_trend, news_score, session, sqs, pattern_name, dm, st, token)
+            # MongoDB condition safe – सख्त check
             if self.mongo.db is not None:
                 self.mongo.save_trade_backup({
                     'id': trade_id, 'asset': asset, 'direction': direction,
