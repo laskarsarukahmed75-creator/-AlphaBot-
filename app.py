@@ -1803,7 +1803,7 @@ class AIOrchestrator:
         self.mtf_gate = MTFConfluenceGate(self.topology)
         self.orderflow = OrderFlowAnalyzer(self.topology, self.futures_stream)
         self.session_timer = SessionTimer()
-        self.sqs_calc = SQS_Calculator(self.topology)
+        self.intelligence_engine = UnifiedIntelligenceEngine(self.topology, self.futures_stream, self.absorption_meter, self.neutral_engine)
         self.pending_queue = PendingVerificationQueue(self.topology)
         self.dynamic_sl = DynamicStopLoss(self.topology)
         self.health_engine = TradeHealthEngine(self.topology, self.cache)
