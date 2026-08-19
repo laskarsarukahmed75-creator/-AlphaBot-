@@ -1332,25 +1332,100 @@ class SessionTimer:
         return True, "ALWAYS", "00:00-23:59 IST"
 
 # =====================================================================
-# SQS CALCULATOR (unchanged)
+# 100-POINT UNIFIED INTELLIGENCE ENGINE (Score-Based)
 # =====================================================================
-class SQS_Calculator:
-    def __init__(self, topology):
+class UnifiedIntelligenceEngine:
+    def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
         self.topology = topology
+        self.futures = futures_stream
+        self.absorption = absorption_meter
+        self.neutral = neutral_engine
 
-    def calculate(self, asset, price, direction, session_ok, patterns, sr, bos, choch,
-                  liquidity_sweep, ob, fvgs, vol_ratio, htf_trend, use_micro_sweep=True):
-        score = 0
-        if bos and bos["direction"]: score += 15
-        if choch: score += 10
-        if liquidity_sweep: score += 10
-        if use_micro_sweep and self.topology.check_1m_rejection(asset, direction): score += 10
-        if ob and ob.get("type"): score += 15
-        if vol_ratio > 1.5: score += 15
-        elif vol_ratio > 1.2: score += 10
-        if htf_trend == direction: score += 15
-        if session_ok: score += 10
-        return score
+    def evaluate_setup(self, asset: str, price: float, direction: str):
+        total_score = 0
+        breakdown = {}
+
+        with self.topology.lock:
+            # 1. 4H Macro Overextension (Max 15 Pts)
+            c_4h = self.topology.get_completed(asset, 14400)
+            if len(c_4h) >= 30:
+                closes_4h = [c["close"] for c in c_4h]
+                ema20 = self.topology._ema(closes_4h, 20)[-1]
+                atr_4h = self.topology.get_atr(asset, period=14, tf=14400) or (price * 0.01)
+                dist = abs(price - ema20) / atr_4h
+                pts = 15 if dist >= 2.0 else (10 if dist >= 1.5 else (5 if dist >= 1.0 else 0))
+            else:
+                pts = 0
+            breakdown["MacroOverextension"] = pts
+            total_score += pts
+
+            # 2. 15m Wick Rejection (Max 15 Pts)
+            c_15m = self.topology.get_completed(asset, 900)
+            if len(c_15m) >= 2:
+                last = c_15m[-1]
+                rng = last["high"] - last["low"]
+                if rng > 0:
+                    upper_wick = (last["high"] - max(last["open"], last["close"])) / rng
+                    lower_wick = (min(last["open"], last["close"]) - last["low"]) / rng
+                    wick_ratio = lower_wick if direction == "BUY" else upper_wick
+                    rej_pts = int(min(15, wick_ratio * 25))
+                else:
+                    rej_pts = 0
+            else:
+                rej_pts = 0
+            breakdown["15mRejection"] = rej_pts
+            total_score += rej_pts
+
+            # 3. High Volume Anchor (Max 10 Pts)
+            anchor_ok, _ = self.topology.check_anchor_line_retest(asset, price, direction)
+            pts = 10 if anchor_ok else 0
+            breakdown["VolumeAnchor"] = pts
+            total_score += pts
+
+            # 4. Multi-Timeframe Structure (Max 15 Pts)
+            mtf_pts = 0
+            p_highs = self.topology.pivots[asset]["high"]
+            p_lows = self.topology.pivots[asset]["low"]
+            if direction == "BUY" and len(p_highs) >= 2 and p_highs[0] >= p_highs[1]: mtf_pts += 8
+            if direction == "SELL" and len(p_lows) >= 2 and p_lows[0] <= p_lows[1]: mtf_pts += 8
+            sr = self.topology.support_resistance[asset]
+            atr_1h = self.topology.get_atr(asset, period=14, tf=3600) or (price * 0.01)
+            if direction == "BUY" and sr["support"] and abs(price - max(sr["support"])) <= 1.2 * atr_1h: mtf_pts += 7
+            elif direction == "SELL" and sr["resistance"] and abs(price - min(sr["resistance"])) <= 1.2 * atr_1h: mtf_pts += 7
+            breakdown["MTFStructure"] = min(15, mtf_pts)
+            total_score += breakdown["MTFStructure"]
+
+        # 5. Order Flow & Absorption (Max 20 Pts)
+        symbol = asset.lower()
+        oi_trend = self.futures.get_oi_trend(symbol)
+        cvd = self.futures.get_cvd(symbol)
+        meter = self.absorption.get_meter(asset)
+        of_pts = 0
+        if meter.get("score", 0) >= 50 and meter.get("direction") == direction: of_pts += 10
+        if (direction == "BUY" and cvd > 0) or (direction == "SELL" and cvd < 0): of_pts += 5
+        if (direction == "BUY" and oi_trend > 0) or (direction == "SELL" and oi_trend < 0): of_pts += 5
+        breakdown["OrderFlow"] = of_pts
+        total_score += of_pts
+
+        # 6. Neutral Candle Engine (Max 15 Pts)
+        neutral_data = self.neutral.detect(asset, price, tf=900)
+        neutral_pts = 0
+        if neutral_data.get("direction") == direction:
+            pat = neutral_data.get("pattern", "")
+            if pat in ("Hammer", "ShootingStar", "DragonflyDoji", "GravestoneDoji"): neutral_pts = 15
+            elif pat in ("SpinningTop", "Doji"): neutral_pts = 8
+        breakdown["NeutralCandle"] = neutral_pts
+        total_score += neutral_pts
+
+        # 7. ADX Exhaustion (Max 10 Pts)
+        adx_15 = self.topology.get_adx(asset, 900)
+        pts = 10 if (20 <= adx_15 <= 40) else (5 if adx_15 < 20 else 2)
+        breakdown["RegimeExhaustion"] = pts
+        total_score += pts
+
+        is_valid = total_score >= 65
+        reason = " | ".join([f"{k}:{v}" for k, v in breakdown.items() if v > 0])
+        return is_valid, total_score, reason
 
 # =====================================================================
 # DYNAMIC STOP LOSS (unchanged)
@@ -1438,12 +1513,16 @@ class PendingVerificationQueue:
                         to_remove.append(key)
                         continue
                     first_close = completed[-limit]['close']
-                    if data['direction'] == 'BUY' and first_close < data['start_price'] * 0.99:
+                    atr = self.topology.get_atr(asset, period=14, tf=300) or (data['start_price'] * 0.005)
+                    max_allowed_adverse = 0.8 * atr
+
+                    if data['direction'] == 'BUY' and (data['start_price'] - first_close) > max_allowed_adverse:
                         data['rejected'] = True
                         to_remove.append(key)
-                    elif data['direction'] == 'SELL' and first_close > data['start_price'] * 1.01:
+                    elif data['direction'] == 'SELL' and (first_close - data['start_price']) > max_allowed_adverse:
                         data['rejected'] = True
                         to_remove.append(key)
+
                 if data['candle_count'] >= limit:
                     to_remove.append(key)
             for key in to_remove:
@@ -1807,53 +1886,15 @@ class AIOrchestrator:
             logger.info(f"⏱️ STATUS: last tick {age:.0f}s ago, queue size {qsize}, active trades {len(self.active_trades)}")
 
     def _check_all_gates(self, asset, price, direction, sniper_score, sniper_reason):
-        # Market Regime
-        mr_ok, mr_reason = self.market_regime.check(asset, price)
-        if not mr_ok:
-            return False, f"MarketRegime: {mr_reason}"
-        # MTF Confluence
-        vol_ratio = self.asset_state[asset]["volume_ratio"]
-        htf_trend = self.asset_state[asset]["htf_trend"]
-        tf_trend = self.asset_state[asset]["trend"]
-        regime, params = self.regime_detector.detect(asset, price, vol_ratio, htf_trend, tf_trend)
-        mtf_ok, mtf_reason = self.mtf_gate.check(asset, direction,
-                                                 tolerance=params.get("mtf_tolerance", 0.02),
-                                                 check_4h=params.get("check_4h_ema", False))
-        if not mtf_ok:
-            return False, f"MTF: {mtf_reason}"
-        # Order Flow
-        of_ok, of_reason = self.orderflow.check(asset, direction, price,
-                                                strict=params.get("order_flow_strict", True))
-        if not of_ok:
-            return False, f"OrderFlow: {of_reason}"
-        # SQS Score + Neutral Candle Bonus
-        with self.topology.lock:
-            sr = self.topology.support_resistance[asset]
-            bos = self.topology.bos[asset]
-            choch = self.topology.choch[asset]
-            sweep = self.topology.detect_liquidity_sweep(asset, price) if params.get("use_micro_sweep", True) else ""
-            ob = self.topology.detect_order_block(asset)
-            fvgs = self.topology.detect_fvg(asset)
-        sqs = self.sqs_calc.calculate(asset, price, direction, True, {}, sr, bos, choch,
-                                      sweep, ob, fvgs, vol_ratio, htf_trend,
-                                      use_micro_sweep=params.get("use_micro_sweep", True))
-        # Neutral candle bonus
-        neutral = self.neutral_engine.detect(asset, price, tf=900)  # 15m
-        neutral_score = neutral['score'] if neutral['direction'] == direction else 0
-        if neutral_score:
-            logger.info(f"🌸 Neutral bonus +{neutral_score} for {asset} ({neutral['pattern']})")
+        if not hasattr(self, 'intelligence_engine'):
+            self.intelligence_engine = UnifiedIntelligenceEngine(
+                self.topology, self.futures_stream, self.absorption_meter, self.neutral_engine
+            )
 
-        total_sqs = sqs + sniper_score + neutral_score
-        min_sqs = max(params.get("min_sqs", Config.MIN_SQS), Config.MIN_SQS)
-        if total_sqs < min_sqs:
-            return False, f"SQS {total_sqs} < {min_sqs} (neutral bonus: {neutral_score})"
-        # Absorption meter (double-check)
-        meter = self.absorption_meter.get_meter(asset)
-        if meter["score"] < Config.ABSORPTION_MIN_SCORE:
-            return False, f"Absorption {meter['score']} < {Config.ABSORPTION_MIN_SCORE}"
-        if meter["direction"] and meter["direction"] != direction:
-            return False, f"Absorption direction {meter['direction']} mismatch"
-        return True, "All gates passed"
+        is_valid, total_score, reason = self.intelligence_engine.evaluate_setup(asset, price, direction)
+        if not is_valid:
+            return False, f"Score {total_score} < 65 ({reason})"
+        return True, f"Passed [{total_score}/100]: {reason}"
 
     def _handle_price_tick(self, asset, price, volume):
         with self.trade_lock:
