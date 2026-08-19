@@ -1191,6 +1191,51 @@ class NeutralCandleEngine:
             }
 
 # =====================================================================
+# REGIME & GATES HELPER ENGINES
+# =====================================================================
+class RegimeDetector:
+    def __init__(self, topology):
+        self.topology = topology
+
+    def detect(self, asset, price, vol_ratio, htf_trend, tf_trend):
+        adx = self.topology.get_adx(asset, 900)
+        regime = "TRENDING" if adx >= 25 else "RANGING"
+        params = {
+            "min_sqs": Config.MIN_SQS,
+            "mtf_tolerance": 0.02,
+            "check_4h_ema": True,
+            "order_flow_strict": False,
+            "use_micro_sweep": True
+        }
+        return regime, params
+
+class MarketRegimeFilter:
+    def __init__(self, topology):
+        self.topology = topology
+
+    def check(self, asset, price):
+        return True, "Pass"
+
+class MTFConfluenceGate:
+    def __init__(self, topology):
+        self.topology = topology
+
+    def check(self, asset, direction, tolerance=0.02, check_4h=False):
+        return True, "Pass"
+
+class OrderFlowAnalyzer:
+    def __init__(self, topology, futures_stream):
+        self.topology = topology
+        self.futures = futures_stream
+
+    def check(self, asset, direction, price, strict=False):
+        return True, "Pass"
+
+class SessionTimer:
+    def is_trading_time(self):
+        return True, "ALWAYS", "00:00-23:59 IST"
+
+# =====================================================================
 # ENGINE: SNIPER (Relaxed – used as primary trigger)
 # =====================================================================
 class RallyExhaustionFilter:
