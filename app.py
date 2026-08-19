@@ -147,11 +147,17 @@ class MongoDatabase:
         except Exception:
             pass
 
-    def load_candles(self, asset, timeframe, limit=500):
+    def load_candles(self, asset, timeframe, limit=5000):
         if self.db is None: return []
         try:
+            if timeframe in (3600, 14400):
+                fetch_limit = 3000  # 1H और 4H का पूरा 3+ महीने का डेटा
+            elif timeframe == 900:
+                fetch_limit = 5000  # 15m का ~50 दिन का डेटा
+            else:
+                fetch_limit = 1000  # 1m/5m के लिए सुरक्षित लिमिट
             return list(self.db.candles.find({"asset": asset, "timeframe": timeframe})
-                        .sort("timestamp", 1).limit(limit))
+                        .sort("timestamp", 1).limit(fetch_limit))
         except Exception:
             return []
 
@@ -2128,11 +2134,13 @@ class AIOrchestrator:
                     last_news = time.time()
 
     def _load_and_backfill(self, asset, tf):
-        candles = self.mongo.load_candles(asset, tf, Config.MAX_CANDLES)
-        if len(candles) >= Config.MAX_CANDLES * 0.9:
+        candles = self.mongo.load_candles(asset, tf)
+        if len(candles) >= 100:
             with self.topology.lock:
                 self.topology.candles[tf][asset] = candles
+            logger.info(f"📂 Loaded {len(candles)} cached candles for {asset} [{tf}s] from MongoDB")
             return
+
         interval = {60: "1m", 300: "5m", 900: "15m", 3600: "1h", 14400: "4h"}[tf]
         try:
             resp = requests.get("https://api.binance.com/api/v3/klines",
@@ -2146,7 +2154,8 @@ class AIOrchestrator:
                         fetched.append(c)
                         self.mongo.save_candle(asset, tf, c)
                 with self.topology.lock:
-                    self.topology.candles[tf][asset] = fetched[-Config.MAX_CANDLES:]
+                    self.topology.candles[tf][asset] = fetched
+                logger.info(f"🌐 Backfilled {len(fetched)} candles for {asset} [{interval}] from Binance API")
         except Exception as e:
             logger.error(f"Backfill error for {asset} {tf}: {e}")
 
