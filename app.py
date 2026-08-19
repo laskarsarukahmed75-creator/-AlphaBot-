@@ -1,5 +1,7 @@
 # =====================================================================
-# app.py – AlphaBot v7.5 BALANCED (Final Production Fixed)
+# app.py – AlphaBot v7.5 FINAL with Neutral Candle Engine
+# =====================================================================
+# एकीकृत आर्किटेक्चर: Sniper (प्राथमिक) + Neutral Candle बोनस
 # =====================================================================
 
 import math
@@ -71,7 +73,7 @@ class Config:
     ABSORPTION_EXIT_SCORE = 80
 
 # =====================================================================
-# DATA VALIDATION LAYER
+# DATA VALIDATION LAYER (unchanged)
 # =====================================================================
 class DataValidator:
     @staticmethod
@@ -105,7 +107,7 @@ class DataValidator:
             return False
 
 # =====================================================================
-# DATABASE LAYERS
+# DATABASE LAYERS (unchanged – thread-safe)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -392,7 +394,7 @@ class TradeDatabase:
             cur.close()
 
 # =====================================================================
-# NEWS SCANNER
+# NEWS SCANNER (unchanged)
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
@@ -429,7 +431,7 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 20))
 
 # =====================================================================
-# WEBSOCKET STREAMS (Futures & Public Fixed)
+# WEBSOCKET STREAMS (Futures & Public Fixed – unchanged)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -664,7 +666,7 @@ class BinancePublicStream:
                     except Exception: pass
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (Thread-safe)
+# CANDLE TOPOLOGY ENGINE (Thread-safe – unchanged)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -967,7 +969,7 @@ class CandleTopologyEngine:
         return 100 - (100 / (1 + rs))
 
 # =====================================================================
-# INDICATOR CACHE
+# INDICATOR CACHE (unchanged)
 # =====================================================================
 class IndicatorCache:
     def __init__(self, topology):
@@ -1020,7 +1022,106 @@ class IndicatorCache:
             return {}
 
 # =====================================================================
-# ENGINE: SNIPER (RELAXED)
+# NEUTRAL CANDLE ENGINE (NEW)
+# =====================================================================
+class NeutralCandleEngine:
+    """
+    Detects neutral/indecision candle patterns (Doji, Spinning Top, etc.)
+    and returns a bonus score for directionally favorable patterns.
+    """
+    def __init__(self, topology):
+        self.topology = topology
+
+    def detect(self, asset, price, tf=900):
+        """
+        Analyze the last completed candle of given timeframe (default 15m).
+        Returns a dict: {
+            'pattern': str,          # e.g. "Doji", "SpinningTop", "LongLegged", "None"
+            'direction': str,        # "BUY", "SELL", or "" if neutral
+            'score': int,            # bonus score (0-20)
+            'reason': str
+        }
+        """
+        with self.topology.lock:
+            completed = self.topology.get_completed(asset, tf)
+            if len(completed) < 2:
+                return {'pattern': 'None', 'direction': '', 'score': 0, 'reason': 'Insufficient data'}
+
+            candle = completed[-1]
+            open_ = candle['open']
+            close = candle['close']
+            high = candle['high']
+            low = candle['low']
+            body = abs(close - open_)
+            range_ = high - low
+            if range_ == 0:
+                return {'pattern': 'None', 'direction': '', 'score': 0, 'reason': 'Zero range'}
+
+            upper_wick = high - max(open_, close)
+            lower_wick = min(open_, close) - low
+            body_pct = body / range_
+
+            # Define thresholds
+            DOJI_BODY_PCT = 0.05
+            SPINNING_TOP_BODY_PCT = 0.30
+            WICK_RATIO = 2.0  # wick > 2 * body
+
+            pattern = 'None'
+            direction = ''
+            score = 0
+            reason = ''
+
+            # Identify pattern
+            if body_pct <= DOJI_BODY_PCT:
+                # Doji or variants
+                if upper_wick > 3 * lower_wick and upper_wick > body:
+                    pattern = 'GravestoneDoji'
+                    direction = 'SELL'   # potential top reversal
+                elif lower_wick > 3 * upper_wick and lower_wick > body:
+                    pattern = 'DragonflyDoji'
+                    direction = 'BUY'
+                else:
+                    pattern = 'Doji'
+                    direction = ''       # neutral
+            elif body_pct <= SPINNING_TOP_BODY_PCT:
+                # Spinning Top
+                if upper_wick > body * WICK_RATIO and lower_wick > body * WICK_RATIO:
+                    pattern = 'SpinningTop'
+                    direction = ''
+                elif upper_wick > lower_wick * 2 and upper_wick > body:
+                    pattern = 'ShootingStar'
+                    direction = 'SELL'
+                elif lower_wick > upper_wick * 2 and lower_wick > body:
+                    pattern = 'Hammer'
+                    direction = 'BUY'
+                else:
+                    pattern = 'SpinningTop'
+                    direction = ''
+            else:
+                # Not a neutral pattern
+                return {'pattern': 'None', 'direction': '', 'score': 0, 'reason': 'No neutral pattern'}
+
+            # If direction detected, assign a bonus score
+            if direction == 'BUY':
+                score = 15
+                reason = f'{pattern} (bullish)'
+            elif direction == 'SELL':
+                score = 15
+                reason = f'{pattern} (bearish)'
+            else:
+                # Neutral pattern, still may be useful but no directional bonus
+                score = 5  # small bonus for showing indecision
+                reason = f'{pattern} (neutral)'
+
+            return {
+                'pattern': pattern,
+                'direction': direction,
+                'score': score,
+                'reason': reason
+            }
+
+# =====================================================================
+# ENGINE: SNIPER (RELAXED – unchanged)
 # =====================================================================
 class RallyExhaustionFilter:
     def __init__(self, topology, absorption_meter):
@@ -1090,7 +1191,7 @@ class RallyExhaustionFilter:
             return {"direction": direction, "score": min(score, 100), "reason": reason}, None
 
 # =====================================================================
-# REGIME DETECTOR
+# REGIME DETECTOR (unchanged)
 # =====================================================================
 class RegimeDetector:
     def __init__(self, topology):
@@ -1127,7 +1228,7 @@ class RegimeDetector:
             return regime, params
 
 # =====================================================================
-# GATES
+# GATES (unchanged)
 # =====================================================================
 class MarketRegimeFilter:
     def __init__(self, topology):
@@ -1225,7 +1326,7 @@ class SessionTimer:
         return True, "ALWAYS", "00:00-23:59 IST"
 
 # =====================================================================
-# SQS CALCULATOR
+# SQS CALCULATOR (unchanged)
 # =====================================================================
 class SQS_Calculator:
     def __init__(self, topology):
@@ -1246,7 +1347,7 @@ class SQS_Calculator:
         return score
 
 # =====================================================================
-# DYNAMIC STOP LOSS
+# DYNAMIC STOP LOSS (unchanged)
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1288,7 +1389,7 @@ class DynamicStopLoss:
         return sl, tp
 
 # =====================================================================
-# PENDING VERIFICATION QUEUE (THREAD SAFE)
+# PENDING VERIFICATION QUEUE (THREAD SAFE – unchanged)
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
@@ -1361,7 +1462,7 @@ class PendingVerificationQueue:
             return ready
 
 # =====================================================================
-# TRADE HEALTH ENGINE
+# TRADE HEALTH ENGINE (unchanged)
 # =====================================================================
 class TradeHealthEngine:
     def __init__(self, topology, cache):
@@ -1410,7 +1511,7 @@ class TradeHealthEngine:
             return 100
 
 # =====================================================================
-# MARKET ABSORPTION METER
+# MARKET ABSORPTION METER (unchanged)
 # =====================================================================
 class MarketAbsorptionMeter:
     def __init__(self, futures_stream, topology):
@@ -1473,7 +1574,7 @@ class MarketAbsorptionMeter:
         return False
 
 # =====================================================================
-# TELEGRAM PIPELINE
+# TELEGRAM PIPELINE (unchanged)
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1518,7 +1619,7 @@ class TelegramPipeline:
         self.queue.put(f"📰 {html.escape(title)}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}")
 
 # =====================================================================
-# ACTIVE TRADE LIFECYCLE
+# ACTIVE TRADE LIFECYCLE (unchanged)
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1591,7 +1692,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR
+# CORE ORCHESTRATOR (with Neutral Candle Engine)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1608,6 +1709,9 @@ class AIOrchestrator:
 
         self.absorption_meter = MarketAbsorptionMeter(self.futures_stream, self.topology)
         self.sniper_engine = RallyExhaustionFilter(self.topology, self.absorption_meter)
+
+        # New Neutral Candle Engine
+        self.neutral_engine = NeutralCandleEngine(self.topology)
 
         self.regime_detector = RegimeDetector(self.topology)
         self.market_regime = MarketRegimeFilter(self.topology)
@@ -1627,7 +1731,8 @@ class AIOrchestrator:
         self.signal_timestamps = deque(maxlen=100)
         self.asset_state = {a: {"trend": "NEUTRAL", "htf_trend": "NEUTRAL", "volume_ratio": 1.0,
                                 "rsi": 50, "adx": 20, "volatility": 0.01,
-                                "news_sentiment": 0, "news_importance": 0.5} for a in Config.ASSETS}
+                                "news_sentiment": 0, "news_importance": 0.5,
+                                "neutral_pattern": "None"} for a in Config.ASSETS}
         self.accepted = 0
         self.rejected = 0
         self.stream = None
@@ -1696,9 +1801,11 @@ class AIOrchestrator:
             logger.info(f"⏱️ STATUS: last tick {age:.0f}s ago, queue size {qsize}, active trades {len(self.active_trades)}")
 
     def _check_all_gates(self, asset, price, direction, sniper_score, sniper_reason):
+        # Market Regime
         mr_ok, mr_reason = self.market_regime.check(asset, price)
         if not mr_ok:
             return False, f"MarketRegime: {mr_reason}"
+        # MTF Confluence
         vol_ratio = self.asset_state[asset]["volume_ratio"]
         htf_trend = self.asset_state[asset]["htf_trend"]
         tf_trend = self.asset_state[asset]["trend"]
@@ -1708,10 +1815,12 @@ class AIOrchestrator:
                                                  check_4h=params.get("check_4h_ema", False))
         if not mtf_ok:
             return False, f"MTF: {mtf_reason}"
+        # Order Flow
         of_ok, of_reason = self.orderflow.check(asset, direction, price,
                                                 strict=params.get("order_flow_strict", True))
         if not of_ok:
             return False, f"OrderFlow: {of_reason}"
+        # SQS Score + Neutral Candle Bonus
         with self.topology.lock:
             sr = self.topology.support_resistance[asset]
             bos = self.topology.bos[asset]
@@ -1722,10 +1831,17 @@ class AIOrchestrator:
         sqs = self.sqs_calc.calculate(asset, price, direction, True, {}, sr, bos, choch,
                                       sweep, ob, fvgs, vol_ratio, htf_trend,
                                       use_micro_sweep=params.get("use_micro_sweep", True))
-        total_sqs = sqs + sniper_score
+        # Neutral candle bonus
+        neutral = self.neutral_engine.detect(asset, price, tf=900)  # 15m
+        neutral_score = neutral['score'] if neutral['direction'] == direction else 0
+        if neutral_score:
+            logger.info(f"🌸 Neutral bonus +{neutral_score} for {asset} ({neutral['pattern']})")
+
+        total_sqs = sqs + sniper_score + neutral_score
         min_sqs = max(params.get("min_sqs", Config.MIN_SQS), Config.MIN_SQS)
         if total_sqs < min_sqs:
-            return False, f"SQS {total_sqs} < {min_sqs}"
+            return False, f"SQS {total_sqs} < {min_sqs} (neutral bonus: {neutral_score})"
+        # Absorption meter (double-check)
         meter = self.absorption_meter.get_meter(asset)
         if meter["score"] < Config.ABSORPTION_MIN_SCORE:
             return False, f"Absorption {meter['score']} < {Config.ABSORPTION_MIN_SCORE}"
@@ -1740,6 +1856,11 @@ class AIOrchestrator:
 
         self.topology.process_tick(asset, price, volume)
         self._update_active_trades(asset, price)
+
+        # Update neutral pattern in asset state (every tick but we only care on candle close)
+        if self.topology.candle_just_closed.get(asset, False):
+            neutral = self.neutral_engine.detect(asset, price, tf=900)
+            self.asset_state[asset]['neutral_pattern'] = neutral['pattern']
 
         if self.topology.candle_just_closed.get(asset, False):
             if self.pending_queue.pending:
@@ -1991,7 +2112,7 @@ class AIOrchestrator:
                 pass
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AlphaBot v7.5 BALANCED – Live & Monitoring")
+        self.telegram.send_message("🚀 AlphaBot v7.5 – Neutral Candle Engine Active")
         last_news = 0
         while True:
             time.sleep(10)
@@ -2048,7 +2169,7 @@ class AIOrchestrator:
             time.sleep(300)
 
 # =====================================================================
-# HEALTH SERVER (With Reject / Close Control)
+# HEALTH SERVER (Updated Dashboard with Neutral Pattern)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -2111,10 +2232,18 @@ def start_health_server(orchestrator):
                         active_list.append({"id": tid, "asset": trade['asset'], "dir": trade['direction'],
                                             "entry": trade['entry'], "pnl": round(pnl, 2),
                                             "health": trade.get('health', 100)})
-                html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>AlphaBot v7.5 Balanced Dashboard</title>
+
+                # Build neutral pattern display
+                neutral_html = ""
+                for asset in Config.ASSETS:
+                    pat = orchestrator.asset_state.get(asset, {}).get('neutral_pattern', 'None')
+                    neutral_html += f"<span style='margin:0 15px;'><b>{asset}</b>: {pat}</span>"
+
+                html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>AlphaBot v7.5 Dashboard</title>
 <meta http-equiv="refresh" content="10"><style>body{{font-family:Arial;background:#111;color:#eee;margin:20px}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #444;padding:6px;text-align:center}} th{{background:#333}} .g{{color:#0f0}} .r{{color:#f00}} .btn{{background:#d9534f;color:#fff;padding:3px 8px;text-decoration:none;border-radius:3px;font-size:12px;font-weight:bold}}</style></head><body>
-<h1>🚀 AlphaBot v7.5 BALANCED</h1>
+<h1>🚀 AlphaBot v7.5 – Neutral Candle Active</h1>
 <p>🟢 <b>Bot Status: Online</b> | ⏱️ Market Watching Age: {age_str}</p>
+<p>🌼 <b>Current Neutral Patterns:</b> {neutral_html}</p>
 <h2>All-Time Counters</h2>
 <p>📊 Accepted Signals: {mem.get("accepted_signals_count", 0)} | ❌ Rejected: {mem.get("rejected_signals_count", 0)}</p>
 <p>💰 Closed Trades: {mem.get("total_trades_closed", 0)} | Wins: {mem.get("total_wins", 0)} | Losses: {mem.get("total_losses", 0)}</p>
