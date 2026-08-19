@@ -57,10 +57,10 @@ class Config:
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
-    # !!! RELAXED: MIN_SQS lowered from 65 → 45
+    # !!! RELAXED
     MIN_SQS = 45
-    PENDING_VERIFICATION_CANDLES = 1   # !!! RELAXED: 2 → 1 (5 minutes)
-    VOLUME_DECAY_THRESHOLD = 0.5       # !!! RELAXED: 0.6 → 0.5
+    PENDING_VERIFICATION_CANDLES = 1
+    VOLUME_DECAY_THRESHOLD = 0.5
     SIGNAL_COOLDOWN = 1200
     MAX_SIGNALS_PER_DAY = 8
     MAX_HOLD_TIME = 14400
@@ -70,14 +70,12 @@ class Config:
     TRADE_HEALTH_STALE_MINUTES = 25
     WS_HEALTH_CHECK_TIMEOUT = 1800
 
-    # Anchor line tolerance (unchanged)
     ANCHOR_RETEST_TOLERANCE = 0.004
-    # !!! RELAXED: Absorption score lowered from 70 → 50
     ABSORPTION_MIN_SCORE = 50
     ABSORPTION_EXIT_SCORE = 80
 
 # =====================================================================
-# DATA VALIDATION LAYER (unchanged)
+# DATA VALIDATION LAYER
 # =====================================================================
 class DataValidator:
     @staticmethod
@@ -111,7 +109,7 @@ class DataValidator:
             return False
 
 # =====================================================================
-# DATABASE LAYERS (same as v7.5 – thread-safe)
+# DATABASE LAYERS (thread-safe)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -405,7 +403,7 @@ class TradeDatabase:
             cur.close()
 
 # =====================================================================
-# NEWS SCANNER (unchanged)
+# NEWS SCANNER
 # =====================================================================
 class CryptoNewsScanner:
     def __init__(self):
@@ -442,7 +440,7 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 20))
 
 # =====================================================================
-# WEBSOCKET STREAMS (with OI REST fetcher – unchanged)
+# WEBSOCKET STREAMS (with OI REST fetcher)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -632,7 +630,7 @@ class BinancePublicStream:
                 self.running = False
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (Thread-safe – unchanged)
+# CANDLE TOPOLOGY ENGINE (Thread-safe)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -935,7 +933,7 @@ class CandleTopologyEngine:
         return 100 - (100 / (1 + rs))
 
 # =====================================================================
-# INDICATOR CACHE (unchanged)
+# INDICATOR CACHE
 # =====================================================================
 class IndicatorCache:
     def __init__(self, topology):
@@ -988,7 +986,7 @@ class IndicatorCache:
             return {}
 
 # =====================================================================
-# ENGINE A: SNIPER (RELAXED)
+# ENGINE: SNIPER (RELAXED)
 # =====================================================================
 class RallyExhaustionFilter:
     def __init__(self, topology, absorption_meter):
@@ -996,13 +994,8 @@ class RallyExhaustionFilter:
         self.absorption_meter = absorption_meter
 
     def evaluate(self, asset, price):
-        """
-        Returns (signal_dict, error) if conditions met.
-        Signal dict: {'direction': str, 'score': int, 'reason': str}
-        RELAXED: 4H overextension threshold 1.5→1.1, anchor retest is bonus (+15) not required.
-        """
         with self.topology.lock:
-            # 4H EMA overextension – !!! RELAXED: 1.5 → 1.1
+            # 4H EMA overextension – RELAXED: 1.5 → 1.1
             candles_4h = self.topology.candles[14400][asset]
             complete_4h = [c for c in candles_4h if c.get("complete", False)]
             if len(complete_4h) < 30:
@@ -1016,7 +1009,6 @@ class RallyExhaustionFilter:
                 return None, "ATR zero"
             above = price - ema20_4h[-1]
             below = ema20_4h[-1] - price
-            # !!! RELAXED: threshold from 1.5*ATR to 1.1*ATR
             overbought = above > 1.1 * atr
             oversold = below > 1.1 * atr
             if not overbought and not oversold:
@@ -1028,12 +1020,9 @@ class RallyExhaustionFilter:
             if len(complete_15m) < 20:
                 return None, "Insufficient 15m"
             last = complete_15m[-1]
-            body = abs(last["close"] - last["open"])
             range_ = last["high"] - last["low"]
             if range_ == 0:
                 return None, "No range"
-            vol_ma = sum(c["volume"] for c in complete_15m[-20:]) / 20
-            vol_spike = last["volume"] > 1.3 * vol_ma
             upper_wick = last["high"] - max(last["open"], last["close"])
             lower_wick = min(last["open"], last["close"]) - last["low"]
 
@@ -1046,7 +1035,7 @@ class RallyExhaustionFilter:
             else:
                 return None, "No rejection wick"
 
-            # Absorption Meter – !!! RELAXED: threshold 70→50
+            # Absorption Meter – RELAXED: 70→50
             meter = self.absorption_meter.get_meter(asset)
             if not meter:
                 return None, "Meter not ready"
@@ -1057,13 +1046,12 @@ class RallyExhaustionFilter:
             if meter_direction != direction:
                 return None, f"Meter direction mismatch: {meter_direction} vs {direction}"
 
-            # Anchor line retest – !!! RELAXED: now optional (bonus +15)
+            # Anchor line retest – optional bonus
             anchor_ok, anchor_price = self.topology.check_anchor_line_retest(asset, price, direction)
             bonus = 15 if anchor_ok else 0
             anchor_text = f"AnchorRetest@{anchor_price:.2f}" if anchor_ok else "NoAnchor"
 
-            # Score
-            score = 70  # base score
+            score = 70
             rsi_4h = self.topology._calc_rsi(closes_4h[-15:])
             if direction == "SELL" and rsi_4h > 70: score += 10
             elif direction == "BUY" and rsi_4h < 30: score += 10
@@ -1072,7 +1060,7 @@ class RallyExhaustionFilter:
             return {"direction": direction, "score": min(score, 100), "reason": reason}, None
 
 # =====================================================================
-# REGIME DETECTOR (unchanged)
+# REGIME DETECTOR
 # =====================================================================
 class RegimeDetector:
     def __init__(self, topology):
@@ -1109,7 +1097,7 @@ class RegimeDetector:
             return regime, params
 
 # =====================================================================
-# GATES (unchanged except MIN_SQS reference)
+# GATES
 # =====================================================================
 class MarketRegimeFilter:
     def __init__(self, topology):
@@ -1207,7 +1195,7 @@ class SessionTimer:
         return True, "ALWAYS", "00:00-23:59 IST"
 
 # =====================================================================
-# SQS CALCULATOR (unchanged)
+# SQS CALCULATOR
 # =====================================================================
 class SQS_Calculator:
     def __init__(self, topology):
@@ -1228,7 +1216,7 @@ class SQS_Calculator:
         return score
 
 # =====================================================================
-# DYNAMIC STOP LOSS (unchanged)
+# DYNAMIC STOP LOSS
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1270,7 +1258,7 @@ class DynamicStopLoss:
         return sl, tp
 
 # =====================================================================
-# PENDING VERIFICATION QUEUE (THREAD SAFE – relaxed)
+# PENDING VERIFICATION QUEUE (THREAD SAFE)
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
@@ -1313,7 +1301,6 @@ class PendingVerificationQueue:
                         to_remove.append(key)
                         continue
                     first_close = completed[-limit]['close']
-                    # !!! RELAXED: tolerance from 0.5% to 1% (to reduce rejections)
                     if data['direction'] == 'BUY' and first_close < data['start_price'] * 0.99:
                         data['rejected'] = True
                         to_remove.append(key)
@@ -1344,7 +1331,7 @@ class PendingVerificationQueue:
             return ready
 
 # =====================================================================
-# TRADE HEALTH ENGINE (unchanged)
+# TRADE HEALTH ENGINE
 # =====================================================================
 class TradeHealthEngine:
     def __init__(self, topology, cache):
@@ -1393,7 +1380,7 @@ class TradeHealthEngine:
             return 100
 
 # =====================================================================
-# MARKET ABSORPTION METER (unchanged)
+# MARKET ABSORPTION METER
 # =====================================================================
 class MarketAbsorptionMeter:
     def __init__(self, futures_stream, topology):
@@ -1456,7 +1443,7 @@ class MarketAbsorptionMeter:
         return False
 
 # =====================================================================
-# TELEGRAM PIPELINE (unchanged)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1501,7 +1488,7 @@ class TelegramPipeline:
         self.queue.put(f"📰 {html.escape(title)}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}")
 
 # =====================================================================
-# ACTIVE TRADE LIFECYCLE (unchanged)
+# ACTIVE TRADE LIFECYCLE
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1574,7 +1561,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR (Unified Pipeline – with relaxed thresholds)
+# CORE ORCHESTRATOR (Unified Pipeline – Balanced)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1593,7 +1580,6 @@ class AIOrchestrator:
         self.sniper_engine = RallyExhaustionFilter(self.topology, self.absorption_meter)
 
         self.regime_detector = RegimeDetector(self.topology)
-        self.advanced_engine = AdvancedSignalEngine(self.topology)  # not used for signal, but keep for maybe future
         self.market_regime = MarketRegimeFilter(self.topology)
         self.mtf_gate = MTFConfluenceGate(self.topology)
         self.orderflow = OrderFlowAnalyzer(self.topology, self.futures_stream)
@@ -1689,7 +1675,7 @@ class AIOrchestrator:
                                                 strict=params.get("order_flow_strict", True))
         if not of_ok:
             return False, f"OrderFlow: {of_reason}"
-        # 4. SQS Score – !!! RELAXED: min_sqs may be reduced dynamically; we still use params but default global MIN_SQS is 45
+        # 4. SQS Score
         with self.topology.lock:
             sr = self.topology.support_resistance[asset]
             bos = self.topology.bos[asset]
@@ -1701,17 +1687,15 @@ class AIOrchestrator:
                                       sweep, ob, fvgs, vol_ratio, htf_trend,
                                       use_micro_sweep=params.get("use_micro_sweep", True))
         total_sqs = sqs + sniper_score
-        # Use global MIN_SQS (45) but also respect regime min if higher
-        min_sqs = max(params.get("min_sqs", Config.MIN_SQS), Config.MIN_SQS)  # take higher
+        min_sqs = max(params.get("min_sqs", Config.MIN_SQS), Config.MIN_SQS)
         if total_sqs < min_sqs:
             return False, f"SQS {total_sqs} < {min_sqs}"
-        # 5. Absorption meter (already used in sniper, but double-check)
+        # 5. Absorption meter (double-check)
         meter = self.absorption_meter.get_meter(asset)
         if meter["score"] < Config.ABSORPTION_MIN_SCORE:
             return False, f"Absorption {meter['score']} < {Config.ABSORPTION_MIN_SCORE}"
         if meter["direction"] and meter["direction"] != direction:
             return False, f"Absorption direction {meter['direction']} mismatch"
-        # All passed
         return True, "All gates passed"
 
     def _handle_price_tick(self, asset, price, volume):
@@ -1723,14 +1707,12 @@ class AIOrchestrator:
         self._update_active_trades(asset, price)
 
         if self.topology.candle_just_closed.get(asset, False):
-            # 1. Check pending verification
             if self.pending_queue.pending:
                 self.pending_queue.check_pending(asset)
                 verified = self.pending_queue.get_verified_signals()
                 for signal in verified:
                     self._send_final_signal(signal)
 
-            # 2. Only Sniper engine generates signals
             sniper_signal, err = self.sniper_engine.evaluate(asset, price)
             if not sniper_signal:
                 return
@@ -1739,7 +1721,6 @@ class AIOrchestrator:
             sniper_score = sniper_signal["score"]
             sniper_reason = sniper_signal["reason"]
 
-            # 3. Check all gates
             gates_ok, gate_reason = self._check_all_gates(asset, price, direction, sniper_score, sniper_reason)
             if not gates_ok:
                 self.db.log_rejected(asset, price, sniper_score, gate_reason,
@@ -1748,7 +1729,6 @@ class AIOrchestrator:
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
 
-            # 4. Cooldown and daily cap
             now_ts = time.time()
             if now_ts - self.last_signal_time[asset] < Config.SIGNAL_COOLDOWN:
                 self.db.log_rejected(asset, price, sniper_score, "Cooldown",
@@ -1763,7 +1743,6 @@ class AIOrchestrator:
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
 
-            # 5. Dynamic SL/TP
             atr = self.topology.get_atr(asset) or price*0.01
             sl, tp = self.dynamic_sl.calculate(asset, direction, price, atr)
             risk = abs(price - sl)
@@ -1776,7 +1755,6 @@ class AIOrchestrator:
                 else:
                     tp = price - 2.5 * risk
 
-            # 6. Create pending signal
             trade_id = self.db.generate_trade_id()
             token = f"SNPR-{asset}-{int(time.time()*1000)}"
             signal = {
@@ -1797,8 +1775,8 @@ class AIOrchestrator:
                 'score': 0,
                 'confidence': 'HIGH',
                 'num_passed': 11,
-                'pending_candles': Config.PENDING_VERIFICATION_CANDLES,  # now 1
-                'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,  # now 0.5
+                'pending_candles': Config.PENDING_VERIFICATION_CANDLES,
+                'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,
                 'dynamic_min_sqs': Config.MIN_SQS,
                 'signal_type': 'SNIPER',
                 'signal_token': token,
@@ -2032,7 +2010,7 @@ class AIOrchestrator:
             time.sleep(300)
 
 # =====================================================================
-# HEALTH SERVER (unchanged)
+# HEALTH SERVER
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
