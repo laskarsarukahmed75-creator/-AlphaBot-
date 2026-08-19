@@ -1,9 +1,5 @@
 # =====================================================================
-# app.py – AlphaBot v7.5 BALANCED (Relaxed Thresholds, Unified Pipeline)
-# =====================================================================
-# एकीकृत आर्किटेक्चर: केवल Sniper इंजन सिग्नल उत्पन्न करता है,
-# जो सभी गेट्स (Regime, MTF, Order Flow, SQS, Absorption Meter) से
-# गुज़रता है तथा पेंडिंग वेरिफिकेशन के बाद ही ट्रेड खोलता है।
+# app.py – AlphaBot v7.5 BALANCED (Final Production Fixed)
 # =====================================================================
 
 import math
@@ -18,6 +14,7 @@ import requests
 import sqlite3
 import gc
 import html
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 from datetime import datetime, timedelta
@@ -38,7 +35,7 @@ except ImportError:
     HAS_PYMONGO = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AI-Orchestrator-v7.5-Balanced")
+logger = logging.getLogger("AI-Orchestrator-v7.5")
 
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -57,7 +54,6 @@ class Config:
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
-    # !!! RELAXED
     MIN_SQS = 45
     PENDING_VERIFICATION_CANDLES = 1
     VOLUME_DECAY_THRESHOLD = 0.5
@@ -109,7 +105,7 @@ class DataValidator:
             return False
 
 # =====================================================================
-# DATABASE LAYERS (thread-safe)
+# DATABASE LAYERS
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -139,8 +135,7 @@ class MongoDatabase:
             pass
 
     def save_candle(self, asset, timeframe, candle):
-        if self.db is None:
-            return
+        if self.db is None: return
         try:
             doc = {**candle, "asset": asset, "timeframe": timeframe}
             self.db.candles.update_one(
@@ -151,8 +146,7 @@ class MongoDatabase:
             pass
 
     def load_candles(self, asset, timeframe, limit=500):
-        if self.db is None:
-            return []
+        if self.db is None: return []
         try:
             return list(self.db.candles.find({"asset": asset, "timeframe": timeframe})
                         .sort("timestamp", 1).limit(limit))
@@ -160,24 +154,21 @@ class MongoDatabase:
             return []
 
     def save_trade_backup(self, trade_data):
-        if self.db is None:
-            return
+        if self.db is None: return
         try:
             self.db.trades.replace_one({"id": trade_data["id"]}, trade_data, upsert=True)
         except Exception:
             pass
 
     def update_trade_sl(self, trade_id, new_sl):
-        if self.db is None:
-            return
+        if self.db is None: return
         try:
             self.db.trades.update_one({"id": trade_id}, {"$set": {"stop_loss": new_sl}})
         except Exception:
             pass
 
     def close_trade_mongo(self, trade_id, exit_price, pnl, exit_reason):
-        if self.db is None:
-            return
+        if self.db is None: return
         try:
             self.db.trades.update_one({"id": trade_id}, {"$set": {
                 "status": "closed",
@@ -190,16 +181,14 @@ class MongoDatabase:
             pass
 
     def get_open_trades(self):
-        if self.db is None:
-            return []
+        if self.db is None: return []
         try:
             return list(self.db.trades.find({"status": "open"}))
         except Exception:
             return []
 
     def save_rejected_backup(self, rejected_data):
-        if self.db is None:
-            return
+        if self.db is None: return
         try:
             self.db.rejected.insert_one(rejected_data)
         except Exception:
@@ -440,7 +429,7 @@ class CryptoNewsScanner:
         return max(-100, min(100, score * 20))
 
 # =====================================================================
-# WEBSOCKET STREAMS (with OI REST fetcher)
+# WEBSOCKET STREAMS (Futures & Public Fixed)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -470,10 +459,8 @@ class BinanceFuturesStream:
         self.running = False
         self.oi_fetch_running = False
         if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
+            try: self.ws.close()
+            except Exception: pass
 
     def _fetch_oi_loop(self):
         while self.oi_fetch_running:
@@ -503,8 +490,8 @@ class BinanceFuturesStream:
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,
-                    on_ping=self._on_ping,      # <--- नया हैंडलर
-                    on_pong=self._on_pong       # <--- नया हैंडलर
+                    on_ping=self._on_ping,
+                    on_pong=self._on_pong
                 )
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
@@ -518,7 +505,7 @@ class BinanceFuturesStream:
         logger.info("✅ Futures Combined WS connected successfully.")
 
     def _on_message(self, ws, message):
-        self.last_ping = time.time()   # <--- पहले से है, सुनिश्चित करें
+        self.last_ping = time.time()
         try:
             raw = json.loads(message)
             data = raw.get("data", raw)
@@ -568,14 +555,11 @@ class BinanceFuturesStream:
     def _health_check(self):
         while self.running:
             time.sleep(30)
-            # अब last_ping पिंग/पोंग से भी अपडेट होगा, इसलिए अनावश्यक क्लोज नहीं होगा
             if time.time() - self.last_ping > Config.WS_HEALTH_CHECK_TIMEOUT:
                 logger.warning(f"Futures WS no data >{Config.WS_HEALTH_CHECK_TIMEOUT}s, forcing reconnect")
                 if self.ws:
-                    try:
-                        self.ws.close()
-                    except Exception:
-                        pass
+                    try: self.ws.close()
+                    except Exception: pass
                 self.reconnect_count += 1
 
     def get_open_interest(self, symbol):
@@ -602,6 +586,10 @@ class BinancePublicStream:
         self.running = False
         self.reconnect_count = 0
         self.last_ping = time.time()
+        self.last_tick_time = time.time()
+        self.tick_counter = 0
+        self.ws = None
+        self.lock = threading.Lock()
 
     def start(self):
         self.running = True
@@ -612,31 +600,68 @@ class BinancePublicStream:
         while self.running:
             try:
                 streams = [f"{a.lower()}@kline_1m" for a in Config.ASSETS]
-                ws = websocket.WebSocketApp(
-                    f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}",
+                ws_url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+                self.ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_open=self._on_open,
                     on_message=self._on_msg,
-                    on_error=lambda x, y: None
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                    on_ping=self._on_ping,
+                    on_pong=self._on_pong
                 )
-                ws.run_forever(ping_interval=15, ping_timeout=10)
-            except Exception:
+                self.ws.run_forever(ping_interval=15, ping_timeout=10)
+            except Exception as e:
+                logger.error(f"Public WS loop exception: {e}")
+                self.reconnect_count += 1
                 time.sleep(5)
 
+    def _on_open(self, ws):
+        with self.lock:
+            self.last_ping = time.time()
+            self.reconnect_count = 0
+        logger.info("✅ Public WebSocket connected.")
+
     def _on_msg(self, ws, msg):
-        self.last_ping = time.time()
+        with self.lock:
+            self.last_ping = time.time()
+            self.last_tick_time = time.time()
+            self.tick_counter += 1
         try:
             data = json.loads(msg)["data"]["k"]
             symbol = data["s"]
             if symbol in Config.ASSETS:
                 self.on_price_update(symbol, float(data["c"]), float(data["v"]))
-        except Exception:
-            pass
+                if self.tick_counter % 50 == 0:
+                    logger.info(f"📊 Public WS ticks: {self.tick_counter} (last: {symbol} @ {float(data['c'])})")
+        except Exception as e:
+            logger.error(f"Public WS msg parse error: {e}")
+
+    def _on_ping(self, ws, data):
+        with self.lock:
+            self.last_ping = time.time()
+
+    def _on_pong(self, ws, data):
+        with self.lock:
+            self.last_ping = time.time()
+
+    def _on_error(self, ws, error):
+        logger.error(f"Public WS error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.warning(f"Public WS closed: {close_status_code} {close_msg}. Reconnecting...")
+        self.reconnect_count += 1
 
     def _health_check(self):
         while self.running:
-            time.sleep(60)
-            if time.time() - self.last_ping > Config.WS_HEALTH_CHECK_TIMEOUT:
-                logger.warning("Public WS no data >600s, forcing reconnect")
-                self.running = False
+            time.sleep(30)
+            with self.lock:
+                age = time.time() - self.last_ping
+            if age > 300:
+                logger.warning(f"Public WS no ping/pong for {age:.0f}s, forcing reconnect")
+                if self.ws:
+                    try: self.ws.close()
+                    except Exception: pass
 
 # =====================================================================
 # CANDLE TOPOLOGY ENGINE (Thread-safe)
@@ -1004,7 +1029,6 @@ class RallyExhaustionFilter:
 
     def evaluate(self, asset, price):
         with self.topology.lock:
-            # 4H EMA overextension – RELAXED: 1.5 → 1.1
             candles_4h = self.topology.candles[14400][asset]
             complete_4h = [c for c in candles_4h if c.get("complete", False)]
             if len(complete_4h) < 30:
@@ -1023,7 +1047,6 @@ class RallyExhaustionFilter:
             if not overbought and not oversold:
                 return None, "No overextension"
 
-            # 15m rejection
             candles_15m = self.topology.candles[900][asset]
             complete_15m = [c for c in candles_15m if c.get("complete", False)]
             if len(complete_15m) < 20:
@@ -1044,7 +1067,6 @@ class RallyExhaustionFilter:
             else:
                 return None, "No rejection wick"
 
-            # Absorption Meter – RELAXED: 70→50
             meter = self.absorption_meter.get_meter(asset)
             if not meter:
                 return None, "Meter not ready"
@@ -1055,7 +1077,6 @@ class RallyExhaustionFilter:
             if meter_direction != direction:
                 return None, f"Meter direction mismatch: {meter_direction} vs {direction}"
 
-            # Anchor line retest – optional bonus
             anchor_ok, anchor_price = self.topology.check_anchor_line_retest(asset, price, direction)
             bonus = 15 if anchor_ok else 0
             anchor_text = f"AnchorRetest@{anchor_price:.2f}" if anchor_ok else "NoAnchor"
@@ -1570,7 +1591,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR (Unified Pipeline – Balanced)
+# CORE ORCHESTRATOR
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1610,6 +1631,7 @@ class AIOrchestrator:
         self.accepted = 0
         self.rejected = 0
         self.stream = None
+        self._price_counter = 0
 
         self._restore_state_from_db()
 
@@ -1618,6 +1640,7 @@ class AIOrchestrator:
         threading.Thread(target=self._process_queue, daemon=True).start()
         threading.Thread(target=self._memory_sync_loop, daemon=True).start()
         threading.Thread(target=self._meter_update_loop, daemon=True).start()
+        threading.Thread(target=self._status_monitor, daemon=True).start()
 
     def _restore_state_from_db(self):
         open_trades = self.mongo.get_open_trades()
@@ -1664,12 +1687,18 @@ class AIOrchestrator:
             except Exception as e:
                 logger.error(f"Meter update error: {e}")
 
+    def _status_monitor(self):
+        while True:
+            time.sleep(60)
+            last_tick = self.stream.last_tick_time if hasattr(self.stream, 'last_tick_time') else 0
+            age = time.time() - last_tick
+            qsize = self.price_queue.qsize()
+            logger.info(f"⏱️ STATUS: last tick {age:.0f}s ago, queue size {qsize}, active trades {len(self.active_trades)}")
+
     def _check_all_gates(self, asset, price, direction, sniper_score, sniper_reason):
-        # 1. Market Regime
         mr_ok, mr_reason = self.market_regime.check(asset, price)
         if not mr_ok:
             return False, f"MarketRegime: {mr_reason}"
-        # 2. MTF Confluence
         vol_ratio = self.asset_state[asset]["volume_ratio"]
         htf_trend = self.asset_state[asset]["htf_trend"]
         tf_trend = self.asset_state[asset]["trend"]
@@ -1679,12 +1708,10 @@ class AIOrchestrator:
                                                  check_4h=params.get("check_4h_ema", False))
         if not mtf_ok:
             return False, f"MTF: {mtf_reason}"
-        # 3. Order Flow
         of_ok, of_reason = self.orderflow.check(asset, direction, price,
                                                 strict=params.get("order_flow_strict", True))
         if not of_ok:
             return False, f"OrderFlow: {of_reason}"
-        # 4. SQS Score
         with self.topology.lock:
             sr = self.topology.support_resistance[asset]
             bos = self.topology.bos[asset]
@@ -1699,7 +1726,6 @@ class AIOrchestrator:
         min_sqs = max(params.get("min_sqs", Config.MIN_SQS), Config.MIN_SQS)
         if total_sqs < min_sqs:
             return False, f"SQS {total_sqs} < {min_sqs}"
-        # 5. Absorption meter (double-check)
         meter = self.absorption_meter.get_meter(asset)
         if meter["score"] < Config.ABSORPTION_MIN_SCORE:
             return False, f"Absorption {meter['score']} < {Config.ABSORPTION_MIN_SCORE}"
@@ -1965,7 +1991,7 @@ class AIOrchestrator:
                 pass
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AlphaBot v7.5 BALANCED – सुरक्षित नियमित सिग्नल्स")
+        self.telegram.send_message("🚀 AlphaBot v7.5 BALANCED – Live & Monitoring")
         last_news = 0
         while True:
             time.sleep(10)
@@ -2007,8 +2033,11 @@ class AIOrchestrator:
         if DataValidator.validate_price(price) and DataValidator.validate_volume(volume):
             try:
                 self.price_queue.put_nowait((asset, price, volume))
+                self._price_counter += 1
+                if self._price_counter % 100 == 0:
+                    logger.info(f"📈 Price tick #{self._price_counter}: {asset} @ {price}")
             except queue.Full:
-                pass
+                logger.warning("Price queue full!")
 
     def _ping_self_loop(self):
         while True:
@@ -2019,13 +2048,33 @@ class AIOrchestrator:
             time.sleep(300)
 
 # =====================================================================
-# HEALTH SERVER
+# HEALTH SERVER (With Reject / Close Control)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
 
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith('/close_trade'):
+                try:
+                    query = urllib.parse.urlparse(self.path).query
+                    params = urllib.parse.parse_qs(query)
+                    tid = int(params.get('id', [0])[0])
+                    with orchestrator.trade_lock:
+                        if tid and tid in orchestrator.active_trades:
+                            trade = orchestrator.active_trades[tid]
+                            asset = trade['asset']
+                            with orchestrator.topology.lock:
+                                curr = orchestrator.topology.history[asset][-1]['price'] if orchestrator.topology.history.get(asset) else trade['entry']
+                            pnl = (curr - trade['entry']) if trade['direction'] == 'BUY' else (trade['entry'] - curr)
+                            orchestrator._close_trade(tid, curr, pnl, "ManualDashboardReject")
+                except Exception as e:
+                    logger.error(f"Manual close error: {e}")
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+
             if self.path == '/rejections':
                 self.send_response(200)
                 self.send_header("Content-type", "application/json")
@@ -2063,17 +2112,18 @@ def start_health_server(orchestrator):
                                             "entry": trade['entry'], "pnl": round(pnl, 2),
                                             "health": trade.get('health', 100)})
                 html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>AlphaBot v7.5 Balanced Dashboard</title>
-<meta http-equiv="refresh" content="10"><style>body{{font-family:Arial;background:#111;color:#eee;margin:20px}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #444;padding:6px;text-align:center}} th{{background:#333}} .g{{color:#0f0}} .r{{color:#f00}}</style></head><body>
+<meta http-equiv="refresh" content="10"><style>body{{font-family:Arial;background:#111;color:#eee;margin:20px}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #444;padding:6px;text-align:center}} th{{background:#333}} .g{{color:#0f0}} .r{{color:#f00}} .btn{{background:#d9534f;color:#fff;padding:3px 8px;text-decoration:none;border-radius:3px;font-size:12px;font-weight:bold}}</style></head><body>
 <h1>🚀 AlphaBot v7.5 BALANCED</h1>
 <p>🟢 <b>Bot Status: Online</b> | ⏱️ Market Watching Age: {age_str}</p>
 <h2>All-Time Counters</h2>
 <p>📊 Accepted Signals: {mem.get("accepted_signals_count", 0)} | ❌ Rejected: {mem.get("rejected_signals_count", 0)}</p>
 <p>💰 Closed Trades: {mem.get("total_trades_closed", 0)} | Wins: {mem.get("total_wins", 0)} | Losses: {mem.get("total_losses", 0)}</p>
 <p>Win Rate: {perf.get('win_rate', 0):.2%} | Total PnL: ${mem.get('total_pnl', 0.0):.2f}</p>
-<h2>Active Trades</h2><table><tr><th>ID</th><th>Asset</th><th>Dir</th><th>Entry</th><th>PnL</th><th>Health</th></tr>"""
+<h2>Active Trades</h2><table><tr><th>ID</th><th>Asset</th><th>Dir</th><th>Entry</th><th>PnL</th><th>Health</th><th>Action</th></tr>"""
                 for t in active_list:
                     cls = "g" if t["pnl"] >= 0 else "r"
-                    html += f"<tr><td>{t['id']}</td><td>{t['asset']}</td><td>{t['dir']}</td><td>{t['entry']:.2f}</td><td class='{cls}'>{t['pnl']:.2f}</td><td>{t['health']}%</td></tr>"
+                    btn = f"<a href='/close_trade?id={t['id']}' class='btn'>❌ Reject / Close</a>"
+                    html += f"<tr><td>{t['id']}</td><td>{t['asset']}</td><td>{t['dir']}</td><td>{t['entry']:.2f}</td><td class='{cls}'>{t['pnl']:.2f}</td><td>{t['health']}%</td><td>{btn}</td></tr>"
                 html += "</table></body></html>"
                 self.wfile.write(html.encode())
             else:
