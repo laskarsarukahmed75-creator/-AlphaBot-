@@ -502,7 +502,9 @@ class BinanceFuturesStream:
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
-                    on_close=self._on_close
+                    on_close=self._on_close,
+                    on_ping=self._on_ping,      # <--- नया हैंडलर
+                    on_pong=self._on_pong       # <--- नया हैंडलर
                 )
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
@@ -516,7 +518,7 @@ class BinanceFuturesStream:
         logger.info("✅ Futures Combined WS connected successfully.")
 
     def _on_message(self, ws, message):
-        self.last_ping = time.time()
+        self.last_ping = time.time()   # <--- पहले से है, सुनिश्चित करें
         try:
             raw = json.loads(message)
             data = raw.get("data", raw)
@@ -550,6 +552,12 @@ class BinanceFuturesStream:
         except Exception:
             pass
 
+    def _on_ping(self, ws, data):
+        self.last_ping = time.time()
+
+    def _on_pong(self, ws, data):
+        self.last_ping = time.time()
+
     def _on_error(self, ws, error):
         logger.error(f"Futures WS error: {error}")
 
@@ -560,6 +568,7 @@ class BinanceFuturesStream:
     def _health_check(self):
         while self.running:
             time.sleep(30)
+            # अब last_ping पिंग/पोंग से भी अपडेट होगा, इसलिए अनावश्यक क्लोज नहीं होगा
             if time.time() - self.last_ping > Config.WS_HEALTH_CHECK_TIMEOUT:
                 logger.warning(f"Futures WS no data >{Config.WS_HEALTH_CHECK_TIMEOUT}s, forcing reconnect")
                 if self.ws:
