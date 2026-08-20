@@ -47,9 +47,9 @@ class Config:
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
 
     MONGO_URI = os.getenv("MONGO_URI", "")
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v7")
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v5")
     RENDER_URL = os.getenv("RENDER_URL", "https://alphabot-76tj.onrender.com")
-    DB_PATH = "trades_v7.db"
+    DB_PATH = "trades_v6.db"
     MAX_CANDLES = 500
     BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws"
 
