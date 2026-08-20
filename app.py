@@ -1,8 +1,9 @@
 # =====================================================================
-# app.py – AlphaBot v7.6 SIMPLE QUALITY SIGNAL ENGINE
+# app.py – AlphaBot v7.6 SIMPLE + OBSERVATION LAYER
 # =====================================================================
 # 4-Layer System: Trend → Location → Confirmation → Risk
-# Max 4 signals / 24h, per-asset 4h cooldown
+# Har 15m evaluation log hota hai (NO SETUP / REJECTED / WATCH / VALID / HIGH)
+# Max 4 final signals / 24h, per-asset 4h cooldown
 # =====================================================================
 
 import math
@@ -47,9 +48,9 @@ class Config:
     DISPLAY_NAMES = {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}
 
     MONGO_URI = os.getenv("MONGO_URI", "")
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v5")
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "crypto_bot_v7")
     RENDER_URL = os.getenv("RENDER_URL", "https://alphabot-76tj.onrender.com")
-    DB_PATH = "trades_v6.db"
+    DB_PATH = "trades_v7.db"
     MAX_CANDLES = 500
     BINANCE_FUTURES_WS_URL = "wss://fstream.binance.com/ws"
 
@@ -57,20 +58,19 @@ class Config:
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
-    # ---- SIMPLE ENGINE THRESHOLDS ----
-    MIN_SCORE_FOR_SIGNAL = 75      # Only ≥75 are sent as final signals
+    # ---- OBSERVATION THRESHOLDS ----
+    SCORE_REJECT = 60
     SCORE_WATCH = 60
-    SCORE_VALID = 65
-    SCORE_HIGH = 75
-    SCORE_EXTREME = 85
+    SCORE_VALID = 75
+    SCORE_HIGH = 85
 
+    MIN_SCORE_FOR_SIGNAL = 75      # Only ≥75 become final signals
     MIN_RR = 2.0                   # Minimum 1:2
     MAX_SIGNALS_PER_DAY = 4        # Global max 4 signals per 24h
     ASSET_COOLDOWN_HOURS = 4       # Per-asset cooldown
 
     PENDING_VERIFICATION_CANDLES = 1
     VOLUME_DECAY_THRESHOLD = 0.5
-    SIGNAL_COOLDOWN = 1200          # fallback, not used directly now
     MAX_HOLD_TIME = 14400
     TIME_DECAY_SECONDS = 3600
     TIME_DECAY_THRESHOLD_PCT = 0.002
@@ -118,7 +118,7 @@ class DataValidator:
             return False
 
 # =====================================================================
-# DATABASE LAYERS (MongoDB + SQLite fallback) – mostly unchanged
+# DATABASE LAYERS (MongoDB + SQLite fallback) – with observation table
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -145,6 +145,7 @@ class MongoDatabase:
             self.db.candles.create_index([("asset", 1), ("timeframe", 1), ("timestamp", 1)], unique=True)
             self.db.trades.create_index([("id", 1)], unique=True)
             self.db.trades.create_index([("status", 1)])
+            self.db.observations.create_index([("asset", 1), ("timestamp", -1)])
         except Exception:
             pass
 
@@ -214,6 +215,13 @@ class MongoDatabase:
         except Exception:
             pass
 
+    def save_observation(self, obs):
+        if self.db is None: return
+        try:
+            self.db.observations.insert_one(obs)
+        except Exception:
+            pass
+
 class TradeDatabase:
     def __init__(self):
         self.local = threading.local()
@@ -229,6 +237,7 @@ class TradeDatabase:
         conn = self._get_conn()
         cur = conn.cursor()
         try:
+            # ---- trades ----
             cur.execute('''CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY,
                 asset TEXT, direction TEXT,
@@ -244,12 +253,35 @@ class TradeDatabase:
                 signal_token TEXT,
                 score_breakdown TEXT
             )''')
+            # ---- rejected_signals (enhanced with status) ----
             cur.execute('''CREATE TABLE IF NOT EXISTS rejected_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset TEXT, price REAL, score INTEGER, reason TEXT,
                 timestamp INTEGER, volatility REAL, market_regime TEXT,
                 gate_name TEXT, regime TEXT,
-                score_breakdown TEXT
+                score_breakdown TEXT,
+                status TEXT,
+                direction TEXT,
+                candidate_timestamp INTEGER
+            )''')
+            try:
+                cur.execute("ALTER TABLE rejected_signals ADD COLUMN status TEXT")
+                cur.execute("ALTER TABLE rejected_signals ADD COLUMN direction TEXT")
+                cur.execute("ALTER TABLE rejected_signals ADD COLUMN candidate_timestamp INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            # ---- observations (new) ----
+            cur.execute('''CREATE TABLE IF NOT EXISTS signal_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset TEXT,
+                timestamp INTEGER,
+                direction TEXT,
+                score INTEGER,
+                status TEXT,
+                reason TEXT,
+                breakdown TEXT,
+                price REAL,
+                volatility REAL
             )''')
             cur.execute('''CREATE TABLE IF NOT EXISTS performance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -335,13 +367,26 @@ class TradeDatabase:
         finally:
             cur.close()
 
-    def log_rejected(self, asset, price, score, reason, volatility, regime, gate_name="", dynamic_regime="", score_breakdown=""):
+    def log_rejected(self, asset, price, score, reason, volatility, regime, gate_name="", dynamic_regime="", score_breakdown="", status="REJECTED", direction="", candidate_ts=None):
         conn = self._get_conn()
         cur = conn.cursor()
         try:
-            cur.execute('''INSERT INTO rejected_signals (asset, price, score, reason, timestamp, volatility, market_regime, gate_name, regime, score_breakdown)
-                VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                (asset, price, score, reason, int(time.time()), volatility, regime, gate_name, dynamic_regime, score_breakdown))
+            cur.execute('''INSERT INTO rejected_signals 
+                (asset, price, score, reason, timestamp, volatility, market_regime, gate_name, regime, score_breakdown, status, direction, candidate_timestamp)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (asset, price, score, reason, int(time.time()), volatility, regime, gate_name, dynamic_regime, score_breakdown, status, direction, candidate_ts or int(time.time())))
+            conn.commit()
+        finally:
+            cur.close()
+
+    def log_observation(self, asset, price, direction, score, status, reason, breakdown, volatility):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute('''INSERT INTO signal_observations 
+                (asset, timestamp, direction, score, status, reason, breakdown, price, volatility)
+                VALUES (?,?,?,?,?,?,?,?,?)''',
+                (asset, int(time.time()), direction, score, status, reason, json.dumps(breakdown), price, volatility))
             conn.commit()
         finally:
             cur.close()
@@ -392,6 +437,15 @@ class TradeDatabase:
             return [row[0] for row in cur.fetchall()]
         finally:
             cur.close()
+
+    def get_recent_observations(self, limit=50):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT asset, datetime(timestamp, 'unixepoch') as time, direction, score, status, reason FROM signal_observations ORDER BY timestamp DESC LIMIT ?", (limit,))
+            return cur.fetchall()
+        except Exception:
+            return []
 
 # =====================================================================
 # PERSISTENT MEMORY ENGINE (unchanged)
@@ -1248,16 +1302,9 @@ class NeutralCandleEngine:
             }
 
 # =====================================================================
-# SIMPLE SIGNAL ENGINE (4 Layers)
+# SIMPLE SIGNAL ENGINE (4 Layers) – now returns full status
 # =====================================================================
 class SimpleSignalEngine:
-    """
-    4‑Layer Quality Signal Engine:
-    Layer 1: Trend (30 pts)
-    Layer 2: Entry Location (25 pts)
-    Layer 3: Confirmation (Volume+OrderFlow 20, Candle+Structure 15)
-    Layer 4: Risk & Volatility (10 pts)
-    """
     def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
         self.topology = topology
         self.futures = futures_stream
@@ -1266,17 +1313,30 @@ class SimpleSignalEngine:
 
     def evaluate(self, asset: str, price: float, volume: float):
         """
-        Returns: (is_valid, direction, score, tier, reason, breakdown)
+        Returns a dict with status, direction, score, reason, breakdown.
+        status: "NO SETUP" | "REJECTED" | "WATCH" | "VALID" | "HIGH"
         """
         breakdown = {}
         with self.topology.lock:
-            # ---- LAYER 1: TREND (30 pts) ----
+            # ---- LAYER 1: TREND ----
             c15 = self.topology.get_completed(asset, 900)
             if len(c15) < 30:
-                return False, None, 0, "INSUFFICIENT_DATA", "Not enough 15m data", breakdown
+                return {
+                    "status": "NO SETUP",
+                    "direction": None,
+                    "score": 0,
+                    "reason": "Insufficient 15m data",
+                    "breakdown": {"error": "insufficient_data"}
+                }
             c1h = self.topology.get_completed(asset, 3600)
             if len(c1h) < 30:
-                return False, None, 0, "INSUFFICIENT_DATA", "Not enough 1h data", breakdown
+                return {
+                    "status": "NO SETUP",
+                    "direction": None,
+                    "score": 0,
+                    "reason": "Insufficient 1h data",
+                    "breakdown": {"error": "insufficient_data"}
+                }
 
             closes_15 = [c['close'] for c in c15[-30:]]
             closes_1h = [c['close'] for c in c1h[-30:]]
@@ -1288,7 +1348,13 @@ class SimpleSignalEngine:
             rsi_15 = self.topology._calc_rsi(closes_15[-15:]) if len(closes_15) >= 15 else 50
 
             if None in (ema20_15, ema50_15, ema20_1h, ema50_1h):
-                return False, None, 0, "INSUFFICIENT_DATA", "EMA not ready", breakdown
+                return {
+                    "status": "NO SETUP",
+                    "direction": None,
+                    "score": 0,
+                    "reason": "EMA not ready",
+                    "breakdown": {"error": "ema_not_ready"}
+                }
 
             trend_15_bull = ema20_15 > ema50_15
             trend_1h_bull = ema20_1h > ema50_1h
@@ -1301,16 +1367,19 @@ class SimpleSignalEngine:
                 direction = "SELL"
                 trend_score = 30
             else:
-                # Conflicting trends → reject
-                return False, None, 0, "REJECT", "Trend conflict or no clear direction", breakdown
+                return {
+                    "status": "NO SETUP",
+                    "direction": None,
+                    "score": 0,
+                    "reason": "Trend conflict or unclear",
+                    "breakdown": {"trend": "conflict"}
+                }
 
             breakdown["Trend"] = trend_score
 
-            # ---- LAYER 2: ENTRY LOCATION (25 pts) ----
+            # ---- LAYER 2: LOCATION ----
             loc_score = 0
             loc_reasons = []
-
-            # 2a. Support/Resistance proximity
             sr = self.topology.support_resistance[asset]
             atr = self.topology.get_atr(asset, period=14, tf=3600) or (price * 0.01)
             nearest_support = max(sr["support"]) if sr["support"] else None
@@ -1323,13 +1392,11 @@ class SimpleSignalEngine:
                 loc_score += 12
                 loc_reasons.append("NearResistance")
 
-            # 2b. Volume anchor retest
             anchor_ok, anchor_price = self.topology.check_anchor_line_retest(asset, price, direction)
             if anchor_ok:
                 loc_score += 8
                 loc_reasons.append(f"Anchor@{anchor_price:.0f}")
 
-            # 2c. Pullback to EMA (20 or 50)
             if direction == "BUY" and price <= ema20_15 * 1.005:
                 loc_score += 5
                 loc_reasons.append("Near15EMA")
@@ -1337,17 +1404,14 @@ class SimpleSignalEngine:
                 loc_score += 5
                 loc_reasons.append("Near15EMA")
 
-            # Limit to 25
             loc_score = min(loc_score, 25)
             breakdown["Location"] = loc_score
             breakdown["LocationDetails"] = " | ".join(loc_reasons) if loc_reasons else "Poor location"
 
             # ---- LAYER 3: CONFIRMATION ----
-            # 3a. Volume + Order Flow (20 pts)
             conf_score = 0
             vol_reasons = []
 
-            # Volume ratio
             vol_ma = self.topology.volume_ma.get(asset, 0)
             vol_ratio = volume / vol_ma if vol_ma > 0 else 1.0
             if (direction == "BUY" and vol_ratio > 1.5) or (direction == "SELL" and vol_ratio > 1.5):
@@ -1357,13 +1421,11 @@ class SimpleSignalEngine:
                 conf_score += 5
                 vol_reasons.append("AboveAvgVolume")
 
-            # CVD
             cvd = self.futures.get_cvd(asset.lower())
             if (direction == "BUY" and cvd > 0) or (direction == "SELL" and cvd < 0):
                 conf_score += 6
                 vol_reasons.append("CVDsupport")
 
-            # OI trend
             oi_trend = self.futures.get_oi_trend(asset.lower())
             if (direction == "BUY" and oi_trend > 0) or (direction == "SELL" and oi_trend < 0):
                 conf_score += 6
@@ -1373,11 +1435,10 @@ class SimpleSignalEngine:
             breakdown["VolumeOrderFlow"] = conf_score
             breakdown["VolFlowDetails"] = " | ".join(vol_reasons) if vol_reasons else "Neutral"
 
-            # 3b. Candle + Structure (15 pts)
+            # Candle + Structure
             struct_score = 0
             struct_reasons = []
 
-            # Rejection wick
             if len(c15) >= 2:
                 last = c15[-1]
                 rng = last["high"] - last["low"]
@@ -1391,7 +1452,6 @@ class SimpleSignalEngine:
                         struct_score += 6
                         struct_reasons.append("RejectionWick")
 
-            # BOS / CHoCH
             bos = self.topology.bos[asset]["direction"]
             if (direction == "BUY" and bos == "UP") or (direction == "SELL" and bos == "DOWN"):
                 struct_score += 5
@@ -1401,7 +1461,6 @@ class SimpleSignalEngine:
                 struct_score += 4
                 struct_reasons.append("CHoCH")
 
-            # Neutral candle bonus (using existing engine)
             neutral = self.neutral.detect(asset, price, tf=900)
             if neutral.get("direction") == direction:
                 struct_score += 5
@@ -1411,11 +1470,10 @@ class SimpleSignalEngine:
             breakdown["CandleStructure"] = struct_score
             breakdown["StructDetails"] = " | ".join(struct_reasons) if struct_reasons else "Weak"
 
-            # ---- LAYER 4: RISK & VOLATILITY (10 pts) ----
+            # ---- LAYER 4: RISK ----
             risk_score = 0
             risk_reasons = []
 
-            # ATR check – not too high (avoid excessive volatility)
             atr_pct = atr / price if price > 0 else 0.01
             if atr_pct < 0.02:
                 risk_score += 4
@@ -1426,7 +1484,6 @@ class SimpleSignalEngine:
             else:
                 risk_reasons.append("HighVol")
 
-            # Overextension check: price vs 20 EMA (15m)
             dist_pct = abs(price - ema20_15) / price
             if dist_pct < 0.02:
                 risk_score += 6
@@ -1446,23 +1503,24 @@ class SimpleSignalEngine:
             breakdown["Total"] = total_score
             breakdown["Direction"] = direction
 
-            # ---- DETERMINE TIER ----
-            if total_score >= Config.SCORE_EXTREME:
-                tier = "EXTREME"
-            elif total_score >= Config.SCORE_HIGH:
-                tier = "HIGH"
+            # ---- DETERMINE STATUS ----
+            if total_score >= Config.SCORE_HIGH:
+                status = "HIGH"
             elif total_score >= Config.SCORE_VALID:
-                tier = "VALID"
+                status = "VALID"
             elif total_score >= Config.SCORE_WATCH:
-                tier = "WATCH"
+                status = "WATCH"
             else:
-                tier = "REJECT"
-
-            # ---- VALIDITY ----
-            is_valid = (total_score >= Config.SCORE_HIGH)  # only HIGH+ become final candidates
+                status = "REJECTED"
 
             reason = (f"Trend: {trend_score} | Loc: {loc_score} | V/OF: {conf_score} | C/S: {struct_score} | Risk: {risk_score}")
-            return is_valid, direction, total_score, tier, reason, breakdown
+            return {
+                "status": status,
+                "direction": direction,
+                "score": total_score,
+                "reason": reason,
+                "breakdown": breakdown
+            }
 
 # =====================================================================
 # DYNAMIC STOP LOSS (Structure-based)
@@ -1503,7 +1561,7 @@ class DynamicStopLoss:
             sl = entry - buffer if direction == "BUY" else entry + buffer
             risk = buffer
 
-        # ---- TP based on structure ----
+        # TP based on structure
         targets = []
         if direction == "SELL":
             if nearest_support:
@@ -1530,7 +1588,6 @@ class DynamicStopLoss:
 
         rr = abs(tp - entry) / risk if risk > 0 else 0
         if rr < Config.MIN_RR:
-            # Try to extend TP to meet minimum R:R
             if direction == "BUY":
                 tp = entry + Config.MIN_RR * risk
             else:
@@ -1870,7 +1927,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR (v7.6 Simple)
+# CORE ORCHESTRATOR (v7.6 Simple + Observation)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -1888,7 +1945,6 @@ class AIOrchestrator:
         self.absorption_meter = MarketAbsorptionMeter(self.futures_stream, self.topology)
         self.neutral_engine = NeutralCandleEngine(self.topology)
 
-        # ---- NEW SIMPLE ENGINE ----
         self.signal_engine = SimpleSignalEngine(
             self.topology,
             self.futures_stream,
@@ -1906,8 +1962,8 @@ class AIOrchestrator:
         self.start_time = time.time()
 
         # Global signal tracking
-        self.signal_timestamps = deque(maxlen=100)      # all final signals
-        self.asset_last_signal = {a: 0 for a in Config.ASSETS}   # per-asset cooldown
+        self.signal_timestamps = deque(maxlen=100)
+        self.asset_last_signal = {a: 0 for a in Config.ASSETS}
 
         self.asset_state = {a: {"trend": "NEUTRAL", "htf_trend": "NEUTRAL", "volume_ratio": 1.0,
                                 "rsi": 50, "adx": 20, "volatility": 0.01,
@@ -1917,7 +1973,7 @@ class AIOrchestrator:
         self.rejected = 0
         self.stream = None
         self._price_counter = 0
-        self._ready = False   # set True after backfill
+        self._ready = False
 
         self._restore_state_from_db()
 
@@ -1982,18 +2038,15 @@ class AIOrchestrator:
             logger.info(f"⏱️ STATUS: last tick {age:.0f}s ago, queue size {qsize}, active trades {len(self.active_trades)}")
 
     def _signal_limit_ok(self):
-        """Check global 24h limit (max 4 signals)."""
         now = time.time()
         count = sum(1 for ts in self.signal_timestamps if now - ts < 86400)
         return count < Config.MAX_SIGNALS_PER_DAY
 
     def _asset_cooldown_ok(self, asset):
-        """Check per-asset 4h cooldown."""
         last = self.asset_last_signal.get(asset, 0)
         return (time.time() - last) >= (Config.ASSET_COOLDOWN_HOURS * 3600)
 
     def _handle_price_tick(self, asset, price, volume):
-        # Skip if already in a trade for this asset
         with self.trade_lock:
             if any(t['asset'] == asset for t in self.active_trades.values()):
                 return
@@ -2001,38 +2054,65 @@ class AIOrchestrator:
         self.topology.process_tick(asset, price, volume)
         self._update_active_trades(asset, price)
 
-        # Only evaluate on 15m candle close
         if not self.topology.candle_just_closed.get(asset, False):
             return
 
-        # Check pending verification first
+        # ---- Check pending verification ----
         if self.pending_queue.pending:
             self.pending_queue.check_pending(asset)
             verified = self.pending_queue.get_verified_signals()
             for signal in verified:
                 self._send_final_signal(signal)
 
-        # ---- RUN THE SIMPLE ENGINE ----
-        is_valid, direction, score, tier, reason, breakdown = self.signal_engine.evaluate(asset, price, volume)
+        # ---- Evaluate with Simple Engine ----
+        result = self.signal_engine.evaluate(asset, price, volume)
+        status = result["status"]
+        direction = result["direction"]
+        score = result["score"]
+        reason = result["reason"]
+        breakdown = result["breakdown"]
 
-        # Log every evaluation for debugging
-        logger.info(f"🔍 {asset} | Score: {score} | Tier: {tier} | Valid: {is_valid} | Reason: {reason}")
+        # ---- LOG OBSERVATION ----
+        self.db.log_observation(
+            asset=asset,
+            price=price,
+            direction=direction if direction else "NONE",
+            score=score,
+            status=status,
+            reason=reason,
+            breakdown=breakdown,
+            volatility=self.asset_state[asset]["volatility"]
+        )
+        logger.info(f"🔍 {asset} | Status: {status} | Score: {score} | Dir: {direction} | Reason: {reason}")
 
-        # If not valid candidate (score < 75), reject silently (store in DB if >=60)
-        if not is_valid:
-            if score >= Config.SCORE_WATCH:
-                self.db.log_rejected(asset, price, score, f"Score {score} below {Config.SCORE_HIGH}",
-                                     self.asset_state[asset]["volatility"], "SIMPLE", "LowScore",
-                                     json.dumps(breakdown))
-                self.rejected += 1
-                self.memory.update_state({"rejected_signals_count": 1})
+        # ---- If status is REJECTED or NO SETUP, just log and return ----
+        if status in ("NO SETUP", "REJECTED"):
+            # Also log to rejected_signals for backward compatibility
+            self.db.log_rejected(
+                asset=asset,
+                price=price,
+                score=score,
+                reason=f"{status}: {reason}",
+                volatility=self.asset_state[asset]["volatility"],
+                regime="SIMPLE",
+                gate_name="Engine",
+                status=status,
+                direction=direction if direction else "",
+                score_breakdown=json.dumps(breakdown)
+            )
+            self.rejected += 1
+            self.memory.update_state({"rejected_signals_count": 1})
             return
+
+        # ---- Only VALID and HIGH proceed further ----
+        if status not in ("VALID", "HIGH"):
+            return  # WATCH is just logged, not a final candidate
 
         # ---- Global and per-asset limits ----
         if not self._signal_limit_ok():
-            self.db.log_rejected(asset, price, score, "Global daily limit (4) reached",
+            self.db.log_rejected(asset, price, score, "Global daily limit reached",
                                  self.asset_state[asset]["volatility"], "SIMPLE", "DailyLimit",
-                                 json.dumps(breakdown))
+                                 json.dumps(breakdown), status="REJECTED", direction=direction)
             self.rejected += 1
             self.memory.update_state({"rejected_signals_count": 1})
             return
@@ -2040,7 +2120,7 @@ class AIOrchestrator:
         if not self._asset_cooldown_ok(asset):
             self.db.log_rejected(asset, price, score, f"Asset cooldown {Config.ASSET_COOLDOWN_HOURS}h",
                                  self.asset_state[asset]["volatility"], "SIMPLE", "Cooldown",
-                                 json.dumps(breakdown))
+                                 json.dumps(breakdown), status="REJECTED", direction=direction)
             self.rejected += 1
             self.memory.update_state({"rejected_signals_count": 1})
             return
@@ -2049,11 +2129,10 @@ class AIOrchestrator:
         atr = self.topology.get_atr(asset, period=14, tf=3600) or (price * 0.01)
         sl, tp, risk, rr = self.dynamic_sl.calculate(asset, direction, price, atr)
 
-        # Reject if R:R < 1:2
         if rr < Config.MIN_RR:
             self.db.log_rejected(asset, price, score, f"R:R {rr:.2f} < {Config.MIN_RR}",
                                  self.asset_state[asset]["volatility"], "SIMPLE", "Risk",
-                                 json.dumps(breakdown))
+                                 json.dumps(breakdown), status="REJECTED", direction=direction)
             self.rejected += 1
             self.memory.update_state({"rejected_signals_count": 1})
             return
@@ -2077,7 +2156,7 @@ class AIOrchestrator:
             'htf_trend': self.asset_state[asset]["htf_trend"],
             'news_score': self.asset_state[asset]["news_sentiment"],
             'score': score,
-            'confidence': tier,
+            'confidence': status,
             'num_passed': 4,
             'pending_candles': Config.PENDING_VERIFICATION_CANDLES,
             'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,
@@ -2090,7 +2169,7 @@ class AIOrchestrator:
 
         self.pending_queue.add_signal(signal)
         self.memory.update_state({"total_signals_generated": 1})
-        logger.info(f"⏳ Pending: {asset} {direction} @ {price} Score:{score} ({tier})")
+        logger.info(f"⏳ Pending: {asset} {direction} @ {price} Score:{score} ({status})")
 
     def _send_final_signal(self, signal):
         try:
@@ -2116,7 +2195,6 @@ class AIOrchestrator:
             confidence = signal.get('confidence', 'HIGH')
             breakdown = signal.get('score_breakdown', '')
 
-            # Log final signal
             self.db.log_trade(trade_id, asset, direction, price, sl, tp, total_score, confidence,
                               list(patterns.keys()), logic, volatility, regime, htf_trend,
                               news_score, session, sqs, pattern_name, dm, st, token, breakdown)
@@ -2152,7 +2230,7 @@ class AIOrchestrator:
             logger.error(f"Error sending final signal: {e}", exc_info=True)
 
     def _update_active_trades(self, asset, price):
-        # (unchanged from previous version)
+        # (unchanged)
         with self.trade_lock:
             to_remove = []
             for tid, trade in list(self.active_trades.items()):
@@ -2254,7 +2332,6 @@ class AIOrchestrator:
     def run(self):
         threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
         threading.Thread(target=self._ping_self_loop, daemon=True).start()
-        # Backfill candles first
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(self._load_and_backfill, asset, tf)
                        for asset in Config.ASSETS for tf in [60, 300, 900, 3600, 14400]]
@@ -2263,7 +2340,7 @@ class AIOrchestrator:
         self._ready = True
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AlphaBot v7.6 SIMPLE ENGINE – Active (Max 4 signals/24h)")
+        self.telegram.send_message("🚀 AlphaBot v7.6 SIMPLE + OBSERVATION – Active")
         last_news = 0
         while True:
             time.sleep(10)
@@ -2323,7 +2400,7 @@ class AIOrchestrator:
             time.sleep(300)
 
 # =====================================================================
-# HEALTH SERVER (with extra info)
+# HEALTH SERVER (Updated Dashboard)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -2357,9 +2434,27 @@ def start_health_server(orchestrator):
                 try:
                     conn = orchestrator.db._get_conn()
                     cur = conn.cursor()
-                    cur.execute("SELECT datetime(timestamp, 'unixepoch'), asset, price, reason, gate_name, regime FROM rejected_signals ORDER BY timestamp DESC LIMIT 50")
+                    cur.execute("SELECT datetime(timestamp, 'unixepoch'), asset, price, reason, gate_name, regime, status FROM rejected_signals ORDER BY timestamp DESC LIMIT 50")
                     rows = cur.fetchall()
-                    data = [{"time": r[0], "asset": r[1], "price": r[2], "reason": r[3], "gate": r[4], "regime": r[5]} for r in rows]
+                    data = [{"time": r[0], "asset": r[1], "price": r[2], "reason": r[3], "gate": r[4], "regime": r[5], "status": r[6]} for r in rows]
+                    self.wfile.write(json.dumps(data, indent=2).encode())
+                except Exception as e:
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
+
+            if self.path.startswith('/observations'):
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                try:
+                    limit = 50
+                    if '?limit=' in self.path:
+                        limit = int(self.path.split('limit=')[1].split('&')[0])
+                    conn = orchestrator.db._get_conn()
+                    cur = conn.cursor()
+                    cur.execute("SELECT asset, datetime(timestamp, 'unixepoch') as ts, direction, score, status, reason FROM signal_observations ORDER BY timestamp DESC LIMIT ?", (limit,))
+                    rows = cur.fetchall()
+                    data = [{"asset": r[0], "time": r[1], "direction": r[2], "score": r[3], "status": r[4], "reason": r[5]} for r in rows]
                     self.wfile.write(json.dumps(data, indent=2).encode())
                 except Exception as e:
                     self.wfile.write(json.dumps({"error": str(e)}).encode())
@@ -2387,19 +2482,30 @@ def start_health_server(orchestrator):
                                             "entry": trade['entry'], "pnl": round(pnl, 2),
                                             "health": trade.get('health', 100)})
 
+                # Recent observations table
+                observations = orchestrator.db.get_recent_observations(10)
+                obs_rows = ""
+                for obs in observations:
+                    obs_rows += f"<tr><td>{obs['asset']}</td><td>{obs['time']}</td><td>{obs['direction']}</td><td>{obs['score']}</td><td>{obs['status']}</td><td>{obs['reason'][:50]}</td></tr>"
+
                 neutral_html = ""
                 for asset in Config.ASSETS:
                     pat = orchestrator.asset_state.get(asset, {}).get('neutral_pattern', 'None')
                     neutral_html += f"<span style='margin:0 15px;'><b>{asset}</b>: {pat}</span>"
 
                 html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>AlphaBot v7.6 Simple</title>
-<meta http-equiv="refresh" content="10"><style>
+<meta http-equiv="refresh" content="15"><style>
 body{{font-family:Arial;background:#111;color:#eee;margin:20px}}
-table{{border-collapse:collapse;width:100%}}
+table{{border-collapse:collapse;width:100%;font-size:14px}}
 th,td{{border:1px solid #444;padding:6px;text-align:center}}
 th{{background:#333}}
 .g{{color:#0f0}} .r{{color:#f00}}
 .btn{{background:#d9534f;color:#fff;padding:3px 8px;text-decoration:none;border-radius:3px;font-size:12px;font-weight:bold}}
+.status-REJECTED{{color:#f44}}
+.status-NO-SETUP{{color:#888}}
+.status-WATCH{{color:#ffa500}}
+.status-VALID{{color:#0f0}}
+.status-HIGH{{color:#0ff}}
 </style></head><body>
 <h1>🚀 AlphaBot v7.6 SIMPLE</h1>
 <p>🟢 <b>Bot Status: Online</b> | ⏱️ Market Watching Age: {age_str}</p>
@@ -2413,7 +2519,16 @@ th{{background:#333}}
                     cls = "g" if t["pnl"] >= 0 else "r"
                     btn = f"<a href='/close_trade?id={t['id']}' class='btn'>❌ Reject / Close</a>"
                     html += f"<tr><td>{t['id']}</td><td>{t['asset']}</td><td>{t['dir']}</td><td>{t['entry']:.2f}</td><td class='{cls}'>{t['pnl']:.2f}</td><td>{t['health']}%</td><td>{btn}</td></tr>"
-                html += "</table></body></html>"
+                html += "</table>"
+                html += f"""
+<h2>📋 Latest Observations</h2>
+<table><tr><th>Asset</th><th>Time</th><th>Dir</th><th>Score</th><th>Status</th><th>Reason</th></tr>
+{obs_rows}
+</table>
+<p><a href='/observations' target='_blank'>View all observations (JSON)</a></p>
+<p><a href='/rejections' target='_blank'>View rejected signals (JSON)</a></p>
+</body></html>
+"""
                 self.wfile.write(html.encode())
             else:
                 self.send_response(200)
