@@ -58,12 +58,12 @@ class Config:
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
-    SCORE_REJECT = 60
-    SCORE_WATCH = 60
-    SCORE_VALID = 75
-    SCORE_HIGH = 85
+    SCORE_REJECT = 45
+    SCORE_WATCH = 45
+    SCORE_VALID = 50
+    SCORE_HIGH = 60
 
-    MIN_SCORE_FOR_SIGNAL = 75
+    MIN_SCORE_FOR_SIGNAL = 50
     MIN_RR = 2.0
     MAX_SIGNALS_PER_DAY = 4
     ASSET_COOLDOWN_HOURS = 4
@@ -1492,7 +1492,9 @@ class SimpleSignalEngine:
             breakdown["Direction"] = direction
 
             # ---- DETERMINE STATUS ----
-            if total_score >= Config.SCORE_HIGH:
+            if total_score >= 75:
+                status = "EXTREME"
+            elif total_score >= Config.SCORE_HIGH:
                 status = "HIGH"
             elif total_score >= Config.SCORE_VALID:
                 status = "VALID"
