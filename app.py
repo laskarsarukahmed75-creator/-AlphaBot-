@@ -1,5 +1,5 @@
 # =====================================================================
-# app.py – AlphaBot v7.6 SIMPLE + OBSERVATION LAYER
+# app.py – AlphaBot v7.6 SIMPLE + OBSERVATION (FIXED EMA WINDOW)
 # =====================================================================
 # 4-Layer System: Trend → Location → Confirmation → Risk
 # Har 15m evaluation log hota hai (NO SETUP / REJECTED / WATCH / VALID / HIGH)
@@ -253,7 +253,7 @@ class TradeDatabase:
                 signal_token TEXT,
                 score_breakdown TEXT
             )''')
-            # ---- rejected_signals (enhanced with status) ----
+            # ---- rejected_signals (enhanced) ----
             cur.execute('''CREATE TABLE IF NOT EXISTS rejected_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 asset TEXT, price REAL, score INTEGER, reason TEXT,
@@ -1302,7 +1302,7 @@ class NeutralCandleEngine:
             }
 
 # =====================================================================
-# SIMPLE SIGNAL ENGINE (4 Layers) – now returns full status
+# SIMPLE SIGNAL ENGINE (FIX: use 150 candles for EMA)
 # =====================================================================
 class SimpleSignalEngine:
     def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
@@ -1319,27 +1319,29 @@ class SimpleSignalEngine:
         breakdown = {}
         with self.topology.lock:
             # ---- LAYER 1: TREND ----
+            # FIX: use 150 candles for EMA50
             c15 = self.topology.get_completed(asset, 900)
-            if len(c15) < 30:
+            if len(c15) < 150:  # need at least 150 for reliable EMA50
                 return {
                     "status": "NO SETUP",
                     "direction": None,
                     "score": 0,
-                    "reason": "Insufficient 15m data",
+                    "reason": "Insufficient 15m data (<150)",
                     "breakdown": {"error": "insufficient_data"}
                 }
             c1h = self.topology.get_completed(asset, 3600)
-            if len(c1h) < 30:
+            if len(c1h) < 150:
                 return {
                     "status": "NO SETUP",
                     "direction": None,
                     "score": 0,
-                    "reason": "Insufficient 1h data",
+                    "reason": "Insufficient 1h data (<150)",
                     "breakdown": {"error": "insufficient_data"}
                 }
 
-            closes_15 = [c['close'] for c in c15[-30:]]
-            closes_1h = [c['close'] for c in c1h[-30:]]
+            # Use last 150 candles for EMA
+            closes_15 = [c['close'] for c in c15[-150:]]
+            closes_1h = [c['close'] for c in c1h[-150:]]
 
             ema20_15 = self.topology._ema(closes_15, 20)[-1] if len(closes_15) >= 20 else None
             ema50_15 = self.topology._ema(closes_15, 50)[-1] if len(closes_15) >= 50 else None
@@ -1352,7 +1354,7 @@ class SimpleSignalEngine:
                     "status": "NO SETUP",
                     "direction": None,
                     "score": 0,
-                    "reason": "EMA not ready",
+                    "reason": "EMA not ready (possible missing data)",
                     "breakdown": {"error": "ema_not_ready"}
                 }
 
@@ -1927,7 +1929,7 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR (v7.6 Simple + Observation)
+# CORE ORCHESTRATOR (v7.6 Simple + Observation + FIX)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -2072,7 +2074,7 @@ class AIOrchestrator:
         reason = result["reason"]
         breakdown = result["breakdown"]
 
-        # ---- LOG OBSERVATION ----
+        # ---- ALWAYS LOG OBSERVATION (regardless of score) ----
         self.db.log_observation(
             asset=asset,
             price=price,
@@ -2085,9 +2087,8 @@ class AIOrchestrator:
         )
         logger.info(f"🔍 {asset} | Status: {status} | Score: {score} | Dir: {direction} | Reason: {reason}")
 
-        # ---- If status is REJECTED or NO SETUP, just log and return ----
+        # ---- If status is NO SETUP or REJECTED, log to rejected_signals for backward compatibility ----
         if status in ("NO SETUP", "REJECTED"):
-            # Also log to rejected_signals for backward compatibility
             self.db.log_rejected(
                 asset=asset,
                 price=price,
@@ -2400,7 +2401,7 @@ class AIOrchestrator:
             time.sleep(300)
 
 # =====================================================================
-# HEALTH SERVER (Updated Dashboard)
+# HEALTH SERVER (Updated Dashboard with Observations)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
