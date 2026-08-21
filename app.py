@@ -1463,6 +1463,69 @@ class SimpleSignalEngine:
         struct_reasons = []
 
         if len(c15) >= 2:
+        # ---- LAYER 3: CONFIRMATION ----
+        conf_score = 0
+        vol_reasons = []
+
+        vol_ma = self.topology.volume_ma.get(asset, 0)
+        vol_ratio = volume / vol_ma if vol_ma > 0 else 1.0
+        if (direction == "BUY" and vol_ratio > 1.5) or (direction == "SELL" and vol_ratio > 1.5):
+            conf_score += 8
+            vol_reasons.append("HighVolume")
+        elif vol_ratio > 1.2:
+            conf_score += 5
+            vol_reasons.append("AboveAvgVolume")
+
+        # --- Multi-Exchange CVD & OI Confluence + Exhaustion Patch ---
+        current_cvd = self.futures.get_cvd(asset.lower())
+        prev_cvd = getattr(self, '_prev_cvd', {}).get(asset, current_cvd)
+        prev_price = c15[-2]['close'] if len(c15) >= 2 else price
+
+        cvd_score = 0
+        if direction == "BUY":
+            if current_cvd > 0:
+                cvd_score = 6
+                vol_reasons.append("CVDSupport")
+            if price > prev_price and current_cvd < prev_cvd:
+                cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 20)
+                vol_reasons.append("CVDExhaustionPenalty")
+        elif direction == "SELL":
+            if current_cvd < 0:
+                cvd_score = 6
+                vol_reasons.append("CVDSupport")
+            if price < prev_price and current_cvd > prev_cvd:
+                cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 20)
+                vol_reasons.append("CVDExhaustionPenalty")
+
+        if not hasattr(self, '_prev_cvd'):
+            self._prev_cvd = {}
+        self._prev_cvd[asset] = current_cvd
+
+        # Multi-Exchange OI (Binance + Bybit + OKX)
+        oi_data = self.multi_oi.fetch_composite_oi(asset)
+        valid_exchanges = [v for v in oi_data.values() if v is not None]
+
+        oi_score = 0
+        if len(valid_exchanges) == 3:
+            oi_score = 8
+            vol_reasons.append("MultiOI_3xConfirm")
+        elif len(valid_exchanges) == 2:
+            oi_score = 5
+            vol_reasons.append("MultiOI_2xConfirm")
+        else:
+            vol_reasons.append("MultiOI_LowConfidence")
+
+        conf_score += cvd_score + oi_score
+
+        conf_score = min(conf_score, 20)
+        breakdown["VolumeOrderFlow"] = conf_score
+        breakdown["VolFlowDetails"] = " | ".join(vol_reasons) if vol_reasons else "Neutral"
+
+        # Candle + Structure
+        struct_score = 0
+        struct_reasons = []
+
+        if len(c15) >= 2:
             last = c15[-1]
             rng = last["high"] - last["low"]
             if rng > 0:
@@ -1493,59 +1556,59 @@ class SimpleSignalEngine:
         breakdown["CandleStructure"] = struct_score
         breakdown["StructDetails"] = " | ".join(struct_reasons) if struct_reasons else "Weak"
 
-            # ---- LAYER 4: RISK ----
-            risk_score = 0
-            risk_reasons = []
+        # ---- LAYER 4: RISK ----
+        risk_score = 0
+        risk_reasons = []
 
-            atr_pct = atr / price if price > 0 else 0.01
-            if atr_pct < 0.02:
-                risk_score += 4
-                risk_reasons.append("LowVol")
-            elif atr_pct < 0.04:
-                risk_score += 2
-                risk_reasons.append("MedVol")
-            else:
-                risk_reasons.append("HighVol")
+        atr_pct = atr / price if price > 0 else 0.01
+        if atr_pct < 0.02:
+            risk_score += 4
+            risk_reasons.append("LowVol")
+        elif atr_pct < 0.04:
+            risk_score += 2
+            risk_reasons.append("MedVol")
+        else:
+            risk_reasons.append("HighVol")
 
-            dist_pct = abs(price - ema20_15) / price
-            if dist_pct < 0.02:
-                risk_score += 6
-                risk_reasons.append("NearEMA")
-            elif dist_pct < 0.04:
-                risk_score += 3
-                risk_reasons.append("ModerateExt")
-            else:
-                risk_reasons.append("Extended")
+        dist_pct = abs(price - ema20_15) / price
+        if dist_pct < 0.02:
+            risk_score += 6
+            risk_reasons.append("NearEMA")
+        elif dist_pct < 0.04:
+            risk_score += 3
+            risk_reasons.append("ModerateExt")
+        else:
+            risk_reasons.append("Extended")
 
-            risk_score = min(risk_score, 10)
-            breakdown["Risk"] = risk_score
-            breakdown["RiskDetails"] = " | ".join(risk_reasons) if risk_reasons else "Unknown"
+        risk_score = min(risk_score, 10)
+        breakdown["Risk"] = risk_score
+        breakdown["RiskDetails"] = " | ".join(risk_reasons) if risk_reasons else "Unknown"
 
-            # ---- TOTAL SCORE ----
-            total_score = trend_score + loc_score + conf_score + struct_score + risk_score
-            breakdown["Total"] = total_score
-            breakdown["Direction"] = direction
+        # ---- TOTAL SCORE ----
+        total_score = trend_score + loc_score + conf_score + struct_score + risk_score
+        breakdown["Total"] = total_score
+        breakdown["Direction"] = direction
 
-            # ---- DETERMINE STATUS ----
-            if total_score >= 75:
-                status = "EXTREME"
-            elif total_score >= Config.SCORE_HIGH:
-                status = "HIGH"
-            elif total_score >= Config.SCORE_VALID:
-                status = "VALID"
-            elif total_score >= Config.SCORE_WATCH:
-                status = "WATCH"
-            else:
-                status = "REJECTED"
+        # ---- DETERMINE STATUS ----
+        if total_score >= 75:
+            status = "EXTREME"
+        elif total_score >= Config.SCORE_HIGH:
+            status = "HIGH"
+        elif total_score >= Config.SCORE_VALID:
+            status = "VALID"
+        elif total_score >= Config.SCORE_WATCH:
+            status = "WATCH"
+        else:
+            status = "REJECTED"
 
-            reason = (f"Trend: {trend_score} | Loc: {loc_score} | V/OF: {conf_score} | C/S: {struct_score} | Risk: {risk_score}")
-            return {
-                "status": status,
-                "direction": direction,
-                "score": total_score,
-                "reason": reason,
-                "breakdown": breakdown
-            }
+        reason = (f"Trend: {trend_score} | Loc: {loc_score} | V/OF: {conf_score} | C/S: {struct_score} | Risk: {risk_score}")
+        return {
+            "status": status,
+            "direction": direction,
+            "score": total_score,
+            "reason": reason,
+            "breakdown": breakdown
+        }
 
 # =====================================================================
 # DYNAMIC STOP LOSS (unchanged)
