@@ -1293,7 +1293,7 @@ class NeutralCandleEngine:
 # =====================================================================
 # SIMPLE SIGNAL ENGINE (FIXED: 150 candles for EMA)
 # =====================================================================
- class SimpleSignalEngine:
+class SimpleSignalEngine:
     def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
         self.topology = topology
         self.futures = futures_stream
