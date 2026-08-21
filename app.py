@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import websocket
+from multi_oi_fetcher import MultiExchangeOIFetcher
 
 try:
     import psutil
@@ -81,6 +82,8 @@ class Config:
     ABSORPTION_MIN_SCORE = 35
     ABSORPTION_EXIT_SCORE = 80
     REST_FALLBACK_INTERVAL = 30
+    ATR_NOISE_MULTIPLIER = 0.5
+    CVD_EXHAUSTION_PENALTY = 20
 
 # =====================================================================
 # DATA VALIDATION (unchanged)
@@ -1296,6 +1299,7 @@ class SimpleSignalEngine:
         self.futures = futures_stream
         self.absorption = absorption_meter
         self.neutral = neutral_engine
+        self.multi_oi = MultiExchangeOIFetcher()
 
     def evaluate(self, asset: str, price: float, volume: float):
         """
@@ -1409,15 +1413,46 @@ class SimpleSignalEngine:
                 conf_score += 5
                 vol_reasons.append("AboveAvgVolume")
 
-            cvd = self.futures.get_cvd(asset.lower())
-            if (direction == "BUY" and cvd > 0) or (direction == "SELL" and cvd < 0):
-                conf_score += 6
-                vol_reasons.append("CVDsupport")
+        # --- Multi-Exchange CVD & OI Confluence + Exhaustion Patch ---
+        current_cvd = self.futures.get_cvd(asset.lower())
+        prev_cvd = getattr(self, '_prev_cvd', {}).get(asset, current_cvd)
+        prev_price = c15[-2]['close'] if len(c15) >= 2 else price
 
-            oi_trend = self.futures.get_oi_trend(asset.lower())
-            if (direction == "BUY" and oi_trend > 0) or (direction == "SELL" and oi_trend < 0):
-                conf_score += 6
-                vol_reasons.append("OIsupport")
+        cvd_score = 0
+        if direction == "BUY":
+            if current_cvd > 0:
+                cvd_score = 6
+                vol_reasons.append("CVDSupport")
+            if price > prev_price and current_cvd < prev_cvd:
+                cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 20)
+                vol_reasons.append("CVDExhaustionPenalty")
+        elif direction == "SELL":
+            if current_cvd < 0:
+                cvd_score = 6
+                vol_reasons.append("CVDSupport")
+            if price < prev_price and current_cvd > prev_cvd:
+                cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 20)
+                vol_reasons.append("CVDExhaustionPenalty")
+
+        if not hasattr(self, '_prev_cvd'):
+            self._prev_cvd = {}
+        self._prev_cvd[asset] = current_cvd
+
+        # Multi-Exchange OI (Binance + Bybit + OKX)
+        oi_data = self.multi_oi.fetch_composite_oi(asset)
+        valid_exchanges = [v for v in oi_data.values() if v is not None]
+        
+        oi_score = 0
+        if len(valid_exchanges) == 3:
+            oi_score = 8
+            vol_reasons.append("MultiOI_3xConfirm")
+        elif len(valid_exchanges) == 2:
+            oi_score = 5
+            vol_reasons.append("MultiOI_2xConfirm")
+        else:
+            vol_reasons.append("MultiOI_LowConfidence")
+
+        conf_score += cvd_score + oi_score
 
             conf_score = min(conf_score, 20)
             breakdown["VolumeOrderFlow"] = conf_score
