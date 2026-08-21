@@ -1454,13 +1454,13 @@ class SimpleSignalEngine:
 
         conf_score += cvd_score + oi_score
 
-            conf_score = min(conf_score, 20)
-            breakdown["VolumeOrderFlow"] = conf_score
-            breakdown["VolFlowDetails"] = " | ".join(vol_reasons) if vol_reasons else "Neutral"
+        conf_score = min(conf_score, 20)
+        breakdown["VolumeOrderFlow"] = conf_score
+        breakdown["VolFlowDetails"] = " | ".join(vol_reasons) if vol_reasons else "Neutral"
 
-            # Candle + Structure
-            struct_score = 0
-            struct_reasons = []
+        # Candle + Structure
+        struct_score = 0
+        struct_reasons = []
 
             if len(c15) >= 2:
                 last = c15[-1]
