@@ -26,6 +26,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import websocket
 from multi_oi_fetcher import MultiExchangeOIFetcher
+from volume_profile import VolumeProfileEngine
+from backtester import BacktestingEngine
+from mongo_db import MongoDatabaseHandler
 
 try:
     import psutil
