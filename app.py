@@ -1387,14 +1387,32 @@ class SimpleSignalEngine:
             trend_1h_bull = ema20_1h > ema50_1h
             rsi_bull = rsi_15 > 50
 
+            # 1. दोनों Timeframes (15m + 1h) का पूरा मैच
             if trend_15_bull and trend_1h_bull and rsi_bull:
                 direction = "BUY"
                 trend_score = 30
             elif not trend_15_bull and not trend_1h_bull and not rsi_bull:
                 direction = "SELL"
                 trend_score = 30
+
+            # 2. Fast Parabolic Rally Bypass (1h के लैग को बाईपास करके 15m ब्रेकआउट पकड़ना)
+            elif trend_15_bull and rsi_15 >= 65 and price > ema20_15:
+                direction = "BUY"
+                trend_score = 25
+                breakdown["TrendNotice"] = "15m Fast Breakout (1h Lag Bypassed)"
+            elif not trend_15_bull and rsi_15 <= 35 and price < ema20_15:
+                direction = "SELL"
+                trend_score = 25
+                breakdown["TrendNotice"] = "15m Fast Breakdown (1h Lag Bypassed)"
+
             else:
-                return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Trend conflict", "breakdown": breakdown}
+                return {
+                    "status": "NO SETUP",
+                    "direction": None,
+                    "score": 0,
+                    "reason": "Trend conflict",
+                    "breakdown": breakdown
+                }
 
             breakdown["Trend"] = trend_score
 
