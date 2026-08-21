@@ -1462,36 +1462,36 @@ class SimpleSignalEngine:
         struct_score = 0
         struct_reasons = []
 
-            if len(c15) >= 2:
-                last = c15[-1]
-                rng = last["high"] - last["low"]
-                if rng > 0:
-                    upper_wick = (last["high"] - max(last["open"], last["close"])) / rng
-                    lower_wick = (min(last["open"], last["close"]) - last["low"]) / rng
-                    if direction == "BUY" and lower_wick > 0.4:
-                        struct_score += 6
-                        struct_reasons.append("RejectionWick")
-                    elif direction == "SELL" and upper_wick > 0.4:
-                        struct_score += 6
-                        struct_reasons.append("RejectionWick")
+        if len(c15) >= 2:
+            last = c15[-1]
+            rng = last["high"] - last["low"]
+            if rng > 0:
+                upper_wick = (last["high"] - max(last["open"], last["close"])) / rng
+                lower_wick = (min(last["open"], last["close"]) - last["low"]) / rng
+                if direction == "BUY" and lower_wick > 0.4:
+                    struct_score += 6
+                    struct_reasons.append("RejectionWick")
+                elif direction == "SELL" and upper_wick > 0.4:
+                    struct_score += 6
+                    struct_reasons.append("RejectionWick")
 
-            bos = self.topology.bos[asset]["direction"]
-            if (direction == "BUY" and bos == "UP") or (direction == "SELL" and bos == "DOWN"):
-                struct_score += 5
-                struct_reasons.append("BOSconfirm")
+        bos = self.topology.bos[asset]["direction"]
+        if (direction == "BUY" and bos == "UP") or (direction == "SELL" and bos == "DOWN"):
+            struct_score += 5
+            struct_reasons.append("BOSconfirm")
 
-            if self.topology.choch[asset]:
-                struct_score += 4
-                struct_reasons.append("CHoCH")
+        if self.topology.choch[asset]:
+            struct_score += 4
+            struct_reasons.append("CHoCH")
 
-            neutral = self.neutral.detect(asset, price, tf=900)
-            if neutral.get("direction") == direction:
-                struct_score += 5
-                struct_reasons.append(neutral.get("pattern", "Neutral"))
+        neutral = self.neutral.detect(asset, price, tf=900)
+        if neutral.get("direction") == direction:
+            struct_score += 5
+            struct_reasons.append(neutral.get("pattern", "Neutral"))
 
-            struct_score = min(struct_score, 15)
-            breakdown["CandleStructure"] = struct_score
-            breakdown["StructDetails"] = " | ".join(struct_reasons) if struct_reasons else "Weak"
+        struct_score = min(struct_score, 15)
+        breakdown["CandleStructure"] = struct_score
+        breakdown["StructDetails"] = " | ".join(struct_reasons) if struct_reasons else "Weak"
 
             # ---- LAYER 4: RISK ----
             risk_score = 0
