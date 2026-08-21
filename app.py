@@ -1293,7 +1293,7 @@ class NeutralCandleEngine:
 # =====================================================================
 # SIMPLE SIGNAL ENGINE (FIXED: 150 candles for EMA)
 # =====================================================================
-class SimpleSignalEngine:
+ class SimpleSignalEngine:
     def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
         self.topology = topology
         self.futures = futures_stream
@@ -1302,60 +1302,48 @@ class SimpleSignalEngine:
         self.multi_oi = MultiExchangeOIFetcher()
 
     def _detect_regime(self, asset: str, price: float, volume: float, c15: list, rsi_15: float, ema20_15: float, atr_15: float) -> dict:
-        """
-        Detects market regime: MOMENTUM, REVERSAL, or RANGE.
-        """
         result = {
             "regime": "RANGE",
             "parabolic": False,
             "overextended": False,
             "vol_expansion": False,
-            "oi_expanding": False
+            "oi_expanding": False,
+            "blowoff_exhaustion": False
         }
         if len(c15) < 20:
             return result
 
-        # 1. Volume Expansion Check (Last 20 candles average)
-        vol_ma = sum(c['volume'] for c in c15[-20:]) / 20
-        result["vol_expansion"] = volume > (vol_ma * getattr(Config, 'VOLUME_EXPANSION_RATIO', 1.5))
+        vol_ma = sum(c['volume'] for c in c15[-20:]) / 20.0
+        result["vol_expansion"] = volume > (vol_ma * getattr(Config, 'VOLUME_EXPANSION_RATIO', 1.3))
 
-        # 2. Distance from EMA20
-        dist_pct = (abs(price - ema20_15) / ema20_15 * 100) if ema20_15 > 0 else 0
-        atr_pct = (atr_15 / price * 100) if price > 0 else 1.0
+        dist_pct = (abs(price - ema20_15) / ema20_15 * 100.0) if ema20_15 > 0 else 0.0
+        atr_pct = (atr_15 / price * 100.0) if price > 0 else 1.0
 
-        # 3. Parabolic Momentum (Breakout continuation)
+        # Parabolic Expansion (Fast Long/Short Run-up)
         result["parabolic"] = (
             result["vol_expansion"] and 
-            (rsi_15 > getattr(Config, 'PARABOLIC_RSI_THRESHOLD', 70) or rsi_15 < (100 - getattr(Config, 'PARABOLIC_RSI_THRESHOLD', 70))) and 
-            dist_pct > atr_pct
+            (rsi_15 >= 58.0 or rsi_15 <= 42.0) and 
+            dist_pct > (0.35 * atr_pct)
         )
 
-        # 4. Overextension (Potential Top/Bottom Reversal)
-        result["overextended"] = (
-            dist_pct > (getattr(Config, 'OVEREXTENSION_ATR_MULT', 2.0) * atr_pct) and 
-            not result["vol_expansion"]
-        )
+        # Overextension (Top/Bottom Reversal Detection)
+        result["overextended"] = dist_pct > (getattr(Config, 'OVEREXTENSION_ATR_MULT', 1.8) * atr_pct)
+        result["blowoff_exhaustion"] = result["overextended"] and not result["vol_expansion"]
 
-        # 5. Multi-Exchange OI Expansion Check
-        oi_data = self.multi_oi.fetch_composite_oi(asset)
-        valid_oi = [v for v in oi_data.values() if v is not None]
-        result["oi_expanding"] = len(valid_oi) >= 2
+        oi_trend = self.futures.get_oi_trend(asset.lower())
+        result["oi_expanding"] = abs(oi_trend) > 0
 
-        # 6. Set Final Regime
-        if result["parabolic"] and result["oi_expanding"]:
-            result["regime"] = "MOMENTUM"
-        elif result["overextended"]:
+        if result["blowoff_exhaustion"]:
             result["regime"] = "REVERSAL"
+        elif result["parabolic"]:
+            result["regime"] = "MOMENTUM"
 
         return result
 
     def evaluate(self, asset: str, price: float, volume: float):
-        """
-        Dual-Mode Evaluation: Parabolic Momentum & Smart Reversals
-        """
         breakdown = {}
         with self.topology.lock:
-            # ---- LAYER 1: TREND ----
+            # ---- LAYER 1: TREND SCORING ----
             c15 = self.topology.get_completed(asset, 900)
             if len(c15) < 60:
                 return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Insufficient 15m data", "breakdown": {}}
@@ -1370,92 +1358,106 @@ class SimpleSignalEngine:
             ema50_15 = self.topology._ema(closes_15, 50)[-1] if len(closes_15) >= 50 else None
             ema20_1h = self.topology._ema(closes_1h, 20)[-1] if len(closes_1h) >= 20 else None
             ema50_1h = self.topology._ema(closes_1h, 50)[-1] if len(closes_1h) >= 50 else None
-            rsi_15 = self.topology._calc_rsi(closes_15[-15:]) if len(closes_15) >= 15 else 50
+            rsi_15 = self.topology._calc_rsi(closes_15[-15:]) if len(closes_15) >= 15 else 50.0
             atr_15 = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.01)
 
             if None in (ema20_15, ema50_15, ema20_1h, ema50_1h):
                 return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "EMAs not ready", "breakdown": {}}
 
-            # ATR Noise Filter (Only applied during standard RANGE mode)
+            trend_15_bull = ema20_15 > ema50_15
+            trend_1h_bull = ema20_1h > ema50_1h
+            rsi_bull = rsi_15 > 50.0
+
             regime = self._detect_regime(asset, price, volume, c15, rsi_15, ema20_15, atr_15)
             breakdown["Regime"] = regime["regime"]
 
-            if regime["regime"] == "RANGE" and abs(price - ema20_15) <= (getattr(Config, 'ATR_NOISE_MULTIPLIER', 0.5) * atr_15):
-                return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Chop Zone: Near EMA20", "breakdown": breakdown}
-
-            trend_15_bull = ema20_15 > ema50_15
-            trend_1h_bull = ema20_1h > ema50_1h
-            rsi_bull = rsi_15 > 50
-
-            # 1. दोनों Timeframes (15m + 1h) का पूरा मैच
-            if trend_15_bull and trend_1h_bull and rsi_bull:
-                direction = "BUY"
-                trend_score = 30
-            elif not trend_15_bull and not trend_1h_bull and not rsi_bull:
-                direction = "SELL"
-                trend_score = 30
-
-            # 2. Fast Parabolic Rally Bypass (1h के लैग को बाईपास करके 15m ब्रेकआउट पकड़ना)
-            elif trend_15_bull and rsi_15 >= 65 and price > ema20_15:
-                direction = "BUY"
-                trend_score = 25
-                breakdown["TrendNotice"] = "15m Fast Breakout (1h Lag Bypassed)"
-            elif not trend_15_bull and rsi_15 <= 35 and price < ema20_15:
-                direction = "SELL"
-                trend_score = 25
-                breakdown["TrendNotice"] = "15m Fast Breakdown (1h Lag Bypassed)"
-
-            else:
-                return {
-                    "status": "NO SETUP",
-                    "direction": None,
-                    "score": 0,
-                    "reason": "Trend conflict",
-                    "breakdown": breakdown
-                }
-
-            breakdown["Trend"] = trend_score
-
-            # ---- LAYER 2: REGIME-AWARE LOCATION ----
-            loc_score = 0
-            loc_reasons = []
             sr = self.topology.support_resistance[asset]
             nearest_support = max(sr["support"]) if sr["support"] else None
             nearest_resistance = min(sr["resistance"]) if sr["resistance"] else None
-            dist_from_ema = (abs(price - ema20_15) / ema20_15 * 100) if ema20_15 > 0 else 0
-            atr_pct = (atr_15 / price * 100) if price > 0 else 1.0
+
+            direction = None
+            trend_score = 0
+
+            # 1. Reversal Direction (Top Resistance / Bottom Support)
+            if regime["regime"] == "REVERSAL":
+                if nearest_resistance and abs(price - nearest_resistance) <= 1.5 * atr_15 and rsi_15 >= 68.0:
+                    direction = "SELL"
+                    trend_score = 28
+                    breakdown["TrendNotice"] = "🔄 Top Reversal Setup"
+                elif nearest_support and abs(price - nearest_support) <= 1.5 * atr_15 and rsi_15 <= 32.0:
+                    direction = "BUY"
+                    trend_score = 28
+                    breakdown["TrendNotice"] = "🔄 Bottom Reversal Setup"
+
+            # 2. Multi-Timeframe Alignment
+            if not direction:
+                if trend_15_bull and trend_1h_bull and rsi_bull:
+                    direction = "BUY"
+                    trend_score = 30
+                elif not trend_15_bull and not trend_1h_bull and not rsi_bull:
+                    direction = "SELL"
+                    trend_score = 30
+
+            # 3. Parabolic Fast Momentum Continuation
+            if not direction:
+                if trend_15_bull and rsi_15 >= 58.0 and price > ema20_15:
+                    direction = "BUY"
+                    trend_score = 26
+                    breakdown["TrendNotice"] = "🚀 15m Momentum Breakout"
+                elif not trend_15_bull and rsi_15 <= 42.0 and price < ema20_15:
+                    direction = "SELL"
+                    trend_score = 26
+                    breakdown["TrendNotice"] = "🚀 15m Momentum Breakdown"
+                else:
+                    return {
+                        "status": "NO SETUP",
+                        "direction": None,
+                        "score": 0,
+                        "reason": "Trend conflict",
+                        "breakdown": breakdown
+                    }
+
+            breakdown["Trend"] = trend_score
+
+            # ---- LAYER 2: LOCATION SCORING ----
+            loc_score = 0
+            loc_reasons = []
+            dist_from_ema = (abs(price - ema20_15) / ema20_15 * 100.0) if ema20_15 > 0 else 0.0
+            atr_pct = (atr_15 / price * 100.0) if price > 0 else 1.0
 
             if regime["regime"] == "MOMENTUM":
-                if dist_from_ema > atr_pct:
-                    loc_score = 20
-                    loc_reasons.append("ParabolicBreakout")
+                if dist_from_ema > (0.6 * atr_pct):
+                    loc_score = 22
+                    loc_reasons.append("ParabolicExpansion")
                 else:
-                    loc_score = 15
-                    loc_reasons.append("MomentumExpansion")
+                    loc_score = 16
+                    loc_reasons.append("BreakoutInitiation")
                 if regime["oi_expanding"]:
-                    loc_score = min(loc_score + 5, 25)
+                    loc_score = min(loc_score + 3, 25)
                     loc_reasons.append("OI-Aligned")
+
             elif regime["regime"] == "REVERSAL":
                 reversal_confirmed = False
-                if direction == "SELL" and nearest_resistance and abs(price - nearest_resistance) <= 1.5 * atr_15:
+                if direction == "SELL" and nearest_resistance:
                     if len(c15) >= 1:
                         last = c15[-1]
                         rng = last["high"] - last["low"]
-                        if rng > 0 and ((last["high"] - max(last["open"], last["close"])) / rng) > 0.4:
+                        if rng > 0 and ((last["high"] - max(last["open"], last["close"])) / rng) > 0.35:
                             loc_score = 25
-                            loc_reasons.append("BlowOffTopRejection")
+                            loc_reasons.append("TopPinbarRejection")
                             reversal_confirmed = True
-                elif direction == "BUY" and nearest_support and abs(price - nearest_support) <= 1.5 * atr_15:
+                elif direction == "BUY" and nearest_support:
                     if len(c15) >= 1:
                         last = c15[-1]
                         rng = last["high"] - last["low"]
-                        if rng > 0 and ((min(last["open"], last["close"]) - last["low"]) / rng) > 0.4:
+                        if rng > 0 and ((min(last["open"], last["close"]) - last["low"]) / rng) > 0.35:
                             loc_score = 25
-                            loc_reasons.append("CapitulationBottomRejection")
+                            loc_reasons.append("BottomPinbarRejection")
                             reversal_confirmed = True
                 if not reversal_confirmed:
-                    loc_score = 5
-                    loc_reasons.append("ReversalPending")
+                    loc_score = 14
+                    loc_reasons.append("ReversalZone")
+
             else:
                 if direction == "BUY" and nearest_support and abs(price - nearest_support) <= 1.5 * atr_15:
                     loc_score += 12
@@ -1463,18 +1465,18 @@ class SimpleSignalEngine:
                 elif direction == "SELL" and nearest_resistance and abs(price - nearest_resistance) <= 1.5 * atr_15:
                     loc_score += 12
                     loc_reasons.append("NearResistance")
-                if direction == "BUY" and price <= ema20_15 * 1.005:
-                    loc_score += 5
+                if direction == "BUY" and price <= ema20_15 * 1.008:
+                    loc_score += 10
                     loc_reasons.append("Near15EMA")
-                elif direction == "SELL" and price >= ema20_15 * 0.995:
-                    loc_score += 5
+                elif direction == "SELL" and price >= ema20_15 * 0.992:
+                    loc_score += 10
                     loc_reasons.append("Near15EMA")
 
             loc_score = min(loc_score, 25)
             breakdown["Location"] = loc_score
             breakdown["LocationDetails"] = " | ".join(loc_reasons) if loc_reasons else "Neutral"
 
-            # ---- LAYER 3: SMART CVD & MULTI-EXCHANGE OI ----
+            # ---- LAYER 3: CONFIRMATION & BONUS MULTI-OI ----
             conf_score = 0
             vol_reasons = []
 
@@ -1487,49 +1489,59 @@ class SimpleSignalEngine:
             prev_price = c15[-2]['close'] if len(c15) >= 2 else price
 
             cvd_score = 0
-            cvd_exhausted = False
+            cvd_divergence = False
+
             if direction == "BUY":
                 if current_cvd > 0:
                     cvd_score = 6
                     vol_reasons.append("CVDSupport")
                 if price > prev_price and current_cvd < prev_cvd:
-                    cvd_exhausted = True
+                    cvd_divergence = True
             elif direction == "SELL":
                 if current_cvd < 0:
                     cvd_score = 6
                     vol_reasons.append("CVDSupport")
                 if price < prev_price and current_cvd > prev_cvd:
-                    cvd_exhausted = True
+                    cvd_divergence = True
 
-            if cvd_exhausted:
+            if cvd_divergence:
                 if regime["regime"] == "MOMENTUM":
-                    # Parabolic Rally: Ignore penalty (Whale limit absorption)
                     cvd_score += 5
-                    vol_reasons.append("CVD-AbsorptionBypass")
+                    vol_reasons.append("LimitAbsorptionBypass")
+                elif regime["regime"] == "REVERSAL":
+                    cvd_score += 6
+                    vol_reasons.append("ReversalCVDDivergence")
                 else:
-                    # True exhaustion at tops/bottoms
-                    cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 20)
-                    vol_reasons.append("CVDExhaustionPenalty")
+                    cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 10)
+                    vol_reasons.append("CVDExhaustion")
 
             if not hasattr(self, '_prev_cvd'):
                 self._prev_cvd = {}
             self._prev_cvd[asset] = current_cvd
 
-            # Multi-Exchange OI
-            oi_data = self.multi_oi.fetch_composite_oi(asset)
-            valid_count = sum(1 for v in oi_data.values() if v is not None)
-            if valid_count == 3:
-                conf_score += 8
-                vol_reasons.append("MultiOI_3xConfirm")
-            elif valid_count == 2:
-                conf_score += 5
-                vol_reasons.append("MultiOI_2xConfirm")
+            # Multi-Exchange OI (Pure Non-Blocking Bonus)
+            oi_bonus = 0
+            try:
+                oi_data = self.multi_oi.fetch_composite_oi(asset)
+                valid_count = sum(1 for v in oi_data.values() if v is not None)
+                if valid_count == 3:
+                    oi_bonus = 6
+                    vol_reasons.append("MultiOI_3x_Bonus(+6)")
+                elif valid_count == 2:
+                    oi_bonus = 3
+                    vol_reasons.append("MultiOI_2x_Bonus(+3)")
+            except Exception:
+                pass
 
-            conf_score = min(conf_score + cvd_score, 20)
+            if regime["oi_expanding"]:
+                conf_score += 4
+                vol_reasons.append("BinanceOI_Confirm")
+
+            conf_score = min(max(conf_score + cvd_score + oi_bonus, 0), 20)
             breakdown["VolumeOrderFlow"] = conf_score
             breakdown["VolFlowDetails"] = " | ".join(vol_reasons) if vol_reasons else "Neutral"
 
-            # Structure Scoring
+            # Structure
             struct_score = 0
             struct_reasons = []
             if self.topology.choch.get(asset, False):
@@ -1544,34 +1556,24 @@ class SimpleSignalEngine:
             breakdown["CandleStructure"] = struct_score
 
             # ---- LAYER 4: RISK ----
-            risk_score = 10 if dist_from_ema < (2.0 * atr_pct) else 4
+            risk_score = 10 if dist_from_ema < (2.8 * atr_pct) else 5
             breakdown["Risk"] = risk_score
 
-            # ---- TOTAL SCORE & TWO-WAY EXECUTION ----
+            # ---- FINAL SCORE CALCULATION ----
             total_score = trend_score + loc_score + conf_score + struct_score + risk_score
             breakdown["Total"] = total_score
             breakdown["Direction"] = direction
 
-            # Dynamic Thresholds based on Regime
-            if regime["regime"] == "MOMENTUM":
-                thresh_extreme, thresh_high, thresh_valid = 65, 55, 45
-            elif regime["regime"] == "REVERSAL":
-                thresh_extreme, thresh_high, thresh_valid = 80, 70, 60
-            else:
-                thresh_extreme, thresh_high, thresh_valid = 75, Config.SCORE_HIGH, Config.SCORE_VALID
-
-            if total_score >= thresh_extreme:
-                status = "EXTREME"
-            elif total_score >= thresh_high:
+            if total_score >= Config.SCORE_HIGH:
                 status = "HIGH"
-            elif total_score >= thresh_valid:
+            elif total_score >= Config.SCORE_VALID:
                 status = "VALID"
             elif total_score >= Config.SCORE_WATCH:
                 status = "WATCH"
             else:
                 status = "REJECTED"
 
-            reason = f"Regime:{regime['regime']} | Trend:{trend_score} | Loc:{loc_score} | V/OF:{conf_score} | C/S:{struct_score} | Risk:{risk_score}"
+            reason = f"Mode:{regime['regime']} | Trend:{trend_score} | Loc:{loc_score} | V/OF:{conf_score} | C/S:{struct_score} | Risk:{risk_score}"
             return {
                 "status": status,
                 "direction": direction,
@@ -1579,7 +1581,7 @@ class SimpleSignalEngine:
                 "reason": reason,
                 "breakdown": breakdown
             }
-            
+           
 # =====================================================================
 # DYNAMIC STOP LOSS (unchanged)
 # =====================================================================
@@ -1653,9 +1655,10 @@ class DynamicStopLoss:
             rr = Config.MIN_RR
 
         return sl, tp, risk, rr
+        return sl, tp, risk, round(rr, 2)
 
 # =====================================================================
-# PENDING VERIFICATION QUEUE (FIXED: store verified signals)
+# PENDING VERIFICATION QUEUE (FIXED: STORE VERIFIED SIGNALS)
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
@@ -1674,7 +1677,7 @@ class PendingVerificationQueue:
             signal_data['candle_count'] = 0
             signal_data['start_price'] = signal_data['entry']
             signal_data['rejected'] = False
-            key = f"{asset}_{signal_data['direction']}_{int(time.time())}"
+            key = f"{asset}_{signal_data['direction']}_{int(time.time()*1000)}"
             self.pending[key] = signal_data
             return key
 
@@ -1688,42 +1691,29 @@ class PendingVerificationQueue:
                 completed = [c for c in self.topology.candles[300][asset] if c.get("complete", False)]
                 if len(completed) < 2:
                     continue
+
                 limit = data.get('pending_candles', Config.PENDING_VERIFICATION_CANDLES)
-                vol_decay = data.get('volume_decay_threshold', Config.VOLUME_DECAY_THRESHOLD)
                 new_candles = completed[-limit:] if len(completed) >= limit else completed
+
                 if len(new_candles) > data['candle_count']:
-                    for c in new_candles[data['candle_count']:]:
-                        data['volumes'].append(c["volume"])
-                        data['candle_count'] += 1
-                    if len(data['volumes']) >= 2 and data['volumes'][-1] < data['volumes'][0] * (1 - vol_decay):
-                        data['rejected'] = True
-                        to_remove.append(key)
-                        continue
-                    first_close = completed[-limit]['close']
+                    first_close = completed[-1]['close']
                     atr = self.topology.get_atr(asset, period=14, tf=300) or (data['start_price'] * 0.005)
-                    max_allowed_adverse = 0.8 * atr
+                    max_allowed_adverse = 1.35 * atr
 
-                    # Directional confirmation (light)
-                    if data['direction'] == 'BUY' and first_close <= data['start_price'] * 0.998:
-                        data['rejected'] = True
-                        to_remove.append(key)
-                    elif data['direction'] == 'SELL' and first_close >= data['start_price'] * 1.002:
-                        data['rejected'] = True
-                        to_remove.append(key)
-
-                    # Adverse move check
+                    # Structural invalidation check (No false 0.2% chop rejections)
                     if data['direction'] == 'BUY' and (data['start_price'] - first_close) > max_allowed_adverse:
                         data['rejected'] = True
-                        to_remove.append(key)
                     elif data['direction'] == 'SELL' and (first_close - data['start_price']) > max_allowed_adverse:
                         data['rejected'] = True
-                        to_remove.append(key)
+
+                    data['candle_count'] += 1
 
                 if data['candle_count'] >= limit:
-                    if not data['rejected']:
+                    if not data.get('rejected', False):
                         # FIX: move to verified list
                         self.verified.append(data)
                     to_remove.append(key)
+
             for key in to_remove:
                 if key in self.pending:
                     del self.pending[key]
