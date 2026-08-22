@@ -588,7 +588,7 @@ class SmartNewsEngine:
         if HAS_GEMINI and self.api_key:
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash",
+                model_name="gemini-2.5-flash",
                 generation_config={"response_mime_type": "application/json"}
             )
         else:
