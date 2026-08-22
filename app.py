@@ -109,7 +109,7 @@ class Config:
     CVD_EXHAUSTION_PENALTY = 20
 
     # ---- News Engine ----
-    NEWS_UPDATE_INTERVAL = 180  # 3 minutes
+    NEWS_UPDATE_INTERVAL = 300  # 3 minutes
 
 # =====================================================================
 # DATA VALIDATION
@@ -588,7 +588,7 @@ class SmartNewsEngine:
         if HAS_GEMINI and self.api_key:
             genai.configure(api_key=self.api_key)
             self.model = genai.GenerativeModel(
-                model_name="gemini-2.5-flash",
+                model_name="gemini-1.5-flash-latest",
                 generation_config={"response_mime_type": "application/json"}
             )
         else:
