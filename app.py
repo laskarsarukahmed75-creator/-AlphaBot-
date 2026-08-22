@@ -1,9 +1,8 @@
 # =====================================================================
-# app.py – AlphaBot v7.6 FINAL (All 4 Critical Fixes)
+# app.py – AlphaBot v7.6 FINAL (Production)
 # =====================================================================
-# 4-Layer Simple Engine with full observation logging
-# EMA window: 150 candles, Pending → Verified → Final Signal
-# 5m verification triggered on 5m candle close
+# एकीकृत पाइपलाइन: SimpleSignalEngine (Multi-TF + Breakout + Momentum + Volume Profile)
+# + SmartNewsEngine (Gemini AI + Multi-Source News) + Live Dashboard
 # =====================================================================
 
 import math
@@ -19,17 +18,15 @@ import sqlite3
 import gc
 import html
 import urllib.parse
+import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import websocket
-from multi_oi_fetcher import MultiExchangeOIFetcher
-from volume_profile import VolumeProfileEngine
-from backtester import BacktestingEngine
-from mongo_db import MongoDatabaseHandler
 
+# ---- Optional imports with fallback ----
 try:
     import psutil
     HAS_PSUTIL = True
@@ -42,9 +39,31 @@ try:
 except ImportError:
     HAS_PYMONGO = False
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AlphaBot-v7.6-Final")
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
 
+try:
+    from multi_oi_fetcher import MultiExchangeOIFetcher
+    HAS_MULTI_OI = True
+except ImportError:
+    HAS_MULTI_OI = False
+
+try:
+    from volume_profile import VolumeProfileEngine
+    HAS_VOLUME_PROFILE = True
+except ImportError:
+    HAS_VOLUME_PROFILE = False
+
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("AlphaBot-v7.6-Production")
+
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -62,6 +81,7 @@ class Config:
     SESSION_WINDOWS = [("ALWAYS", 0, 0, 23, 59)]
     DEAD_ZONES = []
 
+    # ---- Score thresholds ----
     SCORE_REJECT = 45
     SCORE_WATCH = 45
     SCORE_VALID = 50
@@ -72,7 +92,7 @@ class Config:
     MAX_SIGNALS_PER_DAY = 20
     ASSET_COOLDOWN_HOURS = 0
 
-    PENDING_VERIFICATION_CANDLES = 1  # 1 candle = 5m
+    PENDING_VERIFICATION_CANDLES = 1
     VOLUME_DECAY_THRESHOLD = 0.5
     MAX_HOLD_TIME = 14400
     TIME_DECAY_SECONDS = 3600
@@ -88,8 +108,11 @@ class Config:
     ATR_NOISE_MULTIPLIER = 0.5
     CVD_EXHAUSTION_PENALTY = 20
 
+    # ---- News Engine ----
+    NEWS_UPDATE_INTERVAL = 180  # 3 minutes
+
 # =====================================================================
-# DATA VALIDATION (unchanged)
+# DATA VALIDATION
 # =====================================================================
 class DataValidator:
     @staticmethod
@@ -123,7 +146,7 @@ class DataValidator:
             return False
 
 # =====================================================================
-# DATABASE LAYERS (MongoDB + SQLite) – same as app(14).py
+# DATABASE LAYERS (MongoDB + SQLite)
 # =====================================================================
 class MongoDatabase:
     def __init__(self):
@@ -444,7 +467,7 @@ class TradeDatabase:
             return []
 
 # =====================================================================
-# PERSISTENT MEMORY (unchanged)
+# PERSISTENT MEMORY ENGINE
 # =====================================================================
 class PersistentMemoryEngine:
     def __init__(self, mongo_db, sqlite_db):
@@ -541,44 +564,244 @@ class PersistentMemoryEngine:
             self._save_to_sqlite(self.cache)
 
 # =====================================================================
-# NEWS SCANNER (unchanged)
+# SMART NEWS ENGINE (Google Gemini + Multi-Source)
 # =====================================================================
-class CryptoNewsScanner:
+class SmartNewsEngine:
     def __init__(self):
-        self.last_news = {}
+        self.cache = {
+            "headlines": [],
+            "score": 0,
+            "impact": "NEUTRAL",
+            "reasoning": "Awaiting initial Gemini cycle",
+            "block_shorts": False,
+            "block_longs": False,
+            "sentiment_trend": "NEUTRAL",
+            "last_update": 0,
+        }
+        self.lock = threading.Lock()
         self.fear_greed = 50
+        self.update_interval = Config.NEWS_UPDATE_INTERVAL
+        self.prev_score = 0
 
-    def fetch_latest(self):
+        # ---- Google Gemini Setup ----
+        self.api_key = os.getenv("GEMINI_API_KEY", "")
+        if HAS_GEMINI and self.api_key:
+            genai.configure(api_key=self.api_key)
+            self.model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash",
+                generation_config={"response_mime_type": "application/json"}
+            )
+        else:
+            self.model = None
+
+        # ---- Background fetcher ----
+        self.running = True
+        threading.Thread(target=self._fetch_loop, daemon=True).start()
+
+    def _fetch_loop(self):
+        while self.running:
+            self._process_news_cycle()
+            time.sleep(self.update_interval)
+
+    def _fetch_headlines(self):
+        items = []
+        # 1. CryptoCompare
         try:
-            resp = requests.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN&limit=3", timeout=5)
-            articles = []
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("Data"):
-                    for article in data["Data"][:2]:
-                        title = article.get("title", "")
-                        sentiment = self._analyze_sentiment(title)
-                        articles.append({"title": title, "sentiment": sentiment})
-                    if articles:
-                        self.last_news = articles[0]
-            fg_resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+            r = requests.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN&limit=10", timeout=5)
+            if r.status_code == 200:
+                for post in r.json().get("Data", [])[:8]:
+                    title = post.get("title", "")
+                    body = post.get("body", "")[:200]
+                    if title:
+                        items.append(f"Title: {title} | Summary: {body}")
+        except Exception:
+            pass
+        # 2. Cointelegraph RSS
+        try:
+            r = requests.get("https://cointelegraph.com/rss", timeout=5)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                for item in root.findall('.//item')[:5]:
+                    title = item.find('title')
+                    desc = item.find('description')
+                    if title is not None and title.text:
+                        summary = desc.text if desc is not None else ""
+                        items.append(f"Title: {title.text} | Summary: {summary[:200]}")
+        except Exception:
+            pass
+        # 3. CoinDesk RSS
+        try:
+            r = requests.get("https://feeds.feedburner.com/CoinDesk", timeout=5)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                for item in root.findall('.//item')[:5]:
+                    title = item.find('title')
+                    desc = item.find('description')
+                    if title is not None and title.text:
+                        summary = desc.text if desc is not None else ""
+                        items.append(f"Title: {title.text} | Summary: {summary[:200]}")
+        except Exception:
+            pass
+        # 4. Decrypt RSS
+        try:
+            r = requests.get("https://decrypt.co/feed", timeout=5)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                for item in root.findall('.//item')[:5]:
+                    title = item.find('title')
+                    desc = item.find('description')
+                    if title is not None and title.text:
+                        summary = desc.text if desc is not None else ""
+                        items.append(f"Title: {title.text} | Summary: {summary[:200]}")
+        except Exception:
+            pass
+        # 5. Bitcoin Magazine RSS
+        try:
+            r = requests.get("https://bitcoinmagazine.com/feed", timeout=5)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                for item in root.findall('.//item')[:5]:
+                    title = item.find('title')
+                    desc = item.find('description')
+                    if title is not None and title.text:
+                        summary = desc.text if desc is not None else ""
+                        items.append(f"Title: {title.text} | Summary: {summary[:200]}")
+        except Exception:
+            pass
+        # Fear & Greed
+        try:
+            fg_resp = requests.get("https://api.alternative.me/fng/?limit=1", timeout=3)
             if fg_resp.status_code == 200:
                 fg_data = fg_resp.json()
                 if fg_data.get("data"):
                     self.fear_greed = int(fg_data["data"][0]["value"])
-            return {"articles": articles, "fresh": True, "fear_greed": self.fear_greed}
         except Exception:
-            return {"articles": [], "fresh": False, "fear_greed": 50}
+            pass
+        return items
 
-    def _analyze_sentiment(self, text):
-        bullish = ["bullish", "breakout", "surge", "buy", "accumulate", "rally", "green", "etf"]
-        bearish = ["bearish", "crash", "dump", "sell", "liquidation", "drop", "red", "sec"]
-        text = text.lower()
-        score = sum(1 for w in bullish if w in text) - sum(1 for w in bearish if w in text)
-        return max(-100, min(100, score * 20))
+    def _analyze_with_gemini(self, items: list) -> dict:
+        if not self.model or not items:
+            return self._simple_heuristic(items)
+
+        prompt = f"""You are an elite quantitative crypto hedge fund analyst with 20 years of experience.
+
+Analyze the following crypto news headlines and summaries:
+
+{json.dumps(items, indent=2)}
+
+Evaluate combined market impact considering:
+- Macro (Fed, inflation, rates)
+- Regulatory (SEC, ETFs, bans, lawsuits)
+- Institutional flows (BlackRock, MicroStrategy, ETFs)
+- On-chain/technical (hacks, upgrades, liquidations)
+
+Apply context and negation correctly:
+- "SEC drops lawsuit" → ULTRA BULLISH
+- "Exchange hack" → BEARISH
+- "No ban" → BULLISH
+- "ETF approved" → BULLISH
+
+Output ONLY valid JSON:
+{{
+  "score": <integer -100 to 100>,
+  "impact": "<MEGA_PUMP|BULLISH|NEUTRAL|BEARISH|CATASTROPHIC_DUMP>",
+  "block_shorts": <true if score >= 70 else false>,
+  "block_longs": <true if score <= -70 else false>,
+  "reasoning": "<max 20 words>"
+}}
+"""
+        try:
+            response = self.model.generate_content(prompt)
+            result = json.loads(response.text)
+            result.setdefault("score", 0)
+            result.setdefault("impact", "NEUTRAL")
+            result.setdefault("block_shorts", False)
+            result.setdefault("block_longs", False)
+            result.setdefault("reasoning", "")
+            return result
+        except Exception as e:
+            logger.error(f"Gemini analysis error: {e}")
+            return self._simple_heuristic(items)
+
+    def _simple_heuristic(self, items):
+        text = " ".join(items).lower()
+        score = 0
+        if any(p in text for p in ["etf approved", "interest rate cut", "strategic reserve", "lawsuit dismissed"]):
+            score = 85
+            impact = "BULLISH"
+        elif any(p in text for p in ["sec lawsuit", "ban crypto", "exchange insolvent", "rate hike"]):
+            score = -85
+            impact = "BEARISH"
+        else:
+            if "hack" in text or "exploit" in text:
+                score = -25
+            elif "partnership" in text or "integration" in text:
+                score = 25
+            impact = "NEUTRAL"
+        return {
+            "score": score,
+            "impact": impact,
+            "block_shorts": score >= 70,
+            "block_longs": score <= -70,
+            "reasoning": "Heuristic fallback"
+        }
+
+    def _process_news_cycle(self):
+        items = self._fetch_headlines()
+        if not items:
+            return
+        headlines = [item.split("|")[0].replace("Title: ", "") for item in items[:5]]
+        result = self._analyze_with_gemini(items)
+        with self.lock:
+            self.cache["headlines"] = headlines
+            self.cache["score"] = result.get("score", 0)
+            self.cache["impact"] = result.get("impact", "NEUTRAL")
+            self.cache["reasoning"] = result.get("reasoning", "")
+            self.cache["block_shorts"] = result.get("block_shorts", False)
+            self.cache["block_longs"] = result.get("block_longs", False)
+            self.cache["last_update"] = int(time.time())
+            if self.cache["score"] > self.prev_score + 15:
+                self.cache["sentiment_trend"] = "BULLISH"
+            elif self.cache["score"] < self.prev_score - 15:
+                self.cache["sentiment_trend"] = "BEARISH"
+            else:
+                self.cache["sentiment_trend"] = "NEUTRAL"
+            self.prev_score = self.cache["score"]
+
+    def get_news_score(self):
+        with self.lock:
+            data = dict(self.cache)
+            data["fear_greed"] = self.fear_greed
+            return data
+
+    def get_signal_bonus(self, direction: str):
+        data = self.get_news_score()
+        score = data["score"]
+        bonus = 0
+        block = False
+        if score >= 70:
+            if direction == "BUY":
+                bonus = 20
+            else:
+                block = data["block_shorts"]
+        elif score <= -70:
+            if direction == "SELL":
+                bonus = 20
+            else:
+                block = data["block_longs"]
+        elif 30 <= score < 70:
+            if direction == "BUY":
+                bonus = 12
+        elif -70 < score <= -30:
+            if direction == "SELL":
+                bonus = 12
+        return bonus, block
+
+    def stop(self):
+        self.running = False
 
 # =====================================================================
-# WEBSOCKET STREAMS (same as app(14).py)
+# WEBSOCKET STREAMS (same as before)
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, on_data=None):
@@ -838,7 +1061,7 @@ class BinancePublicStream:
                 logger.error(f"REST fallback error: {e}")
 
 # =====================================================================
-# CANDLE TOPOLOGY ENGINE (per-timeframe close flags) – FIXED
+# CANDLE TOPOLOGY ENGINE (per-timeframe close flags)
 # =====================================================================
 class CandleTopologyEngine:
     def __init__(self):
@@ -849,7 +1072,6 @@ class CandleTopologyEngine:
         self.choch = {asset: False for asset in Config.ASSETS}
         self.support_resistance = {asset: {"support": [], "resistance": []} for asset in Config.ASSETS}
         self.last_tick_time = {asset: 0 for asset in Config.ASSETS}
-        # ---- per-timeframe close flags ----
         self.candle_just_closed = {tf: {asset: False for asset in Config.ASSETS} for tf in [60, 300, 900, 3600, 14400]}
         self.history = {asset: deque(maxlen=200) for asset in Config.ASSETS}
         self.volume_ma = {asset: 0.0 for asset in Config.ASSETS}
@@ -861,11 +1083,9 @@ class CandleTopologyEngine:
         with self.lock:
             now = int(time.time())
             self.history[asset].append({"price": price, "volume": volume, "time": now})
-            # Reset close flags for all timeframes for this asset
             for tf in self.candle_just_closed:
                 self.candle_just_closed[tf][asset] = False
 
-            # Process each timeframe
             for timeframe in [60, 300, 900, 3600, 14400]:
                 storage = self.candles[timeframe][asset]
                 start = (now // timeframe) * timeframe
@@ -873,7 +1093,6 @@ class CandleTopologyEngine:
                     if storage and not storage[-1].get("complete", False):
                         storage[-1]["complete"] = True
                         self.candle_just_closed[timeframe][asset] = True
-                    # New candle
                     candle = {
                         "timestamp": start, "open": price, "high": price, "low": price,
                         "close": price, "volume": volume, "complete": False
@@ -895,7 +1114,7 @@ class CandleTopologyEngine:
             self._detect_bos_choch(asset)
             self.last_tick_time[asset] = now
 
-    # ---- remaining methods unchanged from app(14).py ----
+    # ---- remaining methods unchanged ----
     def _detect_high_volume_anchor(self, asset, candle):
         vol_ma = self.volume_ma.get(asset, 0)
         if vol_ma == 0:
@@ -1162,7 +1381,7 @@ class CandleTopologyEngine:
         return 100 - (100 / (1 + rs))
 
 # =====================================================================
-# INDICATOR CACHE (unchanged)
+# INDICATOR CACHE
 # =====================================================================
 class IndicatorCache:
     def __init__(self, topology):
@@ -1215,7 +1434,7 @@ class IndicatorCache:
             return {}
 
 # =====================================================================
-# NEUTRAL CANDLE ENGINE (unchanged)
+# NEUTRAL CANDLE ENGINE
 # =====================================================================
 class NeutralCandleEngine:
     def __init__(self, topology):
@@ -1294,7 +1513,7 @@ class NeutralCandleEngine:
             }
 
 # =====================================================================
-# SIMPLE SIGNAL ENGINE (FIXED: 150 candles for EMA)
+# SIMPLE SIGNAL ENGINE (Advanced – Multi-TF + Breakout + Momentum + Volume Profile)
 # =====================================================================
 class SimpleSignalEngine:
     def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
@@ -1302,249 +1521,244 @@ class SimpleSignalEngine:
         self.futures = futures_stream
         self.absorption = absorption_meter
         self.neutral = neutral_engine
-        self.multi_oi = MultiExchangeOIFetcher()
+        # ---- Volume Profile Engine ----
+        if HAS_VOLUME_PROFILE:
+            self.vp_engine = VolumeProfileEngine()
+        else:
+            self.vp_engine = None
+        # ---- Multi-Exchange OI ----
+        if HAS_MULTI_OI:
+            self.multi_oi = MultiExchangeOIFetcher()
+        else:
+            self.multi_oi = None
+        # ---- News Engine ----
+        self.news_engine = SmartNewsEngine()
 
-    def _detect_regime(self, asset: str, price: float, volume: float, c15: list, rsi_15: float, ema20_15: float, atr_15: float) -> dict:
-        result = {
-            "regime": "RANGE",
-            "parabolic": False,
-            "overextended": False,
-            "vol_expansion": False,
-            "oi_expanding": False,
-            "blowoff_exhaustion": False
-        }
+    def _detect_regime(self, asset, price, volume, c15, rsi_15, ema20_15, ema50_15, atr_15):
         if len(c15) < 20:
-            return result
-
+            return "RANGE"
         vol_ma = sum(c['volume'] for c in c15[-20:]) / 20.0
-        result["vol_expansion"] = volume > (vol_ma * getattr(Config, 'VOLUME_EXPANSION_RATIO', 1.3))
-
-        dist_pct = (abs(price - ema20_15) / ema20_15 * 100.0) if ema20_15 > 0 else 0.0
-        atr_pct = (atr_15 / price * 100.0) if price > 0 else 1.0
-
-        # Parabolic Expansion (Fast Long/Short Run-up)
-        result["parabolic"] = (
-            result["vol_expansion"] and 
-            (rsi_15 >= 58.0 or rsi_15 <= 42.0) and 
-            dist_pct > (0.35 * atr_pct)
-        )
-
-        # Overextension (Top/Bottom Reversal Detection)
-        result["overextended"] = dist_pct > (getattr(Config, 'OVEREXTENSION_ATR_MULT', 1.8) * atr_pct)
-        result["blowoff_exhaustion"] = result["overextended"] and not result["vol_expansion"]
-
-        oi_trend = self.futures.get_oi_trend(asset.lower())
-        result["oi_expanding"] = abs(oi_trend) > 0
-
-        if result["blowoff_exhaustion"]:
-            result["regime"] = "REVERSAL"
-        elif result["parabolic"]:
-            result["regime"] = "MOMENTUM"
-
-        return result
+        vol_spike = volume > (vol_ma * 1.5)
+        high_20 = max(c['high'] for c in c15[-20:])
+        low_20 = min(c['low'] for c in c15[-20:])
+        range_20 = high_20 - low_20
+        if range_20 == 0:
+            return "RANGE"
+        price_above_range = price > high_20
+        price_below_range = price < low_20
+        if price_above_range and vol_spike:
+            return "BREAKOUT_UP"
+        elif price_below_range and vol_spike:
+            return "BREAKOUT_DOWN"
+        adx = self.topology.get_adx(asset, 900)
+        if adx > 30 and (rsi_15 > 60 or rsi_15 < 40):
+            return "MOMENTUM"
+        if abs(price - ema50_15) / atr_15 > 2.5:
+            return "REVERSAL"
+        return "RANGE"
 
     def evaluate(self, asset: str, price: float, volume: float):
         breakdown = {}
         with self.topology.lock:
-            # ---- LAYER 1: TREND SCORING ----
+            # ---- Data ----
             c15 = self.topology.get_completed(asset, 900)
             if len(c15) < 60:
                 return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Insufficient 15m data", "breakdown": {}}
             c1h = self.topology.get_completed(asset, 3600)
             if len(c1h) < 60:
                 return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Insufficient 1h data", "breakdown": {}}
+            c4h = self.topology.get_completed(asset, 14400)
+            if len(c4h) < 20:
+                c4h = c1h  # fallback
 
             closes_15 = [c['close'] for c in c15[-150:]]
             closes_1h = [c['close'] for c in c1h[-150:]]
+            closes_4h = [c['close'] for c in c4h[-150:]]
 
-            ema20_15 = self.topology._ema(closes_15, 20)[-1] if len(closes_15) >= 20 else None
-            ema50_15 = self.topology._ema(closes_15, 50)[-1] if len(closes_15) >= 50 else None
-            ema20_1h = self.topology._ema(closes_1h, 20)[-1] if len(closes_1h) >= 20 else None
-            ema50_1h = self.topology._ema(closes_1h, 50)[-1] if len(closes_1h) >= 50 else None
-            rsi_15 = self.topology._calc_rsi(closes_15[-15:]) if len(closes_15) >= 15 else 50.0
-            atr_15 = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.01)
+            ema20_15 = self.topology._ema(closes_15, 20)[-1] if len(closes_15)>=20 else None
+            ema50_15 = self.topology._ema(closes_15, 50)[-1] if len(closes_15)>=50 else None
+            ema150_15 = self.topology._ema(closes_15, 150)[-1] if len(closes_15)>=150 else None
+            ema20_1h = self.topology._ema(closes_1h, 20)[-1] if len(closes_1h)>=20 else None
+            ema50_1h = self.topology._ema(closes_1h, 50)[-1] if len(closes_1h)>=50 else None
+            ema150_1h = self.topology._ema(closes_1h, 150)[-1] if len(closes_1h)>=150 else None
+            ema20_4h = self.topology._ema(closes_4h, 20)[-1] if len(closes_4h)>=20 else None
+            ema50_4h = self.topology._ema(closes_4h, 50)[-1] if len(closes_4h)>=50 else None
+            ema150_4h = self.topology._ema(closes_4h, 150)[-1] if len(closes_4h)>=150 else None
 
-            if None in (ema20_15, ema50_15, ema20_1h, ema50_1h):
+            if None in (ema20_15, ema50_15, ema20_1h, ema50_1h, ema20_4h, ema50_4h):
                 return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "EMAs not ready", "breakdown": {}}
 
-            trend_15_bull = ema20_15 > ema50_15
-            trend_1h_bull = ema20_1h > ema50_1h
-            rsi_bull = rsi_15 > 50.0
+            rsi_15 = self.topology._calc_rsi(closes_15[-15:]) if len(closes_15)>=15 else 50
+            atr_15 = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.01)
+            atr_1h = self.topology.get_atr(asset, period=14, tf=3600) or (price * 0.01)
 
-            regime = self._detect_regime(asset, price, volume, c15, rsi_15, ema20_15, atr_15)
-            breakdown["Regime"] = regime["regime"]
+            # ---- Trend ----
+            bull_15 = ema20_15 > ema50_15
+            bull_1h = ema20_1h > ema50_1h
+            bull_4h = ema20_4h > ema50_4h
+            strong_bull = bull_15 and bull_1h and bull_4h and (ema20_15 > ema150_15 if ema150_15 else True) and (ema20_1h > ema150_1h if ema150_1h else True) and (ema20_4h > ema150_4h if ema150_4h else True)
 
+            direction = None
+            trend_score = 0
+            regime = self._detect_regime(asset, price, volume, c15, rsi_15, ema20_15, ema50_15, atr_15)
+            breakdown["Regime"] = regime
+
+            if regime in ("BREAKOUT_UP", "BREAKOUT_DOWN"):
+                if regime == "BREAKOUT_UP" and rsi_15 > 55:
+                    direction = "BUY"
+                    trend_score = 28
+                elif regime == "BREAKOUT_DOWN" and rsi_15 < 45:
+                    direction = "SELL"
+                    trend_score = 28
+                else:
+                    return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Breakout without momentum", "breakdown": {}}
+            elif regime == "MOMENTUM":
+                if bull_15 and bull_1h and rsi_15 > 55:
+                    direction = "BUY"
+                    trend_score = 30
+                elif (not bull_15) and (not bull_1h) and rsi_15 < 45:
+                    direction = "SELL"
+                    trend_score = 30
+                else:
+                    return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "Momentum weak", "breakdown": {}}
+            elif regime == "REVERSAL":
+                sr = self.topology.support_resistance[asset]
+                nearest_support = max(sr["support"]) if sr["support"] else None
+                nearest_resistance = min(sr["resistance"]) if sr["resistance"] else None
+                if nearest_support and abs(price - nearest_support) <= 1.2 * atr_1h and self.topology.check_1m_rejection(asset, "BUY"):
+                    direction = "BUY"
+                    trend_score = 25
+                elif nearest_resistance and abs(price - nearest_resistance) <= 1.2 * atr_1h and self.topology.check_1m_rejection(asset, "SELL"):
+                    direction = "SELL"
+                    trend_score = 25
+                if not direction:
+                    return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "No reversal confirmation", "breakdown": {}}
+            else:  # RANGE
+                if strong_bull and rsi_15 > 50:
+                    direction = "BUY"
+                    trend_score = 28
+                elif (not bull_15) and (not bull_1h) and rsi_15 < 50:
+                    direction = "SELL"
+                    trend_score = 28
+                else:
+                    return {"status": "NO SETUP", "direction": None, "score": 0, "reason": "No clear trend", "breakdown": {}}
+
+            breakdown["Trend"] = trend_score
+            breakdown["Direction"] = direction
+
+            # ---- Location ----
+            loc_score = 0
+            loc_reasons = []
             sr = self.topology.support_resistance[asset]
             nearest_support = max(sr["support"]) if sr["support"] else None
             nearest_resistance = min(sr["resistance"]) if sr["resistance"] else None
 
-            direction = None
-            trend_score = 0
+            if self.vp_engine is not None:
+                try:
+                    vp_data = self.vp_engine.calculate_profile(c15[-40:])
+                    vp_pts, vp_label = self.vp_engine.score_retest(price, vp_data, direction)
+                    if vp_pts > 0:
+                        loc_score += vp_pts
+                        loc_reasons.append(f"VP_{vp_label}")
+                except Exception:
+                    pass
 
-            # 1. Reversal Direction (Top Resistance / Bottom Support)
-            if regime["regime"] == "REVERSAL":
-                if nearest_resistance and abs(price - nearest_resistance) <= 1.5 * atr_15 and rsi_15 >= 68.0:
-                    direction = "SELL"
-                    trend_score = 28
-                    breakdown["TrendNotice"] = "🔄 Top Reversal Setup"
-                elif nearest_support and abs(price - nearest_support) <= 1.5 * atr_15 and rsi_15 <= 32.0:
-                    direction = "BUY"
-                    trend_score = 28
-                    breakdown["TrendNotice"] = "🔄 Bottom Reversal Setup"
-
-            # 2. Multi-Timeframe Alignment
-            if not direction:
-                if trend_15_bull and trend_1h_bull and rsi_bull:
-                    direction = "BUY"
-                    trend_score = 30
-                elif not trend_15_bull and not trend_1h_bull and not rsi_bull:
-                    direction = "SELL"
-                    trend_score = 30
-
-            # 3. Parabolic Fast Momentum Continuation
-            if not direction:
-                if trend_15_bull and rsi_15 >= 58.0 and price > ema20_15:
-                    direction = "BUY"
-                    trend_score = 26
-                    breakdown["TrendNotice"] = "🚀 15m Momentum Breakout"
-                elif not trend_15_bull and rsi_15 <= 42.0 and price < ema20_15:
-                    direction = "SELL"
-                    trend_score = 26
-                    breakdown["TrendNotice"] = "🚀 15m Momentum Breakdown"
-                else:
-                    return {
-                        "status": "NO SETUP",
-                        "direction": None,
-                        "score": 0,
-                        "reason": "Trend conflict",
-                        "breakdown": breakdown
-                    }
-
-            breakdown["Trend"] = trend_score
-
-            # ---- LAYER 2: LOCATION SCORING ----
-            loc_score = 0
-            loc_reasons = []
-            dist_from_ema = (abs(price - ema20_15) / ema20_15 * 100.0) if ema20_15 > 0 else 0.0
-            atr_pct = (atr_15 / price * 100.0) if price > 0 else 1.0
-
-            if regime["regime"] == "MOMENTUM":
-                if dist_from_ema > (0.6 * atr_pct):
-                    loc_score = 22
-                    loc_reasons.append("ParabolicExpansion")
-                else:
-                    loc_score = 16
-                    loc_reasons.append("BreakoutInitiation")
-                if regime["oi_expanding"]:
-                    loc_score = min(loc_score + 3, 25)
-                    loc_reasons.append("OI-Aligned")
-
-            elif regime["regime"] == "REVERSAL":
-                reversal_confirmed = False
-                if direction == "SELL" and nearest_resistance:
-                    if len(c15) >= 1:
-                        last = c15[-1]
-                        rng = last["high"] - last["low"]
-                        if rng > 0 and ((last["high"] - max(last["open"], last["close"])) / rng) > 0.35:
-                            loc_score = 25
-                            loc_reasons.append("TopPinbarRejection")
-                            reversal_confirmed = True
-                elif direction == "BUY" and nearest_support:
-                    if len(c15) >= 1:
-                        last = c15[-1]
-                        rng = last["high"] - last["low"]
-                        if rng > 0 and ((min(last["open"], last["close"]) - last["low"]) / rng) > 0.35:
-                            loc_score = 25
-                            loc_reasons.append("BottomPinbarRejection")
-                            reversal_confirmed = True
-                if not reversal_confirmed:
-                    loc_score = 14
-                    loc_reasons.append("ReversalZone")
-
-            else:
-                if direction == "BUY" and nearest_support and abs(price - nearest_support) <= 1.5 * atr_15:
+            if direction == "BUY":
+                if nearest_support and abs(price - nearest_support) <= 1.5 * atr_15:
                     loc_score += 12
                     loc_reasons.append("NearSupport")
-                elif direction == "SELL" and nearest_resistance and abs(price - nearest_resistance) <= 1.5 * atr_15:
+                if price <= ema20_15 * 1.01:
+                    loc_score += 8
+                    loc_reasons.append("PullbackToEMA")
+                if regime in ("BREAKOUT_UP", "MOMENTUM") and price > ema20_15 and price <= ema20_15*1.02:
+                    loc_score += 5
+                    loc_reasons.append("BreakoutRetest")
+                anchor_ok, _ = self.topology.check_anchor_line_retest(asset, price, direction)
+                if anchor_ok:
+                    loc_score += 5
+                    loc_reasons.append("AnchorRetest")
+            else:
+                if nearest_resistance and abs(price - nearest_resistance) <= 1.5 * atr_15:
                     loc_score += 12
                     loc_reasons.append("NearResistance")
-                if direction == "BUY" and price <= ema20_15 * 1.008:
-                    loc_score += 10
-                    loc_reasons.append("Near15EMA")
-                elif direction == "SELL" and price >= ema20_15 * 0.992:
-                    loc_score += 10
-                    loc_reasons.append("Near15EMA")
+                if price >= ema20_15 * 0.99:
+                    loc_score += 8
+                    loc_reasons.append("PullbackToEMA")
+                if regime in ("BREAKOUT_DOWN", "MOMENTUM") and price < ema20_15 and price >= ema20_15*0.98:
+                    loc_score += 5
+                    loc_reasons.append("BreakoutRetest")
+                anchor_ok, _ = self.topology.check_anchor_line_retest(asset, price, direction)
+                if anchor_ok:
+                    loc_score += 5
+                    loc_reasons.append("AnchorRetest")
 
             loc_score = min(loc_score, 25)
             breakdown["Location"] = loc_score
             breakdown["LocationDetails"] = " | ".join(loc_reasons) if loc_reasons else "Neutral"
 
-            # ---- LAYER 3: CONFIRMATION & BONUS MULTI-OI ----
+            # ---- Confirmation ----
             conf_score = 0
-            vol_reasons = []
-
-            if regime["vol_expansion"]:
+            conf_reasons = []
+            vol_ma = self.topology.volume_ma.get(asset, 0)
+            vol_ratio = volume / vol_ma if vol_ma > 0 else 1.0
+            if vol_ratio > 1.8:
                 conf_score += 8
-                vol_reasons.append("HighVolume")
+                conf_reasons.append("VeryHighVol")
+            elif vol_ratio > 1.2:
+                conf_score += 5
+                conf_reasons.append("HighVol")
 
-            current_cvd = self.futures.get_cvd(asset.lower())
-            prev_cvd = getattr(self, '_prev_cvd', {}).get(asset, current_cvd)
-            prev_price = c15[-2]['close'] if len(c15) >= 2 else price
-
+            cvd = self.futures.get_cvd(asset.lower())
             cvd_score = 0
             cvd_divergence = False
-
+            prev_price = c15[-2]['close'] if len(c15) >= 2 else price
             if direction == "BUY":
-                if current_cvd > 0:
+                if cvd > 0:
                     cvd_score = 6
-                    vol_reasons.append("CVDSupport")
-                if price > prev_price and current_cvd < prev_cvd:
+                    conf_reasons.append("CVDsupport")
+                if price > prev_price and cvd < 0:
                     cvd_divergence = True
-            elif direction == "SELL":
-                if current_cvd < 0:
+            else:
+                if cvd < 0:
                     cvd_score = 6
-                    vol_reasons.append("CVDSupport")
-                if price < prev_price and current_cvd > prev_cvd:
+                    conf_reasons.append("CVDsupport")
+                if price < prev_price and cvd > 0:
                     cvd_divergence = True
 
             if cvd_divergence:
-                if regime["regime"] == "MOMENTUM":
+                if regime in ("MOMENTUM", "BREAKOUT_UP", "BREAKOUT_DOWN"):
                     cvd_score += 5
-                    vol_reasons.append("LimitAbsorptionBypass")
-                elif regime["regime"] == "REVERSAL":
+                    conf_reasons.append("LimitAbsorptionBypass(+5)")
+                elif regime == "REVERSAL":
                     cvd_score += 6
-                    vol_reasons.append("ReversalCVDDivergence")
+                    conf_reasons.append("ReversalCVDDivergence(+6)")
                 else:
-                    cvd_score -= getattr(Config, 'CVD_EXHAUSTION_PENALTY', 10)
-                    vol_reasons.append("CVDExhaustion")
+                    cvd_score -= 4
+                    conf_reasons.append("CVDExhaustion(-4)")
 
-            if not hasattr(self, '_prev_cvd'):
-                self._prev_cvd = {}
-            self._prev_cvd[asset] = current_cvd
+            oi_trend = self.futures.get_oi_trend(asset.lower())
+            if (direction == "BUY" and oi_trend > 0) or (direction == "SELL" and oi_trend < 0):
+                conf_score += 6
+                conf_reasons.append("OIsupport")
 
-            # Multi-Exchange OI (Pure Non-Blocking Bonus)
-            oi_bonus = 0
-            try:
-                oi_data = self.multi_oi.fetch_composite_oi(asset)
-                valid_count = sum(1 for v in oi_data.values() if v is not None)
-                if valid_count == 3:
-                    oi_bonus = 6
-                    vol_reasons.append("MultiOI_3x_Bonus(+6)")
-                elif valid_count == 2:
-                    oi_bonus = 3
-                    vol_reasons.append("MultiOI_2x_Bonus(+3)")
-            except Exception:
-                pass
+            if self.multi_oi is not None:
+                try:
+                    oi_data = self.multi_oi.fetch_composite_oi(asset)
+                    valid_count = sum(1 for v in oi_data.values() if v is not None)
+                    if valid_count == 3:
+                        conf_score += 6
+                        conf_reasons.append("MultiOI_3x(+6)")
+                    elif valid_count == 2:
+                        conf_score += 3
+                        conf_reasons.append("MultiOI_2x(+3)")
+                except Exception:
+                    pass
 
-            if regime["oi_expanding"]:
-                conf_score += 4
-                vol_reasons.append("BinanceOI_Confirm")
-
-            conf_score = min(max(conf_score + cvd_score + oi_bonus, 0), 20)
+            conf_score = min(max(conf_score + cvd_score, 0), 20)
             breakdown["VolumeOrderFlow"] = conf_score
-            breakdown["VolFlowDetails"] = " | ".join(vol_reasons) if vol_reasons else "Neutral"
+            breakdown["VolFlowDetails"] = " | ".join(conf_reasons) if conf_reasons else "Neutral"
 
-            # Structure
+            # ---- Structure ----
             struct_score = 0
             struct_reasons = []
             if self.topology.choch.get(asset, False):
@@ -1553,30 +1767,62 @@ class SimpleSignalEngine:
             bos = self.topology.bos[asset]["direction"]
             if (direction == "BUY" and bos == "UP") or (direction == "SELL" and bos == "DOWN"):
                 struct_score += 7
-                struct_reasons.append("BOSconfirm")
-
+                struct_reasons.append("BOS")
+            if regime != "REVERSAL":
+                if len(c15) >= 1:
+                    last = c15[-1]
+                    rng = last["high"] - last["low"]
+                    if rng > 0:
+                        upper_wick = (last["high"] - max(last["open"], last["close"])) / rng
+                        lower_wick = (min(last["open"], last["close"]) - last["low"]) / rng
+                        if direction == "BUY" and lower_wick > 0.35:
+                            struct_score += 5
+                            struct_reasons.append("RejectionWick")
+                        elif direction == "SELL" and upper_wick > 0.35:
+                            struct_score += 5
+                            struct_reasons.append("RejectionWick")
             struct_score = min(struct_score, 15)
             breakdown["CandleStructure"] = struct_score
+            breakdown["StructDetails"] = " | ".join(struct_reasons) if struct_reasons else "Weak"
 
-            # ---- LAYER 4: RISK ----
-            risk_score = 10 if dist_from_ema < (2.8 * atr_pct) else 5
+            # ---- Risk ----
+            risk_score = 0
+            dist_pct = abs(price - ema20_15) / price if price > 0 else 0
+            if dist_pct < 0.03:
+                risk_score = 10
+            elif dist_pct < 0.06:
+                risk_score = 7
+            else:
+                risk_score = 4
+            if abs(price - ema20_1h) / price > 0.04:
+                risk_score = max(0, risk_score - 3)
             breakdown["Risk"] = risk_score
 
-            # ---- FINAL SCORE CALCULATION ----
+            # ---- Pre-news total ----
             total_score = trend_score + loc_score + conf_score + struct_score + risk_score
-            breakdown["Total"] = total_score
-            breakdown["Direction"] = direction
 
-            if total_score >= Config.SCORE_HIGH:
+            # ---- News bonus & blocking ----
+            news_bonus, news_block = self.news_engine.get_signal_bonus(direction)
+            if news_block:
+                return {"status": "NO SETUP", "direction": None, "score": 0,
+                        "reason": f"News blocking {direction} signals", "breakdown": breakdown}
+            total_score += news_bonus
+            breakdown["NewsBonus"] = news_bonus
+            breakdown["NewsScore"] = self.news_engine.get_news_score()["score"]
+
+            # ---- Final status ----
+            if total_score >= 80:
+                status = "EXTREME"
+            elif total_score >= 65:
                 status = "HIGH"
-            elif total_score >= Config.SCORE_VALID:
+            elif total_score >= 50:
                 status = "VALID"
-            elif total_score >= Config.SCORE_WATCH:
+            elif total_score >= 36:
                 status = "WATCH"
             else:
                 status = "REJECTED"
 
-            reason = f"Mode:{regime['regime']} | Trend:{trend_score} | Loc:{loc_score} | V/OF:{conf_score} | C/S:{struct_score} | Risk:{risk_score}"
+            reason = f"Regime:{regime} | Trend:{trend_score} | Loc:{loc_score} | V/OF:{conf_score} | C/S:{struct_score} | Risk:{risk_score} | News:{news_bonus:+d}"
             return {
                 "status": status,
                 "direction": direction,
@@ -1584,9 +1830,9 @@ class SimpleSignalEngine:
                 "reason": reason,
                 "breakdown": breakdown
             }
-           
+
 # =====================================================================
-# DYNAMIC STOP LOSS (unchanged)
+# DYNAMIC STOP LOSS
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1624,7 +1870,6 @@ class DynamicStopLoss:
             sl = entry - buffer if direction == "BUY" else entry + buffer
             risk = buffer
 
-        # TP based on structure
         targets = []
         if direction == "SELL":
             if nearest_support:
@@ -1657,17 +1902,16 @@ class DynamicStopLoss:
                 tp = entry - Config.MIN_RR * risk
             rr = Config.MIN_RR
 
-        return sl, tp, risk, rr
         return sl, tp, risk, round(rr, 2)
 
 # =====================================================================
-# PENDING VERIFICATION QUEUE (FIXED: STORE VERIFIED SIGNALS)
+# PENDING VERIFICATION QUEUE (FIXED)
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology):
         self.topology = topology
         self.pending = {}
-        self.verified = []   # FIX: store verified signals here
+        self.verified = []
         self.lock = threading.Lock()
 
     def add_signal(self, signal_data):
@@ -1685,7 +1929,6 @@ class PendingVerificationQueue:
             return key
 
     def check_pending(self, asset):
-        """Check pending signals for asset and move verified ones to self.verified"""
         to_remove = []
         with self.lock:
             for key, data in list(self.pending.items()):
@@ -1694,43 +1937,34 @@ class PendingVerificationQueue:
                 completed = [c for c in self.topology.candles[300][asset] if c.get("complete", False)]
                 if len(completed) < 2:
                     continue
-
                 limit = data.get('pending_candles', Config.PENDING_VERIFICATION_CANDLES)
                 new_candles = completed[-limit:] if len(completed) >= limit else completed
-
                 if len(new_candles) > data['candle_count']:
                     first_close = completed[-1]['close']
                     atr = self.topology.get_atr(asset, period=14, tf=300) or (data['start_price'] * 0.005)
                     max_allowed_adverse = 1.35 * atr
-
-                    # Structural invalidation check (No false 0.2% chop rejections)
                     if data['direction'] == 'BUY' and (data['start_price'] - first_close) > max_allowed_adverse:
                         data['rejected'] = True
                     elif data['direction'] == 'SELL' and (first_close - data['start_price']) > max_allowed_adverse:
                         data['rejected'] = True
-
                     data['candle_count'] += 1
-
                 if data['candle_count'] >= limit:
                     if not data.get('rejected', False):
-                        # FIX: move to verified list
                         self.verified.append(data)
                     to_remove.append(key)
-
             for key in to_remove:
                 if key in self.pending:
                     del self.pending[key]
             return to_remove
 
     def get_verified_signals(self):
-        """Return all verified signals and clear the list"""
         with self.lock:
             ready = self.verified[:]
             self.verified = []
             return ready
 
 # =====================================================================
-# TRADE HEALTH ENGINE (unchanged)
+# TRADE HEALTH ENGINE
 # =====================================================================
 class TradeHealthEngine:
     def __init__(self, topology, cache):
@@ -1779,7 +2013,7 @@ class TradeHealthEngine:
             return 100
 
 # =====================================================================
-# MARKET ABSORPTION METER (unchanged)
+# MARKET ABSORPTION METER
 # =====================================================================
 class MarketAbsorptionMeter:
     def __init__(self, futures_stream, topology):
@@ -1844,7 +2078,7 @@ class MarketAbsorptionMeter:
         return False
 
 # =====================================================================
-# TELEGRAM PIPELINE (unchanged)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self):
@@ -1901,7 +2135,7 @@ class TelegramPipeline:
         self.queue.put(f"📰 {html.escape(title)}\n🧠 Sentiment: {sentiment:.0f} | Fear/Greed: {fg}")
 
 # =====================================================================
-# ACTIVE TRADE LIFECYCLE (unchanged)
+# ACTIVE TRADE LIFECYCLE
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -1974,13 +2208,12 @@ class ActiveTradeLifecycle:
                 gc.collect()
 
 # =====================================================================
-# CORE ORCHESTRATOR – FIXED: separate 5m and 15m triggers
+# CORE ORCHESTRATOR
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
         self.topology = CandleTopologyEngine()
         self.cache = IndicatorCache(self.topology)
-        self.news = CryptoNewsScanner()
         self.db = TradeDatabase()
         self.mongo = MongoDatabase()
         self.memory = PersistentMemoryEngine(self.mongo, self.db)
@@ -2100,7 +2333,7 @@ class AIOrchestrator:
         self.topology.process_tick(asset, price, volume)
         self._update_active_trades(asset, price)
 
-        # ---- Check 5m candle close for pending verification ----
+        # 5m verification
         if self.topology.candle_just_closed[300].get(asset, False):
             if self.pending_queue.pending:
                 self.pending_queue.check_pending(asset)
@@ -2108,9 +2341,8 @@ class AIOrchestrator:
                 for signal in verified:
                     self._send_final_signal(signal)
 
-        # ---- Check 15m candle close for new signal evaluation ----
+        # 15m evaluation
         if self.topology.candle_just_closed[900].get(asset, False):
-            # ---- Evaluate with Simple Engine ----
             result = self.signal_engine.evaluate(asset, price, volume)
             status = result["status"]
             direction = result["direction"]
@@ -2118,7 +2350,6 @@ class AIOrchestrator:
             reason = result["reason"]
             breakdown = result["breakdown"]
 
-            # ---- LOG OBSERVATION (ALWAYS) ----
             self.db.log_observation(
                 asset=asset,
                 price=price,
@@ -2131,7 +2362,6 @@ class AIOrchestrator:
             )
             logger.info(f"🔍 {asset} | Status: {status} | Score: {score} | Dir: {direction} | Reason: {reason}")
 
-            # ---- Always log to rejected_signals if status is not HIGH/VALID ----
             if status in ("NO SETUP", "REJECTED", "WATCH"):
                 self.db.log_rejected(
                     asset=asset,
@@ -2149,11 +2379,9 @@ class AIOrchestrator:
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
 
-            # ---- Only VALID and HIGH proceed further ----
-            if status not in ("VALID", "HIGH"):
+            if status not in ("VALID", "HIGH", "EXTREME"):
                 return
 
-            # ---- Global and per-asset limits ----
             if not self._signal_limit_ok():
                 self.db.log_rejected(asset, price, score, "Global daily limit reached",
                                      self.asset_state[asset]["volatility"], "SIMPLE", "DailyLimit",
@@ -2170,7 +2398,6 @@ class AIOrchestrator:
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
 
-            # ---- Calculate SL/TP ----
             atr = self.topology.get_atr(asset, period=14, tf=3600) or (price * 0.01)
             sl, tp, risk, rr = self.dynamic_sl.calculate(asset, direction, price, atr)
 
@@ -2182,7 +2409,6 @@ class AIOrchestrator:
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
 
-            # ---- Prepare pending signal ----
             trade_id = self.db.generate_trade_id()
             token = f"SMP-{asset}-{int(time.time()*1000)}"
             signal = {
@@ -2195,11 +2421,11 @@ class AIOrchestrator:
                 'session': "ALWAYS",
                 'patterns': {},
                 'logic': reason,
-                'news': self.news.last_news.get('title','')[:100],
+                'news': "Aggregated news analysis active",
                 'volatility': self.asset_state[asset]["volatility"],
                 'regime': "SIMPLE",
                 'htf_trend': self.asset_state[asset]["htf_trend"],
-                'news_score': self.asset_state[asset]["news_sentiment"],
+                'news_score': self.signal_engine.news_engine.get_news_score()["score"],
                 'score': score,
                 'confidence': status,
                 'num_passed': 4,
@@ -2275,7 +2501,6 @@ class AIOrchestrator:
             logger.error(f"Error sending final signal: {e}", exc_info=True)
 
     def _update_active_trades(self, asset, price):
-        # (unchanged)
         with self.trade_lock:
             to_remove = []
             for tid, trade in list(self.active_trades.items()):
@@ -2385,20 +2610,13 @@ class AIOrchestrator:
         self._ready = True
         self.stream = BinancePublicStream(self._on_price)
         self.stream.start()
-        self.telegram.send_message("🚀 AlphaBot v7.6 FINAL – All Bugs Fixed")
+        self.telegram.send_message("🚀 AlphaBot v7.6 PRODUCTION – Live")
         last_news = 0
         while True:
             time.sleep(10)
             if time.time() - last_news > 60:
-                news = self.news.fetch_latest()
-                if news.get("fresh"):
-                    for a in Config.ASSETS:
-                        self.asset_state[a]["news_sentiment"] = news["articles"][0]["sentiment"] if news["articles"] else 0
-                    if news["articles"]:
-                        self.telegram.fire_news_alert(news["articles"][0]["title"],
-                                                      news["articles"][0]["sentiment"],
-                                                      news.get("fear_greed", 50))
-                    last_news = time.time()
+                # news is already handled by SmartNewsEngine internally
+                last_news = time.time()
 
     def _load_and_backfill(self, asset, tf):
         candles = self.mongo.load_candles(asset, tf)
@@ -2445,7 +2663,7 @@ class AIOrchestrator:
             time.sleep(300)
 
 # =====================================================================
-# HEALTH SERVER (with Observations table)
+# HEALTH SERVER (with live counter)
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
@@ -2511,11 +2729,6 @@ def start_health_server(orchestrator):
                 self.end_headers()
                 mem = orchestrator.memory.get_or_create_state()
                 first_launch = mem.get("first_launch_timestamp", int(time.time()))
-                watch_sec = int(time.time() - first_launch)
-                d = watch_sec // 86400
-                h = (watch_sec % 86400) // 3600
-                m = (watch_sec % 3600) // 60
-                age_str = f"{d}d {h}h {m}m"
                 perf = orchestrator.db.get_performance_metrics()
                 active_list = []
                 with orchestrator.trade_lock:
@@ -2537,8 +2750,9 @@ def start_health_server(orchestrator):
                     pat = orchestrator.asset_state.get(asset, {}).get('neutral_pattern', 'None')
                     neutral_html += f"<span style='margin:0 15px;'><b>{asset}</b>: {pat}</span>"
 
-                html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>AlphaBot v7.6 Final</title>
-<meta http-equiv="refresh" content="15"><style>
+                html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>AlphaBot v7.6 PRODUCTION</title>
+<meta http-equiv="refresh" content="60">
+<style>
 body{{font-family:Arial;background:#111;color:#eee;margin:20px}}
 table{{border-collapse:collapse;width:100%;font-size:14px}}
 th,td{{border:1px solid #444;padding:6px;text-align:center}}
@@ -2551,8 +2765,8 @@ th{{background:#333}}
 .status-VALID{{color:#0f0}}
 .status-HIGH{{color:#0ff}}
 </style></head><body>
-<h1>🚀 AlphaBot v7.6 FINAL – All Bugs Fixed</h1>
-<p>🟢 <b>Bot Status: Online</b> | ⏱️ Market Watching Age: {age_str}</p>
+<h1>🚀 AlphaBot v7.6 PRODUCTION</h1>
+<p>🟢 <b>Bot Status: Online</b> | ⏱️ Market Watching Age: <span id="ageDisplay">Loading...</span></p>
 <p>🌼 <b>Current Neutral Patterns:</b> {neutral_html}</p>
 <h2>All-Time Counters</h2>
 <p>📊 Accepted Signals: {mem.get("accepted_signals_count", 0)} | ❌ Rejected: {mem.get("rejected_signals_count", 0)}</p>
@@ -2571,6 +2785,20 @@ th{{background:#333}}
 </table>
 <p><a href='/observations' target='_blank'>View all observations (JSON)</a></p>
 <p><a href='/rejections' target='_blank'>View rejected signals (JSON)</a></p>
+<script>
+    const firstLaunch = {first_launch};
+    function updateAge() {{
+        const now = Math.floor(Date.now() / 1000);
+        const elapsed = now - firstLaunch;
+        const d = Math.floor(elapsed / 86400);
+        const h = Math.floor((elapsed % 86400) / 3600);
+        const m = Math.floor((elapsed % 3600) / 60);
+        const s = elapsed % 60;
+        document.getElementById('ageDisplay').innerText = `${{d}}d ${{h}}h ${{m}}m ${{s}}s`;
+    }}
+    updateAge();
+    setInterval(updateAge, 1000);
+</script>
 </body></html>
 """
                 self.wfile.write(html.encode())
