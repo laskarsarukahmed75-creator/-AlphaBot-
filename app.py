@@ -2828,4 +2828,634 @@ class AIOrchestrator:
                                      breakdown.get("Regime", "V10_INST"),
                                      "Cooldown", json.dumps(breakdown),
                                      status="REJECTED", direction=direction)
-                self.memory.update_state({"re
+                                    self.memory.update_state({"rejected_signals_count": 1})
+                    return
+
+                if status not in ("VALID", "HIGH", "EXTREME"):
+                    return
+
+                # Correlation shield (softened)
+                corr_ok, corr_reason = self._correlation_shield_ok(asset, direction)
+                if not corr_ok:
+                    self.db.log_rejected(asset, price, score, corr_reason,
+                                         self.asset_state[asset]["volatility"],
+                                         breakdown.get("Regime", "V10_INST"),
+                                         "CorrelationShield", json.dumps(breakdown),
+                                         status="REJECTED", direction=direction)
+                    self.memory.update_state({"rejected_signals_count": 1})
+                    return
+
+                # Portfolio heat check
+                heat_ok, heat_pct = self.sizing_engine.portfolio_heat_ok(self.active_trades)
+                if not heat_ok:
+                    self.db.log_rejected(asset, price, score, f"Portfolio heat {heat_pct}% > cap {Config.MAX_PORTFOLIO_HEAT_PCT}%",
+                                         self.asset_state[asset]["volatility"],
+                                         breakdown.get("Regime", "V10_INST"),
+                                         "PortfolioHeat", json.dumps(breakdown),
+                                         status="REJECTED", direction=direction)
+                    self.memory.update_state({"rejected_signals_count": 1})
+                    return
+
+                if not self._signal_limit_ok():
+                    self.db.log_rejected(asset, price, score, "Global daily limit reached",
+                                         self.asset_state[asset]["volatility"],
+                                         breakdown.get("Regime", "V10_INST"),
+                                         "DailyLimit", json.dumps(breakdown),
+                                         status="REJECTED", direction=direction)
+                    self.memory.update_state({"rejected_signals_count": 1})
+                    return
+
+                if not self._asset_cooldown_ok(asset):
+                    self.db.log_rejected(asset, price, score, f"Asset cooldown ({Config.ASSET_COOLDOWN_HOURS}h)",
+                                         self.asset_state[asset]["volatility"],
+                                         breakdown.get("Regime", "V10_INST"),
+                                         "Cooldown", json.dumps(breakdown),
+                                         status="REJECTED", direction=direction)
+                    self.memory.update_state({"rejected_signals_count": 1})
+                    return
+
+                atr = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.008)
+                sl, tp1, tp2, tp3, risk, rr = self.dynamic_sl.calculate(asset, direction, price, atr)
+
+                sizing = self.sizing_engine.calculate(price, sl)
+                trade_id = self.db.generate_trade_id()
+                token = f"V10-{asset}-{int(time.time()*1000)}"
+                
+                signal = {
+                    'asset': asset,
+                    'direction': direction,
+                    'entry': price,
+                    'sl': sl,
+                    'tp1': tp1,
+                    'tp2': tp2,
+                    'tp3': tp3,
+                    'sqs': score,
+                    'session': breakdown.get("Session", "ALWAYS"),
+                    'patterns': patterns,
+                    'logic': reason,
+                    'news': self.news.last_news.get('title', '')[:100],
+                    'volatility': self.asset_state[asset]["volatility"],
+                    'regime': breakdown.get("Regime", "V10_INST"),
+                    'htf_trend': self.asset_state[asset]["htf_trend"],
+                    'news_score': self.asset_state[asset]["news_sentiment"],
+                    'score': score,
+                    'confidence': status,
+                    'pending_candles': Config.PENDING_VERIFICATION_CANDLES,
+                    'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,
+                    'dynamic_min_sqs': Config.MIN_SCORE_FOR_SIGNAL,
+                    'signal_type': 'V10_INST',
+                    'signal_token': token,
+                    'trade_id': trade_id,
+                    'score_breakdown': json.dumps(breakdown),
+                    'quantity': sizing["quantity"],
+                    'risk_usd': sizing["risk_usd"]
+                }
+
+                self.pending_queue.add_signal(signal)
+                self.memory.update_state({"total_signals_generated": 1})
+                logger.info(f"⏳ Added to 5m Verification Queue: {asset} {direction} @ {price:.2f} | Score: {score} ({status})")
+
+    def _send_final_signal(self, signal):
+        try:
+            asset = signal['asset']
+            direction = signal['direction']
+            price = signal['entry']
+            atr = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.008)
+            sl, tp1, tp2, tp3, risk, rr = self.dynamic_sl.calculate(asset, direction, price, atr)
+
+            sqs = signal['sqs']
+            session = signal['session']
+            patterns = signal['patterns']
+            logic = signal['logic']
+            news = signal['news']
+            volatility = signal['volatility']
+            regime = signal['regime']
+            htf_trend = signal['htf_trend']
+            news_score = signal['news_score']
+            dm = signal.get('dynamic_min_sqs', 0)
+            st = signal.get('signal_type', 'V10_INST')
+            token = signal.get('signal_token')
+            trade_id = signal.get('trade_id') or self.db.generate_trade_id()
+            pattern_name = list(patterns.keys())[0] if patterns else "smc_flow"
+            total_score = signal.get('score', 0)
+            confidence = signal.get('confidence', 'HIGH')
+            breakdown = signal.get('score_breakdown', '')
+            qty = signal.get('quantity', 0.0)
+            risk_usd = signal.get('risk_usd', 0.0)
+
+            self.db.log_trade(trade_id, asset, direction, price, sl, tp1, tp2, tp3, total_score, confidence,
+                              list(patterns.keys()), logic, volatility, regime, htf_trend,
+                              news_score, session, sqs, pattern_name, dm, qty, risk_usd,
+                              st, token, breakdown)
+                              
+            if self.mongo.db is not None:
+                self.mongo.save_trade_backup({
+                    'id': trade_id, 'asset': asset, 'direction': direction,
+                    'entry': price, 'stop_loss': sl, 'take_profit': tp3,
+                    'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'tp1_hit': False, 'tp2_hit': False,
+                    'score': total_score, 'status': 'open', 'signal_type': st,
+                    'regime': regime, 'signal_token': token, 'entry_time': int(time.time()),
+                    'quantity': qty, 'risk_usd': risk_usd
+                })
+
+            self.telegram.fire_signal(
+                asset=asset, direction=direction, price=price, sl=sl,
+                tp1=tp1, tp2=tp2, tp3=tp3, logic=logic, news=news,
+                score=total_score, trade_id=trade_id, session=session,
+                rr=rr, regime=regime, signal_token=token, tier=confidence, quantity=qty
+            )
+
+            self.asset_last_signal[asset] = time.time()
+            self.signal_timestamps.append(time.time())
+            
+            with self.trade_lock:
+                self.active_trades[trade_id] = {
+                    'id': trade_id, 'asset': asset, 'direction': direction,
+                    'entry': price, 'sl': sl, 'tp': tp3,
+                    'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+                    'tp1_hit': False, 'tp2_hit': False,
+                    'entry_time': int(time.time()),
+                    'health': 100, 'regime': regime, 'signal_token': token,
+                    'quantity': qty, 'risk_usd': risk_usd
+                }
+            self.memory.update_state({"accepted_signals_count": 1})
+            logger.info(f"✅ FINAL v10 SIGNAL FIRED: {asset} {direction} @ {price:.2f} | TP1:{tp1:.2f} TP2:{tp2:.2f} TP3:{tp3:.2f}")
+        except Exception as e:
+            logger.error(f"Error sending final signal: {e}", exc_info=True)
+
+    def _update_active_trades(self, asset, price):
+        with self.trade_lock:
+            to_close = []
+            for tid, trade in list(self.active_trades.items()):
+                if trade['asset'] != asset:
+                    continue
+
+                d = trade['direction']
+                entry = trade['entry']
+                tp1 = trade.get('tp1', trade['tp'])
+                tp2 = trade.get('tp2', trade['tp'])
+                tp3 = trade.get('tp3', trade['tp'])
+
+                if not trade.get('tp1_hit', False):
+                    if (d == 'BUY' and price >= tp1) or (d == 'SELL' and price <= tp1):
+                        trade['tp1_hit'] = True
+                        trade['sl'] = entry
+                        self.mongo.update_trade_fields(tid, {"stop_loss": entry, "tp1_hit": True})
+                        self.db.update_trade_sqlite(tid, {"stop_loss": entry, "tp1_hit": 1})
+                        self.telegram.fire_partial_tp(tid, asset, d, "TP1 (50% Booked)", price, entry)
+                        logger.info(f"🎯 Trade #{tid} ({asset}) hit TP1 @ {price:.2f} -> SL moved to BE ({entry:.2f})")
+
+                if trade.get('tp1_hit', False) and not trade.get('tp2_hit', False):
+                    if (d == 'BUY' and price >= tp2) or (d == 'SELL' and price <= tp2):
+                        trade['tp2_hit'] = True
+                        trade['sl'] = tp1
+                        self.mongo.update_trade_fields(tid, {"stop_loss": tp1, "tp2_hit": True})
+                        self.db.update_trade_sqlite(tid, {"stop_loss": tp1, "tp2_hit": 1})
+                        self.telegram.fire_partial_tp(tid, asset, d, "TP2 (80% Total Booked)", price, tp1)
+                        logger.info(f"🎯 Trade #{tid} ({asset}) hit TP2 @ {price:.2f} -> SL moved to TP1 ({tp1:.2f})")
+
+                if trade.get('tp2_hit', False):
+                    c5 = self.topology.get_completed(asset, 300)
+                    if len(c5) >= 2:
+                        struct_sl = min(c5[-1]['low'], c5[-2]['low']) if d == 'BUY' else max(c5[-1]['high'], c5[-2]['high'])
+                        atr_5 = self.topology.get_atr(asset, period=14, tf=300) or (entry * 0.005)
+                        if d == 'BUY':
+                            struct_sl = max(struct_sl, price - 1.5 * atr_5)
+                            if struct_sl > trade['sl']:
+                                trade['sl'] = struct_sl
+                        else:
+                            struct_sl = min(struct_sl, price + 1.5 * atr_5)
+                            if struct_sl < trade['sl']:
+                                trade['sl'] = struct_sl
+
+                if d == 'BUY':
+                    if price <= trade['sl']:
+                        raw_move = price - entry
+                        reason = "TP2 Trail Hit (Profit)" if trade.get('tp2_hit') else ("TP1 Breakeven Exit (Win)" if trade.get('tp1_hit') else "SL Hit")
+                        to_close.append((tid, price, raw_move, reason))
+                    elif price >= tp3:
+                        to_close.append((tid, price, price - entry, "TP3 Moon Target Hit 🚀"))
+                else:
+                    if price >= trade['sl']:
+                        raw_move = entry - price
+                        reason = "TP2 Trail Hit (Profit)" if trade.get('tp2_hit') else ("TP1 Breakeven Exit (Win)" if trade.get('tp1_hit') else "SL Hit")
+                        to_close.append((tid, price, raw_move, reason))
+                    elif price <= tp3:
+                        to_close.append((tid, price, entry - price, "TP3 Moon Target Hit 🚀"))
+
+            for tid, exit_p, raw_move, reason in to_close:
+                self._close_trade(tid, exit_p, raw_move, reason)
+
+    def _close_trade(self, tid, price, raw_move, reason=""):
+        trade = self.active_trades.pop(tid, None)
+        if not trade:
+            return
+        entry_time = trade.get('entry_time', int(time.time()))
+        entry = trade.get('entry', 0)
+        asset = trade.get('asset', '')
+        d = trade.get('direction', 'BUY')
+        tp1 = trade.get('tp1', entry)
+        tp2 = trade.get('tp2', entry)
+
+        if trade.get('tp2_hit'):
+            move_tp1 = abs(tp1 - entry)
+            move_tp2 = abs(tp2 - entry)
+            pnl = 0.50 * move_tp1 + 0.30 * move_tp2 + 0.20 * raw_move
+            if d == 'SELL' and raw_move > 0:
+                pnl = -pnl 
+        elif trade.get('tp1_hit'):
+            move_tp1 = abs(tp1 - entry)
+            pnl = 0.50 * move_tp1 + 0.50 * raw_move
+            if d == 'SELL' and raw_move > 0:
+                pnl = -pnl
+        else:
+            pnl = raw_move
+
+        pnl -= abs(entry) * Config.SLIPPAGE_PCT
+
+        self.db.close_trade(tid, price, pnl, reason)
+        self.mongo.close_trade_mongo(tid, price, pnl, reason)
+        self.telegram.fire_trade_close(tid, asset, entry, price, pnl, reason, entry_time)
+        logger.info(f"🔒 Trade #{tid} ({asset}) closed @ {price:.2f} | Weighted PnL: {pnl:+.2f} | Reason: {reason}")
+
+        mem = self.memory.get_or_create_state()
+        consec_losses = int(mem.get("consecutive_losses", 0))
+        updates = {"total_trades_closed": 1, "total_pnl": float(pnl)}
+
+        if pnl > 0:
+            updates["total_wins"] = 1
+            updates["consecutive_losses"] = 0
+        elif pnl < 0:
+            updates["total_losses"] = 1
+            consec_losses += 1
+            updates["consecutive_losses"] = consec_losses
+            
+            if consec_losses >= Config.MCB_MAX_CONSECUTIVE_LOSSES:
+                until_ts = int(time.time()) + Config.MCB_COOLDOWN_SECONDS
+                updates["mcb_until_ts"] = until_ts
+                self.pending_queue.clear_all("MCB Activated")
+                self.telegram.fire_cb_alert("MCB (3 Consecutive Losses)", Config.MCB_COOLDOWN_SECONDS // 60)
+
+        self.memory.update_state(updates, absolute_keys={"consecutive_losses", "mcb_until_ts"})
+
+        # Check Daily/Weekly CB
+        daily_balance = float(mem.get("daily_start_balance", Config.ACCOUNT_BALANCE_USD))
+        weekly_balance = float(mem.get("weekly_start_balance", Config.ACCOUNT_BALANCE_USD))
+        current_balance = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0)) + pnl
+        
+        daily_loss_pct = ((daily_balance - current_balance) / daily_balance * 100) if daily_balance > 0 else 0
+        weekly_loss_pct = ((weekly_balance - current_balance) / weekly_balance * 100) if weekly_balance > 0 else 0
+
+        if daily_loss_pct >= Config.DAILY_LOSS_LIMIT_PCT:
+            until_ts = int(time.time()) + Config.DAILY_LOSS_PAUSE_SECONDS
+            self.memory.update_state({"daily_cb_until_ts": until_ts}, absolute_keys={"daily_cb_until_ts"})
+            self.pending_queue.clear_all("Daily CB Activated")
+            self.telegram.fire_cb_alert("Daily Loss Limit Hit", Config.DAILY_LOSS_PAUSE_SECONDS // 60)
+            
+        if weekly_loss_pct >= Config.WEEKLY_LOSS_LIMIT_PCT:
+            until_ts = int(time.time()) + Config.WEEKLY_LOSS_PAUSE_SECONDS
+            self.memory.update_state({"weekly_cb_until_ts": until_ts}, absolute_keys={"weekly_cb_until_ts"})
+            self.pending_queue.clear_all("Weekly CB Activated")
+            self.telegram.fire_cb_alert("Weekly Loss Limit Hit", Config.WEEKLY_LOSS_PAUSE_SECONDS // 60)
+
+    def _update_indicators(self, asset, price):
+        try:
+            with self.topology.lock:
+                c15_all = self.topology.get_completed(asset, 900)
+                c15 = [c["close"] for c in c15_all][-150:]
+                if len(c15) >= 50:
+                    e20, e50 = self.topology._ema(c15, 20), self.topology._ema(c15, 50)
+                    if e20 and e50:
+                        self.asset_state[asset]["trend"] = "BULLISH" if e20[-1] > e50[-1] else "BEARISH"
+                    self.asset_state[asset]["rsi"] = self.topology._calc_rsi(c15, 14)
+                    self.asset_state[asset]["adx"] = self.topology.get_adx(asset, 900)
+                    p_change = c15_all[-1]["close"] - c15_all[-1]["open"]
+                    _, q_label = self.signal_engine.get_oi_quadrant(asset, p_change)
+                    self.asset_state[asset]["oi_quadrant"] = q_label
+                c1h = [c["close"] for c in self.topology.get_completed(asset, 3600)][-150:]
+                if len(c1h) >= 50:
+                    e20_1h, e50_1h = self.topology._ema(c1h, 20), self.topology._ema(c1h, 50)
+                    if e20_1h and e50_1h:
+                        self.asset_state[asset]["htf_trend"] = "BULLISH" if e20_1h[-1] > e50_1h[-1] else "BEARISH"
+                atr = self.topology.get_atr(asset, period=14, tf=900)
+                if atr and price > 0:
+                    self.asset_state[asset]["volatility"] = round((atr / price) * 100, 3)
+                neut = self.neutral_engine.detect(asset, price, tf=900)
+                self.asset_state[asset]["neutral_pattern"] = neut.get("pattern", "None")
+                self.asset_state[asset]["funding_rate"] = self.futures_stream.get_funding_rate(asset.lower())
+                self.asset_state[asset]["ob_imbalance"] = self.futures_stream.get_ob_imbalance(asset.lower())
+        except Exception as e:
+            logger.error(f"Indicator update error: {e}")
+
+    def _process_queue(self):
+        while True:
+            try:
+                item = self.price_queue.get(timeout=1)
+                if item:
+                    self._handle_price_tick(*item)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logger.error(f"Queue processing error: {e}")
+
+    def run(self):
+        threading.Thread(target=start_health_server, args=(self,), daemon=True).start()
+        threading.Thread(target=self._ping_self_loop, daemon=True).start()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(self._load_and_backfill, asset, tf)
+                       for asset in Config.ASSETS for tf in [60, 300, 900, 3600, 14400]]
+            for _ in as_completed(futures):
+                pass
+        for asset in Config.ASSETS:
+            self.topology.initialize_structure(asset)
+            c15 = self.topology.get_completed(asset, 900)
+            if c15:
+                self.asset_state[asset]["price"] = c15[-1]["close"]
+                self._update_indicators(asset, c15[-1]["close"])
+
+        self._ready = True
+        self.stream = BinancePublicStream(self._on_price)
+        self.stream.start()
+        self.telegram.send_message(
+            "🏛️ <b>AlphaBot v10.0 FINAL Online</b>\n"
+            "✅ Backtest + Position Sizing + Daily/Weekly CB Active\n"
+            "✅ OI 4-Quadrant + Funding + TP1/TP2/TP3 Scale-Out Active"
+        )
+        last_news = 0
+        while True:
+            time.sleep(15)
+            if time.time() - last_news > 300:
+                news = self.news.fetch_latest()
+                if news.get("fresh") and news.get("articles"):
+                    for a in Config.ASSETS:
+                        self.asset_state[a]["news_sentiment"] = news["articles"][0]["sentiment"]
+                    last_news = time.time()
+
+    def _load_and_backfill(self, asset, tf):
+        interval = {60: "1m", 300: "5m", 900: "15m", 3600: "1h", 14400: "4h"}[tf]
+        try:
+            resp = requests.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": asset, "interval": interval, "limit": 300},
+                timeout=15
+            )
+            if resp.status_code == 200:
+                fetched = []
+                raw_klines = resp.json()
+                for d in raw_klines[:-1]:
+                    c = {
+                        "timestamp": d[0] // 1000,
+                        "open": float(d[1]), "high": float(d[2]),
+                        "low": float(d[3]), "close": float(d[4]),
+                        "volume": float(d[5]), "complete": True
+                    }
+                    if DataValidator.validate_candle(c):
+                        fetched.append(c)
+                with self.topology.lock:
+                    self.topology.candles[tf][asset] = fetched
+                logger.info(f"🌐 Backfilled {len(fetched)} candles for {asset} [{interval}]")
+                return
+        except Exception as e:
+            logger.error(f"Binance REST backfill error for {asset} {tf}: {e}")
+
+        candles = self.mongo.load_candles(asset, tf, limit=300)
+        if candles:
+            with self.topology.lock:
+                self.topology.candles[tf][asset] = candles
+
+    def _on_price(self, asset, price, volume):
+        if DataValidator.validate_price(price) and DataValidator.validate_volume(volume):
+            try:
+                self.price_queue.put_nowait((asset, price, volume))
+            except queue.Full:
+                try:
+                    self.price_queue.get_nowait()
+                    self.price_queue.put_nowait((asset, price, volume))
+                except Exception:
+                    pass
+
+    def _ping_self_loop(self):
+        while True:
+            time.sleep(300)
+            try:
+                requests.get(Config.RENDER_URL, timeout=10)
+            except Exception:
+                pass
+
+
+# =====================================================================
+# v10.0 FINAL TERMINAL DASHBOARD & HEALTH SERVER
+# =====================================================================
+def start_health_server(orchestrator):
+    port = int(os.environ.get("PORT", 10000))
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith('/reset_mcb'):
+                orchestrator.reset_mcb()
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+
+            if self.path.startswith('/close_trade'):
+                try:
+                    query = urllib.parse.urlparse(self.path).query
+                    params = urllib.parse.parse_qs(query)
+                    tid = int(params.get('id', [0])[0])
+                    with orchestrator.trade_lock:
+                        trade = orchestrator.active_trades.get(tid)
+                        if trade:
+                            asset = trade['asset']
+                            curr = orchestrator.asset_state.get(asset, {}).get("price") or trade['entry']
+                            raw_move = (curr - trade['entry']) if trade['direction'] == 'BUY' else (trade['entry'] - curr)
+                            orchestrator._close_trade(tid, curr, raw_move, "ManualDashboardClose")
+                except Exception as e:
+                    logger.error(f"Manual close error: {e}")
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+
+            if self.path == '/rejections':
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                try:
+                    conn = orchestrator.db._get_conn()
+                    cur = conn.cursor()
+                    cur.execute("SELECT datetime(timestamp, 'unixepoch'), asset, price, score, reason, gate_name, regime, status FROM rejected_signals ORDER BY timestamp DESC LIMIT 50")
+                    rows = cur.fetchall()
+                    data = [{"time": r[0], "asset": r[1], "price": r[2], "score": r[3], "reason": r[4], "gate": r[5], "regime": r[6], "status": r[7]} for r in rows]
+                    self.wfile.write(json.dumps(data, indent=2).encode())
+                except Exception as e:
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
+
+            if self.path.startswith('/observations'):
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                try:
+                    obs = orchestrator.db.get_recent_observations(50)
+                    self.wfile.write(json.dumps(obs, indent=2).encode())
+                except Exception as e:
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
+
+            if self.path == '/' or self.path == '/health':
+                self.send_response(200)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                mem = orchestrator.memory.get_or_create_state()
+                session_uptime = int(time.time() - orchestrator.start_time)
+                sh, sm = session_uptime // 3600, (session_uptime % 3600) // 60
+                uptime_str = f"{sh}h {sm}m"
+
+                perf = orchestrator.db.get_performance_metrics(mem_fallback=mem)
+                session_name, _ = InstitutionalSignalEngine.get_ist_session()
+                mcb_active, mcb_min = orchestrator.is_mcb_tripped()
+                daily_active, daily_min = orchestrator.is_daily_cb_active()
+                weekly_active, weekly_min = orchestrator.is_weekly_cb_active()
+                
+                cb_status = "🟢 All CB Normal"
+                if mcb_active:
+                    cb_status = f"🔴 MCB TRIPPED ({mcb_min}m left) <a href='/reset_mcb' class='btn'>Reset</a>"
+                elif daily_active:
+                    cb_status = f"🔴 Daily CB ({daily_min}m left) <a href='/reset_mcb' class='btn'>Reset</a>"
+                elif weekly_active:
+                    cb_status = f"🔴 Weekly CB ({weekly_min}m left) <a href='/reset_mcb' class='btn'>Reset</a>"
+
+                asset_cards_html = ""
+                for a in Config.ASSETS:
+                    st = orchestrator.asset_state.get(a, {})
+                    cvd_val = orchestrator.futures_stream.get_cvd(a.lower())
+                    fr_pct = st.get("funding_rate", 0.0) * 100
+                    ob_rat = st.get("ob_imbalance", 1.0)
+                    t15_cls = "badge-bull" if st.get("trend") == "BULLISH" else "badge-bear"
+                    t1h_cls = "badge-bull" if st.get("htf_trend") == "BULLISH" else "badge-bear"
+                    asset_cards_html += f"""
+                    <div class="card">
+                        <div class="card-title">{Config.DISPLAY_NAMES.get(a, a)} <span class="price">${st.get('price', 0):,.2f}</span></div>
+                        <div class="metrics-grid">
+                            <div>15m Trend: <span class="{t15_cls}">{st.get('trend')}</span></div>
+                            <div>1h Trend: <span class="{t1h_cls}">{st.get('htf_trend')}</span></div>
+                            <div>OI Flow: <b>{st.get('oi_quadrant', '⚪ Neutral')}</b></div>
+                            <div>Funding: <b>{fr_pct:+.4f}%</b></div>
+                            <div>OrderBook: <b>{ob_rat:.2f}x B/A</b></div>
+                            <div>RSI / ADX: <b>{st.get('rsi', 50):.1f} / {st.get('adx', 20):.1f}</b></div>
+                            <div>CVD: <b>{cvd_val:+,.1f}</b></div>
+                            <div>Absorption: <b>{st.get('absorption_score', 0)} ({st.get('absorption_dir') or 'N/A'})</b></div>
+                        </div>
+                    </div>"""
+
+                pending_rows = ""
+                with orchestrator.pending_queue.lock:
+                    for k, p in orchestrator.pending_queue.pending.items():
+                        pending_rows += f"<tr><td><b>{p['asset']}</b></td><td>{p['direction']}</td><td>${p['entry']:,.2f}</td><td>{p['score']}</td><td>{p['confidence']}</td><td>Waiting 5m + OB Check...</td></tr>"
+                if not pending_rows:
+                    pending_rows = "<tr><td colspan='6' style='color:#777'>No signals waiting in 5m verification queue</td></tr>"
+
+                active_rows = ""
+                with orchestrator.trade_lock:
+                    for tid, trade in orchestrator.active_trades.items():
+                        curr = orchestrator.asset_state.get(trade['asset'], {}).get('price') or trade['entry']
+                        pnl = (curr - trade['entry']) if trade['direction'] == 'BUY' else (trade['entry'] - curr)
+                        pnl_pct = (pnl / trade['entry'] * 100) if trade['entry'] else 0
+                        cls = "g" if pnl >= 0 else "r"
+                        tp_status = "TP2 Locked 🔒" if trade.get('tp2_hit') else ("TP1 Hit (BE) 🛡️" if trade.get('tp1_hit') else "Open (Waiting TP1)")
+                        btn = f"<a href='/close_trade?id={tid}' class='btn'>Close</a>"
+                        active_rows += (
+                            f"<tr><td>#{tid}</td><td><b>{trade['asset']}</b></td><td>{trade['direction']}</td>"
+                            f"<td>${trade['entry']:,.2f}</td><td>${curr:,.2f}</td><td>${trade['sl']:,.2f}</td>"
+                            f"<td>${trade.get('tp1', 0):,.2f} / ${trade.get('tp2', 0):,.2f} / ${trade.get('tp3', 0):,.2f}</td>"
+                            f"<td><b>{tp_status}</b></td>"
+                            f"<td class='{cls}'>${pnl:+,.2f} ({pnl_pct:+.2f}%)</td><td>{btn}</td></tr>"
+                        )
+                if not active_rows:
+                    active_rows = "<tr><td colspan='10' style='color:#777'>No active trades open right now</td></tr>"
+
+                observations = orchestrator.db.get_recent_observations(15)
+                obs_rows = ""
+                for obs in observations:
+                    st_cls = f"status-{obs['status'].replace(' ', '-')}"
+                    obs_rows += (
+                        f"<tr><td><b>{obs['asset']}</b></td><td>{obs['time']}</td><td>${(obs.get('price') or 0):,.2f}</td>"
+                        f"<td>{obs['direction']}</td><td><b>{obs['score']}</b></td>"
+                        f"<td class='{st_cls}'><b>{obs['status']}</b></td><td style='text-align:left'>{html.escape(obs['reason'][:95])}</td></tr>"
+                    )
+                if not obs_rows:
+                    obs_rows = "<tr><td colspan='7' style='color:#777'>Waiting for next 15m candle close evaluation...</td></tr>"
+
+                page = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AlphaBot v10.0 FINAL</title><meta http-equiv="refresh" content="15">
+<style>
+body{{font-family:'Segoe UI',Roboto,Arial,sans-serif;background:#0b0e14;color:#e6edf3;margin:0;padding:14px}}
+.header{{display:flex;justify-content:space-between;align-items:center;background:#161b22;padding:14px 18px;border-radius:10px;border:1px solid #30363d;margin-bottom:14px;flex-wrap:wrap;gap:8px}}
+.header h1{{margin:0;font-size:19px;color:#58a6ff}}
+.stats-bar{{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;margin-bottom:16px}}
+.stat-box{{background:#161b22;border:1px solid #30363d;padding:11px;border-radius:8px;text-align:center}}
+.stat-box .val{{font-size:19px;font-weight:bold;color:#fff;margin-top:4px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-bottom:18px}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px}}
+.card-title{{font-size:17px;font-weight:bold;display:flex;justify-content:space-between;border-bottom:1px solid #21262d;padding-bottom:8px;margin-bottom:10px}}
+.price{{color:#3fb950}}
+.metrics-grid{{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12.5px;color:#8b949e}}
+.metrics-grid b{{color:#e6edf3}}
+.badge-bull{{color:#3fb950;font-weight:bold}} .badge-bear{{color:#f85149;font-weight:bold}}
+h2{{font-size:15.5px;color:#58a6ff;margin:16px 0 8px}}
+.table-wrap{{overflow-x:auto;background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:16px}}
+table{{border-collapse:collapse;width:100%;font-size:12.5px}}
+th,td{{border-bottom:1px solid #21262d;padding:8px 9px;text-align:center}}
+th{{background:#21262d;color:#8b949e;font-weight:600}}
+.g{{color:#3fb950;font-weight:bold}} .r{{color:#f85149;font-weight:bold}}
+.btn{{background:#da3633;color:#fff;padding:3px 9px;text-decoration:none;border-radius:4px;font-size:11.5px;font-weight:bold}}
+.status-REJECTED{{color:#f85149}} .status-NO-SETUP{{color:#8b949e}} .status-WATCH{{color:#d29922}}
+.status-VALID{{color:#3fb950}} .status-HIGH{{color:#58a6ff}} .status-EXTREME{{color:#bc8cff}}
+.links a{{color:#58a6ff;margin-right:15px;text-decoration:none;font-size:13px}}
+</style></head><body>
+<div class="header">
+  <h1>🏛️ AlphaBot v10.0 FINAL – SMC + Scale-Out + CB Shield</h1>
+  <div style="font-size:13px">🟢 <b>Online ({uptime_str})</b> | 🕒 IST: <b>{session_name}</b> | {cb_status} | 😨 F&G: <b>{orchestrator.news.fear_greed}</b></div>
+</div>
+<div class="stats-bar">
+  <div class="stat-box"><div>Accepted Signals</div><div class="val g">{mem.get("accepted_signals_count", 0)}</div></div>
+  <div class="stat-box"><div>Filtered / Rejected</div><div class="val r">{mem.get("rejected_signals_count", 0)}</div></div>
+  <div class="stat-box"><div>Closed Trades (W/L)</div><div class="val">{mem.get("total_trades_closed", 0)} ({mem.get("total_wins", 0)}W / {mem.get("total_losses", 0)}L)</div></div>
+  <div class="stat-box"><div>Win Rate</div><div class="val g">{perf.get('win_rate', 0):.1%}</div></div>
+  <div class="stat-box"><div>Cumulative Move (PnL)</div><div class="val {'g' if mem.get('total_pnl', 0) >= 0 else 'r'}">${mem.get('total_pnl', 0.0):+,.2f}</div></div>
+</div>
+<div class="cards">{asset_cards_html}</div>
+<h2>⏳ 5m Pending Verification Queue (+ OrderBook Wall Check)</h2>
+<div class="table-wrap"><table><tr><th>Asset</th><th>Direction</th><th>Trigger Price</th><th>Score</th><th>Tier</th><th>Status</th></tr>{pending_rows}</table></div>
+<h2>⚡ Active Open Trades (3-Tier Scale-Out: TP1 / TP2 / TP3)</h2>
+<div class="table-wrap"><table><tr><th>ID</th><th>Asset</th><th>Dir</th><th>Entry</th><th>Current</th><th>SL</th><th>TP1 / TP2 / TP3</th><th>Scale-Out Stage</th><th>Unrealized</th><th>Action</th></tr>{active_rows}</table></div>
+<h2>📋 Latest 15m Signal Evaluations</h2>
+<div class="table-wrap"><table><tr><th>Asset</th><th>Time (UTC)</th><th>Price</th><th>Dir</th><th>Score</th><th>Status</th><th>Institutional Layer Breakdown</th></tr>{obs_rows}</table></div>
+<div class="links">
+  <a href="/observations" target="_blank">📄 View Observations JSON</a>
+  <a href="/rejections" target="_blank">📄 View Rejections JSON</a>
+</div>
+</body></html>"""
+                self.wfile.write(page.encode())
+            else:
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "online", "version": "10.0-FINAL"}).encode())
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+    httpd = HTTPServer(("0.0.0.0", port), H)
+    logger.info(f"🌐 Health & Dashboard server listening on port {port}")
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    bot = AIOrchestrator()
+    bot.run()
