@@ -2828,22 +2828,21 @@ class AIOrchestrator:
                                      breakdown.get("Regime", "V10_INST"),
                                      "Cooldown", json.dumps(breakdown),
                                      status="REJECTED", direction=direction)
-                                    self.memory.update_state({"rejected_signals_count": 1})
-                    return
+                self.memory.update_state({"rejected_signals_count": 1})
+                return
+            if status not in ("VALID", "HIGH", "EXTREME"):
+                return
 
-                if status not in ("VALID", "HIGH", "EXTREME"):
-                    return
-
-                # Correlation shield (softened)
-                corr_ok, corr_reason = self._correlation_shield_ok(asset, direction)
-                if not corr_ok:
-                    self.db.log_rejected(asset, price, score, corr_reason,
-                                         self.asset_state[asset]["volatility"],
-                                         breakdown.get("Regime", "V10_INST"),
-                                         "CorrelationShield", json.dumps(breakdown),
-                                         status="REJECTED", direction=direction)
-                    self.memory.update_state({"rejected_signals_count": 1})
-                    return
+            # Correlation shield (softened)
+            corr_ok, corr_reason = self._correlation_shield_ok(asset, direction)
+            if not corr_ok:
+                self.db.log_rejected(asset, price, score, corr_reason,
+                                    self.asset_state[asset]["volatility"],
+                                    breakdown.get("Regime", "V10_INST"),
+                                    "CorrelationShield", json.dumps(breakdown),
+                                    status="REJECTED", direction=direction)
+                self.memory.update_state({"rejected_signals_count": 1})
+                return
 
                 # Portfolio heat check
                 heat_ok, heat_pct = self.sizing_engine.portfolio_heat_ok(self.active_trades)
@@ -3459,3 +3458,4 @@ th{{background:#21262d;color:#8b949e;font-weight:600}}
 if __name__ == "__main__":
     bot = AIOrchestrator()
     bot.run()
+                
