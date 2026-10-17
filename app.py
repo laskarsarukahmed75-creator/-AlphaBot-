@@ -1,5 +1,5 @@
 # =====================================================================
-# app.py – AlphaBot v10.0 FINAL INSTITUTIONAL EDITION
+# app.py – AlphaBot v10.0 FINAL INSTITUTIONAL EDITION (PART 1/2)
 # =====================================================================
 # MASTER UPGRADES (v9 -> v10):
 #   FIXED   : MCB bypass bug in pending queue
@@ -585,7 +585,6 @@ class TradeDatabase:
             gross_loss = abs(cur.fetchone()[0] or 0.0)
 
             if total == 0:
-                # FIXED: honest fallback (no fake profit_factor=1.0)
                 return {
                     "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
                     "win_rate": 0.0, "profit_factor": 0.0,
@@ -628,7 +627,6 @@ class TradeDatabase:
         finally:
             cur.close()
 
-    # NEW: Performance Attribution
     def get_attribution_stats(self):
         conn = self._get_conn()
         cur = conn.cursor()
@@ -2493,9 +2491,12 @@ class BacktestEngine:
         logger.info(f"🧪 Backtest complete {symbol}: {summary}")
         return {"summary": summary, "trades": trades[-50:]}
 
-
 # =====================================================================
-# CORE ORCHESTRATOR v10.0 FINAL
+# END OF PART 1
+# (यहाँ तक कॉपी करें और नीचे PART 2 पेस्ट करें)
+# =====================================================================
+# =====================================================================
+# CORE ORCHESTRATOR v10.0 FINAL (PART 2/2)
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -2830,89 +2831,47 @@ class AIOrchestrator:
                                      status="REJECTED", direction=direction)
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
-            if status not in ("VALID", "HIGH", "EXTREME"):
-                return
 
-            # Correlation shield (softened)
-            corr_ok, corr_reason = self._correlation_shield_ok(asset, direction)
-            if not corr_ok:
-                self.db.log_rejected(asset, price, score, corr_reason,
-                                    self.asset_state[asset]["volatility"],
-                                    breakdown.get("Regime", "V10_INST"),
-                                    "CorrelationShield", json.dumps(breakdown),
-                                    status="REJECTED", direction=direction)
-                self.memory.update_state({"rejected_signals_count": 1})
-                return
+            atr = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.008)
+            sl, tp1, tp2, tp3, risk, rr = self.dynamic_sl.calculate(asset, direction, price, atr)
 
-                # Portfolio heat check
-                heat_ok, heat_pct = self.sizing_engine.portfolio_heat_ok(self.active_trades)
-                if not heat_ok:
-                    self.db.log_rejected(asset, price, score, f"Portfolio heat {heat_pct}% > cap {Config.MAX_PORTFOLIO_HEAT_PCT}%",
-                                         self.asset_state[asset]["volatility"],
-                                         breakdown.get("Regime", "V10_INST"),
-                                         "PortfolioHeat", json.dumps(breakdown),
-                                         status="REJECTED", direction=direction)
-                    self.memory.update_state({"rejected_signals_count": 1})
-                    return
+            sizing = self.sizing_engine.calculate(price, sl)
+            trade_id = self.db.generate_trade_id()
+            token = f"V10-{asset}-{int(time.time()*1000)}"
+            
+            signal = {
+                'asset': asset,
+                'direction': direction,
+                'entry': price,
+                'sl': sl,
+                'tp1': tp1,
+                'tp2': tp2,
+                'tp3': tp3,
+                'sqs': score,
+                'session': breakdown.get("Session", "ALWAYS"),
+                'patterns': patterns,
+                'logic': reason,
+                'news': self.news.last_news.get('title', '')[:100],
+                'volatility': self.asset_state[asset]["volatility"],
+                'regime': breakdown.get("Regime", "V10_INST"),
+                'htf_trend': self.asset_state[asset]["htf_trend"],
+                'news_score': self.asset_state[asset]["news_sentiment"],
+                'score': score,
+                'confidence': status,
+                'pending_candles': Config.PENDING_VERIFICATION_CANDLES,
+                'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,
+                'dynamic_min_sqs': Config.MIN_SCORE_FOR_SIGNAL,
+                'signal_type': 'V10_INST',
+                'signal_token': token,
+                'trade_id': trade_id,
+                'score_breakdown': json.dumps(breakdown),
+                'quantity': sizing["quantity"],
+                'risk_usd': sizing["risk_usd"]
+            }
 
-                if not self._signal_limit_ok():
-                    self.db.log_rejected(asset, price, score, "Global daily limit reached",
-                                         self.asset_state[asset]["volatility"],
-                                         breakdown.get("Regime", "V10_INST"),
-                                         "DailyLimit", json.dumps(breakdown),
-                                         status="REJECTED", direction=direction)
-                    self.memory.update_state({"rejected_signals_count": 1})
-                    return
-
-                if not self._asset_cooldown_ok(asset):
-                    self.db.log_rejected(asset, price, score, f"Asset cooldown ({Config.ASSET_COOLDOWN_HOURS}h)",
-                                         self.asset_state[asset]["volatility"],
-                                         breakdown.get("Regime", "V10_INST"),
-                                         "Cooldown", json.dumps(breakdown),
-                                         status="REJECTED", direction=direction)
-                    self.memory.update_state({"rejected_signals_count": 1})
-                    return
-
-                atr = self.topology.get_atr(asset, period=14, tf=900) or (price * 0.008)
-                sl, tp1, tp2, tp3, risk, rr = self.dynamic_sl.calculate(asset, direction, price, atr)
-
-                sizing = self.sizing_engine.calculate(price, sl)
-                trade_id = self.db.generate_trade_id()
-                token = f"V10-{asset}-{int(time.time()*1000)}"
-                
-                signal = {
-                    'asset': asset,
-                    'direction': direction,
-                    'entry': price,
-                    'sl': sl,
-                    'tp1': tp1,
-                    'tp2': tp2,
-                    'tp3': tp3,
-                    'sqs': score,
-                    'session': breakdown.get("Session", "ALWAYS"),
-                    'patterns': patterns,
-                    'logic': reason,
-                    'news': self.news.last_news.get('title', '')[:100],
-                    'volatility': self.asset_state[asset]["volatility"],
-                    'regime': breakdown.get("Regime", "V10_INST"),
-                    'htf_trend': self.asset_state[asset]["htf_trend"],
-                    'news_score': self.asset_state[asset]["news_sentiment"],
-                    'score': score,
-                    'confidence': status,
-                    'pending_candles': Config.PENDING_VERIFICATION_CANDLES,
-                    'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,
-                    'dynamic_min_sqs': Config.MIN_SCORE_FOR_SIGNAL,
-                    'signal_type': 'V10_INST',
-                    'signal_token': token,
-                    'trade_id': trade_id,
-                    'score_breakdown': json.dumps(breakdown),
-                    'quantity': sizing["quantity"],
-                    'risk_usd': sizing["risk_usd"]
-                }
-
-                self.pending_queue.add_signal(signal)
-                self.memory.update_state({"total_signals_generated": 1})
-                logger.info(f"⏳ Added to 5m Verification Queue: {asset} {direction} @ {price:.2f} | Score: {score} ({status})")
+            self.pending_queue.add_signal(signal)
+            self.memory.update_state({"total_signals_generated": 1})
+            logger.info(f"⏳ Added to 5m Verification Queue: {asset} {direction} @ {price:.2f} | Score: {score} ({status})")
 
     def _send_final_signal(self, signal):
         try:
@@ -3458,4 +3417,3 @@ th{{background:#21262d;color:#8b949e;font-weight:600}}
 if __name__ == "__main__":
     bot = AIOrchestrator()
     bot.run()
-                
