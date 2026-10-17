@@ -1,5 +1,5 @@
 # =====================================================================
-# app.py – AlphaBot v10.0 FINAL INSTITUTIONAL EDITION (PART 1/2)
+# app.py – AlphaBot v10.0 FINAL INSTITUTIONAL EDITION
 # =====================================================================
 # MASTER UPGRADES (v9 -> v10):
 #   FIXED   : MCB bypass bug in pending queue
@@ -9,7 +9,7 @@
 #   FIXED   : CVD now uses rate-of-change (delta), not absolute value
 #   FIXED   : Weighted PnL edge case guarded with bounds
 #   FIXED   : Performance metrics fallback honest when no data
-#   FIXED   : Dead code removed
+#   FIXED   : Dead code removed & URL ping error handling secured
 #   NEW     : Backtest Engine (offline replay on 1yr historical)
 #   NEW     : Position Sizing Engine (0.5% risk/trade)
 #   NEW     : Daily/Weekly Loss Circuit Breaker
@@ -129,22 +129,22 @@ class Config:
     MCB_MAX_CONSECUTIVE_LOSSES = 3
     MCB_COOLDOWN_SECONDS = 6 * 3600
 
-    # NEW: Daily/Weekly loss circuit breaker
-    DAILY_LOSS_LIMIT_PCT = 2.0    # account % — trip 12h pause
-    WEEKLY_LOSS_LIMIT_PCT = 6.0   # account % — trip 48h pause
+    # Daily/Weekly loss circuit breaker
+    DAILY_LOSS_LIMIT_PCT = 2.0
+    WEEKLY_LOSS_LIMIT_PCT = 6.0
     DAILY_LOSS_PAUSE_SECONDS = 12 * 3600
     WEEKLY_LOSS_PAUSE_SECONDS = 48 * 3600
 
-    # NEW: Position Sizing
+    # Position Sizing
     ACCOUNT_BALANCE_USD = float(os.getenv("ACCOUNT_BALANCE_USD", "1000"))
-    RISK_PER_TRADE_PCT = 0.5       # 0.5% per trade
-    MAX_PORTFOLIO_HEAT_PCT = 3.0   # total max risk across all open
+    RISK_PER_TRADE_PCT = 0.5
+    MAX_PORTFOLIO_HEAT_PCT = 3.0
     MAX_LEVERAGE = 10.0
 
-    # NEW: Slippage model (applied to live PnL + backtest)
-    SLIPPAGE_PCT = 0.001           # 0.10%
+    # Slippage model
+    SLIPPAGE_PCT = 0.001
 
-    # NEW: Backtest config
+    # Backtest config
     BACKTEST_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
     BACKTEST_INTERVAL = "15m"
     BACKTEST_LOOKBACK_DAYS = 365
@@ -154,9 +154,9 @@ class Config:
     EXTREME_FUNDING_RATE = 0.0005
     OB_BULL_IMBALANCE = 1.25
     OB_BEAR_IMBALANCE = 0.80
-    FUNDING_POLL_SECONDS = 600     # FIXED: was 30s, now 10 min
+    FUNDING_POLL_SECONDS = 600
 
-    # Correlation shield (FIXED: softer)
+    # Correlation shield
     CORRELATION_BLOCK_MIN_OPEN = 2
 
     PENDING_VERIFICATION_CANDLES = 1
@@ -178,8 +178,7 @@ class Config:
     PARABOLIC_RSI_THRESHOLD = 68
     OVEREXTENSION_ATR_MULT = 2.2
 
-    # CVD persistence
-    CVD_PERSIST_SECONDS = 300       # save every 5 min
+    CVD_PERSIST_SECONDS = 300
 
 
 # =====================================================================
@@ -322,7 +321,6 @@ class MongoDatabase:
         except Exception:
             pass
 
-    # NEW: CVD persistence
     def save_cvd_state(self, symbol: str, cvd_value: float):
         if self.db is None:
             return
@@ -824,7 +822,7 @@ class CryptoNewsScanner:
 
 
 # =====================================================================
-# WEBSOCKET & INSTITUTIONAL DATA STREAM (With CVD Persistence)
+# WEBSOCKET & INSTITUTIONAL DATA STREAM
 # =====================================================================
 class BinanceFuturesStream:
     def __init__(self, mongo_db=None):
@@ -848,7 +846,6 @@ class BinanceFuturesStream:
             return
         self.running = True
         self.running_metrics = True
-        # NEW: restore CVD from Mongo on boot
         if self.mongo and self.mongo.db is not None:
             for s in self.symbols:
                 restored = self.mongo.load_cvd_state(s)
@@ -891,7 +888,6 @@ class BinanceFuturesStream:
                 time.sleep(60)
 
     def _fetch_metrics_loop(self):
-        """FIXED: Funding polled every 10 min instead of 30s to respect rate limits."""
         last_funding_fetch = 0
         last_ob_fetch = 0
         while self.running_metrics:
@@ -899,7 +895,6 @@ class BinanceFuturesStream:
                 now = time.time()
                 for symbol in self.symbols:
                     sym_up = symbol.upper()
-                    # Funding rate: every 10 min
                     if now - last_funding_fetch >= Config.FUNDING_POLL_SECONDS:
                         try:
                             r = requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym_up}", timeout=5)
@@ -909,7 +904,6 @@ class BinanceFuturesStream:
                                     self.data['funding_rate'][symbol] = fr
                         except Exception:
                             pass
-                    # Order book: every 30s
                     if now - last_ob_fetch >= 30:
                         try:
                             r = requests.get(f"https://fapi.binance.com/fapi/v1/depth?symbol={sym_up}&limit=20", timeout=5)
@@ -932,7 +926,6 @@ class BinanceFuturesStream:
                 time.sleep(30)
 
     def _cvd_persist_loop(self):
-        """Persist CVD to Mongo every 5 min."""
         while self.running_metrics:
             time.sleep(Config.CVD_PERSIST_SECONDS)
             if self.mongo and self.mongo.db is not None:
@@ -1535,7 +1528,7 @@ class NeutralCandleEngine:
 
 
 # =====================================================================
-# POSITION SIZING ENGINE (NEW v10)
+# POSITION SIZING ENGINE
 # =====================================================================
 class PositionSizingEngine:
     def __init__(self, memory_engine):
@@ -1571,7 +1564,7 @@ class PositionSizingEngine:
 
 
 # =====================================================================
-# INSTITUTIONAL SIGNAL ENGINE (With Fixed CVD-rate-of-change)
+# INSTITUTIONAL SIGNAL ENGINE
 # =====================================================================
 class InstitutionalSignalEngine:
     def __init__(self, topology, futures_stream, absorption_meter, neutral_engine):
@@ -1639,7 +1632,6 @@ class InstitutionalSignalEngine:
         ob_imbalance = self.futures.get_ob_imbalance(asset.lower())
         session_name, session_mod = self.get_ist_session()
 
-        # FIXED: CVD rate-of-change (delta over last N ticks)
         current_cvd = self.futures.get_cvd(asset.lower())
         self._cvd_history[asset].append(current_cvd)
         if len(self._cvd_history[asset]) >= 5:
@@ -1680,7 +1672,6 @@ class InstitutionalSignalEngine:
             trend_15_bull = ema20_15 > ema50_15
             trend_1h_bull = ema20_1h > ema50_1h
 
-            # ---- LAYER 1: MTF TREND + SESSION (Max 25) ----
             if trend_15_bull and trend_1h_bull and rsi_15 >= 52:
                 direction, trend_score = "BUY", 22
             elif not trend_15_bull and not trend_1h_bull and rsi_15 <= 48:
@@ -1702,7 +1693,6 @@ class InstitutionalSignalEngine:
             trend_score = max(5, min(25, trend_score + (3 if session_mod > 0 else session_mod)))
             breakdown["Trend"] = trend_score
 
-            # ---- LAYER 2: SMC LOCATION (Max 25) ----
             loc_score, loc_reasons = 0, []
             sr = self.topology.support_resistance[asset]
             nearest_support = max(sr["support"]) if sr["support"] else None
@@ -1757,7 +1747,6 @@ class InstitutionalSignalEngine:
             breakdown["Location"] = loc_score
             breakdown["LocationDetails"] = " | ".join(loc_reasons) if loc_reasons else "Standard"
 
-            # ---- LAYER 3: ORDER FLOW (Max 30) ----
             flow_score, flow_reasons = 0, []
             quad_code, quad_label = self.get_oi_quadrant(asset, price_change_15m)
             breakdown["OIQuadrant"] = quad_code
@@ -1803,7 +1792,6 @@ class InstitutionalSignalEngine:
                 flow_score += 5
                 flow_reasons.append("VolExpansion")
 
-            # FIXED: use CVD rate-of-change, not absolute
             if direction == "BUY" and cvd_roc > 0:
                 flow_score += 5
                 flow_reasons.append(f"CVD_ROC+({cvd_roc:.1f})")
@@ -1819,7 +1807,6 @@ class InstitutionalSignalEngine:
             breakdown["VolumeOrderFlow"] = flow_score
             breakdown["VolFlowDetails"] = " | ".join(flow_reasons) if flow_reasons else "Neutral"
 
-            # ---- LAYER 4: STRUCTURE + BTC CORRELATION (Max 20) ----
             struct_score, struct_reasons = 0, []
             if self.topology.choch.get(asset, False):
                 struct_score += 5
@@ -1866,7 +1853,6 @@ class InstitutionalSignalEngine:
             breakdown["CandleStructure"] = struct_score
             breakdown["StructureDetails"] = " | ".join(struct_reasons) if struct_reasons else "None"
 
-            # ---- FINAL ----
             total_score = trend_score + loc_score + flow_score + struct_score
             breakdown["Total"] = total_score
             breakdown["Direction"] = direction
@@ -1903,7 +1889,7 @@ class InstitutionalSignalEngine:
 
 
 # =====================================================================
-# DYNAMIC STOP LOSS (3-Tier TP + Slippage Aware)
+# DYNAMIC STOP LOSS
 # =====================================================================
 class DynamicStopLoss:
     def __init__(self, topology):
@@ -1953,7 +1939,7 @@ class DynamicStopLoss:
 
 
 # =====================================================================
-# 5M PENDING QUEUE (FIXED: MCB re-check + tighter adverse threshold)
+# 5M PENDING QUEUE
 # =====================================================================
 class PendingVerificationQueue:
     def __init__(self, topology, futures_stream, memory_engine, correlation_fn):
@@ -1988,7 +1974,6 @@ class PendingVerificationQueue:
                 return []
             latest = completed[-1]
 
-            # FIXED: check MCB before releasing any queued signals
             mem = self.memory.get_or_create_state()
             mcb_until = int(mem.get("mcb_until_ts", 0))
             mcb_active = mcb_until > int(time.time())
@@ -2049,7 +2034,6 @@ class PendingVerificationQueue:
                     to_remove.append(key)
                     continue
 
-                # NEW: signal decay check — if price drifted too far
                 drift = abs(close_5m - data['start_price'])
                 if drift > 0.35 * atr_5m:
                     data['reject_reason'] = f"5m Verify Failed: Entry Drift {drift:.2f} > 0.35*ATR"
@@ -2087,7 +2071,7 @@ class PendingVerificationQueue:
 
 
 # =====================================================================
-# TRADE HEALTH ENGINE & ABSORPTION METER
+# TRADE HEALTH & ABSORPTION METER
 # =====================================================================
 class TradeHealthEngine:
     def __init__(self, topology, cache):
@@ -2178,7 +2162,7 @@ class MarketAbsorptionMeter:
 
 
 # =====================================================================
-# TELEGRAM PIPELINE (Inline Buttons Support)
+# TELEGRAM PIPELINE
 # =====================================================================
 class TelegramPipeline:
     def __init__(self, orch=None):
@@ -2268,7 +2252,7 @@ class TelegramPipeline:
 
 
 # =====================================================================
-# ACTIVE TRADE LIFECYCLE (with Daily/Weekly CB check)
+# ACTIVE TRADE LIFECYCLE
 # =====================================================================
 class ActiveTradeLifecycle:
     def __init__(self, orchestrator):
@@ -2317,11 +2301,9 @@ class ActiveTradeLifecycle:
 
 
 # =====================================================================
-# BACKTEST ENGINE (NEW v10)
+# BACKTEST ENGINE
 # =====================================================================
 class BacktestEngine:
-    """Offline replay of signal engine over historical candles."""
-
     def __init__(self, topology, signal_engine, dynamic_sl, slippage_pct=None):
         self.topology = topology
         self.signal_engine = signal_engine
@@ -2329,7 +2311,6 @@ class BacktestEngine:
         self.slippage = slippage_pct if slippage_pct is not None else Config.SLIPPAGE_PCT
 
     def fetch_historical(self, symbol: str, interval: str = "15m", days: int = 365) -> List[dict]:
-        """Fetch up to `days` of candles from Binance (auto-paginates)."""
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - (days * 24 * 3600 * 1000)
         url = "https://api.binance.com/api/v3/klines"
@@ -2366,14 +2347,12 @@ class BacktestEngine:
         return candles
 
     def run(self, symbol: str, days: int = None) -> dict:
-        """Simple replay: iterate candles, evaluate signal at each close, simulate TP/SL."""
         days = days or Config.BACKTEST_LOOKBACK_DAYS
         logger.info(f"🧪 Backtest starting for {symbol} ({days} days)...")
         candles = self.fetch_historical(symbol, Config.BACKTEST_INTERVAL, days)
         if len(candles) < 100:
             return {"error": "Not enough candles", "symbol": symbol}
 
-        # Load into topology at 15m only
         with self.topology.lock:
             self.topology.candles[900][symbol] = candles
             c15 = candles
@@ -2384,11 +2363,9 @@ class BacktestEngine:
         peak = balance
         max_dd = 0.0
 
-        # Replay every 4th 15m candle (once per hour) to keep it fast
         step = 4
         for i in range(60, len(candles) - 2, step):
             with self.topology.lock:
-                # Trim view to candles up to i
                 self.topology.candles[900][symbol] = candles[:i+1]
             try:
                 price = candles[i]["close"]
@@ -2404,10 +2381,9 @@ class BacktestEngine:
             atr = self.topology.get_atr(symbol, period=14, tf=900) or (price * 0.008)
             sl, tp1, tp2, tp3, risk, rr = self.dynamic_sl.calculate(symbol, direction, entry, atr)
 
-            # Simulate forward on next N candles
             tp1_hit = tp2_hit = False
             exit_price, exit_reason = None, None
-            for j in range(i + 1, min(i + 96, len(candles))):  # max 24h hold
+            for j in range(i + 1, min(i + 96, len(candles))):
                 c = candles[j]
                 if direction == "BUY":
                     if not tp1_hit and c["high"] >= tp1:
@@ -2440,7 +2416,6 @@ class BacktestEngine:
                 exit_price = candles[min(i + 96, len(candles)-1)]["close"]
                 exit_reason = "TimeExit"
 
-            # Weighted PnL (matching live logic)
             if tp2_hit:
                 move = 0.5 * abs(tp1 - entry) + 0.3 * abs(tp2 - entry) + 0.2 * abs(exit_price - entry)
                 if direction == "SELL":
@@ -2453,7 +2428,6 @@ class BacktestEngine:
                 move = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
                 move -= abs(entry) * self.slippage
 
-            # Guard: SELL trades — PnL should be entry - exit when profitable
             if direction == "SELL" and not tp1_hit:
                 move = (entry - exit_price) - abs(entry) * self.slippage
 
@@ -2491,12 +2465,9 @@ class BacktestEngine:
         logger.info(f"🧪 Backtest complete {symbol}: {summary}")
         return {"summary": summary, "trades": trades[-50:]}
 
+
 # =====================================================================
-# END OF PART 1
-# (यहाँ तक कॉपी करें और नीचे PART 2 पेस्ट करें)
-# =====================================================================
-# =====================================================================
-# CORE ORCHESTRATOR v10.0 FINAL (PART 2/2)
+# CORE ORCHESTRATOR
 # =====================================================================
 class AIOrchestrator:
     def __init__(self):
@@ -2561,12 +2532,10 @@ class AIOrchestrator:
         mem = self.memory.get_or_create_state()
         now = int(time.time())
         updates = {}
-        # Daily rollover (24h)
         daily_ts = int(mem.get("daily_start_ts", 0))
         if now - daily_ts > 86400:
             updates["daily_start_ts"] = now
             updates["daily_start_balance"] = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0))
-        # Weekly rollover (7d)
         weekly_ts = int(mem.get("weekly_start_ts", 0))
         if now - weekly_ts > 7 * 86400:
             updates["weekly_start_ts"] = now
@@ -2614,12 +2583,10 @@ class AIOrchestrator:
             if elapsed >= 300:
                 self.memory.update_state({"total_run_seconds": elapsed, "last_update": now},
                                          absolute_keys={"last_update"})
-                # rollover check
                 self._init_daily_weekly_baselines()
                 last_sync = now
 
     def _attribution_report_loop(self):
-        """Every 6h, log performance attribution."""
         while True:
             time.sleep(6 * 3600)
             try:
@@ -2691,7 +2658,6 @@ class AIOrchestrator:
         return (time.time() - last) >= (Config.ASSET_COOLDOWN_HOURS * 3600)
 
     def _correlation_shield_ok(self, asset: str, direction: str) -> Tuple[bool, str]:
-        """FIXED: block only if 2+ same-direction trades already open."""
         same_dir_open = 0
         with self.trade_lock:
             for tid, t in self.active_trades.items():
@@ -2712,7 +2678,6 @@ class AIOrchestrator:
         with self.trade_lock:
             has_open_trade = any(t['asset'] == asset for t in self.active_trades.values())
 
-        # 5m candle close -> pending verification
         if self.topology.candle_just_closed[300].get(asset, False):
             if self.pending_queue.pending:
                 self.pending_queue.check_pending(asset)
@@ -2733,7 +2698,6 @@ class AIOrchestrator:
                     if not has_open_trade:
                         self._send_final_signal(signal)
 
-        # 15m candle close -> new evaluation
         if self.topology.candle_just_closed[900].get(asset, False):
             self._update_indicators(asset, price)
             if has_open_trade:
@@ -2792,7 +2756,6 @@ class AIOrchestrator:
             if status not in ("VALID", "HIGH", "EXTREME"):
                 return
 
-            # Correlation shield (softened)
             corr_ok, corr_reason = self._correlation_shield_ok(asset, direction)
             if not corr_ok:
                 self.db.log_rejected(asset, price, score, corr_reason,
@@ -2803,7 +2766,6 @@ class AIOrchestrator:
                 self.memory.update_state({"rejected_signals_count": 1})
                 return
 
-            # Portfolio heat check
             heat_ok, heat_pct = self.sizing_engine.portfolio_heat_ok(self.active_trades)
             if not heat_ok:
                 self.db.log_rejected(asset, price, score, f"Portfolio heat {heat_pct}% > cap {Config.MAX_PORTFOLIO_HEAT_PCT}%",
@@ -2840,33 +2802,22 @@ class AIOrchestrator:
             token = f"V10-{asset}-{int(time.time()*1000)}"
             
             signal = {
-                'asset': asset,
-                'direction': direction,
-                'entry': price,
-                'sl': sl,
-                'tp1': tp1,
-                'tp2': tp2,
-                'tp3': tp3,
-                'sqs': score,
-                'session': breakdown.get("Session", "ALWAYS"),
-                'patterns': patterns,
-                'logic': reason,
+                'asset': asset, 'direction': direction, 'entry': price,
+                'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+                'sqs': score, 'session': breakdown.get("Session", "ALWAYS"),
+                'patterns': patterns, 'logic': reason,
                 'news': self.news.last_news.get('title', '')[:100],
                 'volatility': self.asset_state[asset]["volatility"],
                 'regime': breakdown.get("Regime", "V10_INST"),
                 'htf_trend': self.asset_state[asset]["htf_trend"],
                 'news_score': self.asset_state[asset]["news_sentiment"],
-                'score': score,
-                'confidence': status,
+                'score': score, 'confidence': status,
                 'pending_candles': Config.PENDING_VERIFICATION_CANDLES,
                 'volume_decay_threshold': Config.VOLUME_DECAY_THRESHOLD,
                 'dynamic_min_sqs': Config.MIN_SCORE_FOR_SIGNAL,
-                'signal_type': 'V10_INST',
-                'signal_token': token,
-                'trade_id': trade_id,
-                'score_breakdown': json.dumps(breakdown),
-                'quantity': sizing["quantity"],
-                'risk_usd': sizing["risk_usd"]
+                'signal_type': 'V10_INST', 'signal_token': token,
+                'trade_id': trade_id, 'score_breakdown': json.dumps(breakdown),
+                'quantity': sizing["quantity"], 'risk_usd': sizing["risk_usd"]
             }
 
             self.pending_queue.add_signal(signal)
@@ -2961,7 +2912,6 @@ class AIOrchestrator:
                         self.mongo.update_trade_fields(tid, {"stop_loss": entry, "tp1_hit": True})
                         self.db.update_trade_sqlite(tid, {"stop_loss": entry, "tp1_hit": 1})
                         self.telegram.fire_partial_tp(tid, asset, d, "TP1 (50% Booked)", price, entry)
-                        logger.info(f"🎯 Trade #{tid} ({asset}) hit TP1 @ {price:.2f} -> SL moved to BE ({entry:.2f})")
 
                 if trade.get('tp1_hit', False) and not trade.get('tp2_hit', False):
                     if (d == 'BUY' and price >= tp2) or (d == 'SELL' and price <= tp2):
@@ -2970,7 +2920,6 @@ class AIOrchestrator:
                         self.mongo.update_trade_fields(tid, {"stop_loss": tp1, "tp2_hit": True})
                         self.db.update_trade_sqlite(tid, {"stop_loss": tp1, "tp2_hit": 1})
                         self.telegram.fire_partial_tp(tid, asset, d, "TP2 (80% Total Booked)", price, tp1)
-                        logger.info(f"🎯 Trade #{tid} ({asset}) hit TP2 @ {price:.2f} -> SL moved to TP1 ({tp1:.2f})")
 
                 if trade.get('tp2_hit', False):
                     c5 = self.topology.get_completed(asset, 300)
@@ -3056,7 +3005,6 @@ class AIOrchestrator:
 
         self.memory.update_state(updates, absolute_keys={"consecutive_losses", "mcb_until_ts"})
 
-        # Check Daily/Weekly CB
         daily_balance = float(mem.get("daily_start_balance", Config.ACCOUNT_BALANCE_USD))
         weekly_balance = float(mem.get("weekly_start_balance", Config.ACCOUNT_BALANCE_USD))
         current_balance = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0)) + pnl
@@ -3196,13 +3144,17 @@ class AIOrchestrator:
         while True:
             time.sleep(300)
             try:
-                requests.get(Config.RENDER_URL, timeout=10)
+                if Config.RENDER_URL:
+                    url = Config.RENDER_URL.strip()
+                    if not url.startswith("http"):
+                        url = f"https://{url}"
+                    requests.get(url, timeout=10)
             except Exception:
                 pass
 
 
 # =====================================================================
-# v10.0 FINAL TERMINAL DASHBOARD & HEALTH SERVER
+# DASHBOARD & HEALTH SERVER
 # =====================================================================
 def start_health_server(orchestrator):
     port = int(os.environ.get("PORT", 10000))
