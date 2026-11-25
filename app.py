@@ -1882,7 +1882,7 @@ class InstitutionalSignalEngine:
             breakdown["Direction"] = direction
             brain_blocked = False
             if self.xray_brain is not None:
-            brain_res = self.xray_brain.evaluate_pattern(
+                brain_res = self.xray_brain.evaluate_pattern(
                 asset=asset,
                 price=price,
                 ema20_15=ema20_15,
