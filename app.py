@@ -46,13 +46,7 @@ try:
     HAS_MULTI_OI = True
 except ImportError:
     HAS_MULTI_OI = False
-    
-try:
-    from candle_xray_brain import AdvancedCandleXRay, WickPatternBrain
-    HAS_XRAY_BRAIN = True
-except ImportError:
-    HAS_XRAY_BRAIN = False
-   
+
     class MultiExchangeOIFetcher:
         def __init__(self):
             self._cache = {}
@@ -85,10 +79,14 @@ except ImportError:
             return result
 
 try:
-    import psutil
-    HAS_PSUTIL = True
+    from candle_xray_brain import AdvancedCandleXRay, WickPatternBrain
+    HAS_XRAY_BRAIN = True
 except ImportError:
-    HAS_PSUTIL = False
+    try:
+        from candle_xray_brain_v2_2 import AdvancedCandleXRay, WickPatternBrain
+        HAS_XRAY_BRAIN = True
+    except ImportError:
+        HAS_XRAY_BRAIN = False
 
 try:
     from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -98,7 +96,7 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("AlphaBot-v10.0-FINAL")
-
+logger.info(f"Modules loaded | HAS_MULTI_OI={HAS_MULTI_OI} | HAS_XRAY_BRAIN={HAS_XRAY_BRAIN}")
 
 class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
