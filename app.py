@@ -356,8 +356,13 @@ class TradeDatabase:
 
     def _get_conn(self):
         if not hasattr(self.local, 'conn'):
-            self.local.conn = sqlite3.connect(Config.DB_PATH, check_same_thread=False)
+            self.local.conn = sqlite3.connect(Config.DB_PATH, timeout=15.0, check_same_thread=False)
             self.local.conn.row_factory = sqlite3.Row
+            try:
+                self.local.conn.execute("PRAGMA journal_mode=WAL;")
+                self.local.conn.execute("PRAGMA synchronous=NORMAL;")
+            except Exception:
+                pass
         return self.local.conn
 
     def _create_tables(self):
@@ -587,10 +592,18 @@ class TradeDatabase:
             gross_loss = abs(cur.fetchone()[0] or 0.0)
 
             if total == 0:
+                fb = mem_fallback or {}
+                fb_closed = int(fb.get("total_trades_closed", 0) or 0)
+                fb_wins = int(fb.get("total_wins", 0) or 0)
+                fb_losses = int(fb.get("total_losses", 0) or 0)
+                fb_wr = (fb_wins / fb_closed) if fb_closed > 0 else 0.0
                 return {
-                    "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
-                    "win_rate": 0.0, "profit_factor": 0.0,
-                    "total_pnl": float((mem_fallback or {}).get("total_pnl", 0.0)),
+                    "total_trades": fb_closed,
+                    "winning_trades": fb_wins,
+                    "losing_trades": fb_losses if fb_losses else max(0, fb_closed - fb_wins),
+                    "win_rate": fb_wr,
+                    "profit_factor": 0.0,
+                    "total_pnl": float(fb.get("total_pnl", 0.0)),
                     "note": "No closed trades yet in SQLite; using memory counters only."
                 }
 
