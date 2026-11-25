@@ -781,7 +781,10 @@ class PersistentMemoryEngine:
                     self.cache[k] = v
                     set_fields[k] = v
                 elif isinstance(v, (int, float)):
-                    self.cache[k] = self.cache.get(k, 0) + v
+                    current_val = self.cache.get(k, 0)
+                    if current_val is None:
+                        current_val = 0
+                    self.cache[k] = current_val + v
                     inc_fields[k] = v
                 else:
                     self.cache[k] = v
@@ -802,11 +805,7 @@ class PersistentMemoryEngine:
                         self.mongo.db.global_bot_memory.update_one({"_id": "global_state"}, doc, upsert=True)
                 except Exception as e:
                     logger.error(f"MongoDB memory update error: {e}")
-                  current_val = self.cache.get(k, 0)
-                  if current_val is None:
-                      current_val = 0
-                  self.cache[k] = current_val + v
-
+            self._save_to_sqlite(self.cache)
 
 # =====================================================================
 # NEWS SCANNER
