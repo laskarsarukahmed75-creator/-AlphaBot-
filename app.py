@@ -46,6 +46,7 @@ try:
     HAS_MULTI_OI = True
 except ImportError:
     HAS_MULTI_OI = False
+    
  try:
     from candle_xray_brain import AdvancedCandleXRay, WickPatternBrain
     HAS_XRAY_BRAIN = True
