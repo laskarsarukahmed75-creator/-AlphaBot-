@@ -1579,6 +1579,24 @@ class InstitutionalSignalEngine:
         self.neutral = neutral_engine
         self.multi_oi = MultiExchangeOIFetcher()
         self._cvd_history = {a: deque(maxlen=20) for a in Config.ASSETS}
+                self.xray_brain = None
+        if HAS_XRAY_BRAIN:
+            try:
+                _xray = AdvancedCandleXRay(
+                    topology=self.topology,
+                    futures_stream=self.futures,
+                    multi_oi=self.multi_oi,
+                )
+                self.xray_brain = WickPatternBrain(
+                    topology=self.topology,
+                    xray=_xray,
+                    telegram=globals().get("telegram"),
+                    db_path="trades_v7.db",
+                    mongo_db=getattr(self.futures, "mongo", None),
+                )
+            except Exception as e:
+                logger.error(f"WickPatternBrain init error: {e}")
+                self.xray_brain = None
 
     @staticmethod
     def get_ist_session() -> Tuple[str, int]:
@@ -1861,6 +1879,27 @@ class InstitutionalSignalEngine:
             total_score = trend_score + loc_score + flow_score + struct_score
             breakdown["Total"] = total_score
             breakdown["Direction"] = direction
+            brain_blocked = False
+            if self.xray_brain is not None:
+            brain_res = self.xray_brain.evaluate_pattern(
+                asset=asset,
+                price=price,
+                ema20_15=ema20_15,
+                ema50_15=ema50_15,
+                ema20_1h=ema20_1h,
+                ema50_1h=ema50_1h,
+            )
+            p_name = brain_res.get("pattern", "NONE")
+            p_bonus = int(brain_res.get("bonus", 0) or 0)
+            if direction == "BUY" and not brain_res.get("allow_buy", False):
+                brain_blocked = True
+            elif direction == "SELL" and not brain_res.get("allow_sell", False):
+                brain_blocked = True
+            else:
+                if p_bonus:
+                    total_score += p_bonus
+                    breakdown["PatternBrain"] = p_bonus
+            breakdown["Total"] = total_score
 
             if regime["regime"] == "MOMENTUM":
                 te, th, tv = 72, 60, 52
@@ -1872,8 +1911,9 @@ class InstitutionalSignalEngine:
             if session_name == "DEAD_ZONE":
                 tv += 6
                 th += 5
-
-            if total_score >= te:
+            if brain_blocked:
+                status = "REJECTED"   
+            elif total_score >= te:
                 status = "EXTREME"
             elif total_score >= th:
                 status = "HIGH"
