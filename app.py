@@ -183,7 +183,7 @@ class Config:
     OVEREXTENSION_ATR_MULT = 2.2
 
     CVD_PERSIST_SECONDS = 300
-
+    REQUIRE_PATTERN_CONFIRMATION = os.getenv("REQUIRE_PATTERN_CONFIRMATION", "true").lower() == "true"
 
 # =====================================================================
 # DATA VALIDATION
@@ -215,7 +215,7 @@ class DataValidator:
                     candle["high"] >= max(candle["open"], candle["close"]) and
                     candle["low"] <= min(candle["open"], candle["close"]) and
                     candle["low"] <= candle["high"] and
-                    candle["volume"] >= 0)
+                    DataValidator.validate_volume(candle.get("volume")))
         except Exception:
             return False
 
