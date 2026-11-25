@@ -1580,7 +1580,7 @@ class InstitutionalSignalEngine:
         self.neutral = neutral_engine
         self.multi_oi = MultiExchangeOIFetcher()
         self._cvd_history = {a: deque(maxlen=20) for a in Config.ASSETS}
-                self.xray_brain = None
+        self.xray_brain = None
         if HAS_XRAY_BRAIN:
             try:
                 _xray = AdvancedCandleXRay(
