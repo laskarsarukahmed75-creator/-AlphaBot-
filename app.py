@@ -715,9 +715,14 @@ class PersistentMemoryEngine:
                     pass
             state = self.sqlite.get_memory_state()
             if state:
-                self.cache = {"_id": "global_state", **state}
-                logger.info("Memory loaded from SQLite fallback.")
-                return
+              merged = {"_id": "global_state", **self._defaults(), **state}
+              for k, v in self._defaults().items():
+                  if merged.get(k) is None:
+                      merged[k] = v
+              self.cache = merged
+              logger.info("Memory loaded from SQLite fallback.")
+              return
+
             default = self._defaults()
             default["_id"] = "global_state"
             default["first_launch_timestamp"] = int(time.time())
@@ -797,7 +802,10 @@ class PersistentMemoryEngine:
                         self.mongo.db.global_bot_memory.update_one({"_id": "global_state"}, doc, upsert=True)
                 except Exception as e:
                     logger.error(f"MongoDB memory update error: {e}")
-            self._save_to_sqlite(self.cache)
+                  current_val = self.cache.get(k, 0)
+                  if current_val is None:
+                      current_val = 0
+                  self.cache[k] = current_val + v
 
 
 # =====================================================================
