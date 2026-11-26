@@ -1118,16 +1118,19 @@ class BinancePublicStream:
             self.last_tick_time = time.time()
             self.tick_counter += 1
         try:
-            k = json.loads(msg)["data"]["k"]
-            symbol = k["s"]
-            if symbol in Config.ASSETS:
-                close_price = float(k["c"])
-                cum_vol = float(k["v"])
-                kline_start = int(k["t"]) // 1000
-                prev_start, prev_vol = self._last_kline_state.get(symbol, (kline_start, 0.0))
-                delta_vol = cum_vol if kline_start != prev_start else max(0.0, cum_vol - prev_vol)
-                self._last_kline_state[symbol] = (kline_start, cum_vol)
-                self.on_price_update(symbol, close_price, delta_vol)
+                payload = json.loads(msg) if isinstance(msg, str) else msg
+                k = (payload or {}).get("data", {}).get("k") or {}
+                symbol = k.get("s")
+                if symbol in Config.ASSETS:
+                    close_price = float(k.get("c") or 0.0)
+                    cum_vol = float(k.get("v") or 0.0)
+                    kline_start = int(k.get("t") or 0) // 1000
+                    prev_start, prev_vol = self._last_kline_state.get(symbol, (kline_start, 0.0))
+                    prev_vol = float(prev_vol or 0.0)
+                    delta_vol = cum_vol if kline_start != prev_start else max(0.0, cum_vol - prev_vol)
+                    self._last_kline_state[symbol] = (kline_start, cum_vol)
+                    self.on_price_update(symbol, close_price, delta_vol)
+
         except Exception as e:
             logger.error(f"Public WS msg parse error: {e}")
 
