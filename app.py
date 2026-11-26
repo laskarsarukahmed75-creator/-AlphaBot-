@@ -3039,13 +3039,9 @@ class AIOrchestrator:
             move_tp1 = abs(tp1 - entry)
             move_tp2 = abs(tp2 - entry)
             pnl = 0.50 * move_tp1 + 0.30 * move_tp2 + 0.20 * raw_move
-            if d == 'SELL' and raw_move > 0:
-                pnl = -pnl 
         elif trade.get('tp1_hit'):
             move_tp1 = abs(tp1 - entry)
             pnl = 0.50 * move_tp1 + 0.50 * raw_move
-            if d == 'SELL' and raw_move > 0:
-                pnl = -pnl
         else:
             pnl = raw_move
 
