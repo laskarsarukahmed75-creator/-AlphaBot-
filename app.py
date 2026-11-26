@@ -1272,8 +1272,12 @@ class CandleTopologyEngine:
         tolerance = Config.ANCHOR_RETEST_TOLERANCE
         with self.lock:
             for lvl in self.high_volume_levels.get(asset, []):
-                level_price = lvl["price"]
+                level_price = lvl.get("price")
+                if not level_price or float(level_price) <= 0:
+                    continue
+                level_price = float(level_price)
                 if abs(price - level_price) / level_price <= tolerance:
+
                     if direction:
                         if direction == "BUY" and lvl["type"] in ("low", "close"):
                             return True, level_price
