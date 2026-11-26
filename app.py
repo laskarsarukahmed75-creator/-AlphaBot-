@@ -1617,7 +1617,7 @@ class InstitutionalSignalEngine:
                     topology=self.topology,
                     xray=_xray,
                     telegram=globals().get("telegram"),
-                    db_path="trades_v7.db",
+                    db_path=Config.DB_PATH,
                     mongo_db=getattr(self.futures, "mongo", None),
                 )
             except Exception as e:
