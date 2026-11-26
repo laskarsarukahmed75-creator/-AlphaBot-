@@ -1895,16 +1895,16 @@ class InstitutionalSignalEngine:
                     struct_score += 4
                     struct_reasons.append("BTC_KingAligned")
 
-            if dist_from_ema < (2.2 * atr_pct):
-                struct_score += 4
+        if dist_from_ema < (2.2 * atr_pct):
+            struct_score += 4
 
-            struct_score = max(0, min(struct_score, 20))
-            breakdown["CandleStructure"] = struct_score
-            breakdown["StructureDetails"] = " | ".join(struct_reasons) if struct_reasons else "None"
+        struct_score = max(0, min(struct_score, 20))
+        breakdown["CandleStructure"] = struct_score
+        breakdown["StructureDetails"] = " | ".join(struct_reasons) if struct_reasons else "None"
 
-            total_score = trend_score + loc_score + flow_score + struct_score
-            breakdown["Total"] = total_score
-            breakdown["Direction"] = direction
+        total_score = trend_score + loc_score + flow_score + struct_score
+        breakdown["Total"] = total_score
+        breakdown["Direction"] = direction
         brain_blocked = False
         p_name = "NONE"
         if self.xray_brain is not None:
@@ -1933,37 +1933,37 @@ class InstitutionalSignalEngine:
         breakdown["Pattern"] = p_name
         breakdown["Total"] = total_score
 
-            if regime["regime"] == "MOMENTUM":
-                te, th, tv = 72, 60, 52
-            elif regime["regime"] == "REVERSAL":
-                te, th, tv = 78, 68, 58
-            else:
-                te, th, tv = Config.SCORE_EXTREME, Config.SCORE_HIGH, Config.SCORE_VALID
+        if regime["regime"] == "MOMENTUM":
+            te, th, tv = 72, 60, 52
+        elif regime["regime"] == "REVERSAL":
+            te, th, tv = 78, 66, 58
+        else:
+            te, th, tv = Config.SCORE_EXTREME, Config.SCORE_HIGH, Config.SCORE_VALID
 
-            if session_name == "DEAD_ZONE":
-                tv += 6
-                th += 5
-            if brain_blocked:
-                status = "REJECTED"   
-            elif total_score >= te:
-                status = "EXTREME"
-            elif total_score >= th:
-                status = "HIGH"
-            elif total_score >= tv:
-                status = "VALID"
-            elif total_score >= Config.SCORE_WATCH:
-                status = "WATCH"
-            else:
-                status = "REJECTED"
+        if session_name == "DEAD_ZONE":
+            tv += 6
+            th += 5
+        if brain_blocked:
+            status = "REJECTED"
+        elif total_score >= te:
+            status = "EXTREME"
+        elif total_score >= th:
+            status = "HIGH"
+        elif total_score >= tv:
+            status = "VALID"
+        elif total_score >= Config.SCORE_WATCH:
+            status = "WATCH"
+        else:
+            status = "REJECTED"
 
-            reason = (f"[{session_name}] {quad_code} | T:{trend_score} L:{loc_score} "
-                      f"F:{flow_score} S:{struct_score} | CVD-ROC:{cvd_roc:+.1f}")
-            return {
-                "status": status, "direction": direction, "score": total_score,
-                "reason": reason, "breakdown": breakdown, "patterns": patterns,
-                "oi_quadrant": quad_label
-            }
-
+        p_tag = f" | Pat:{p_name}" if p_name and p_name != "NONE" else ""
+        reason = (f"{session_name} {quad_code}{p_tag} | T:{trend_score} L:{loc_score} "
+                  f"F:{flow_score} S:{struct_score} | CVD-ROC:{cvd_roc:+.1f}")
+        return {
+            "status": status, "direction": direction, "score": total_score,
+            "reason": reason, "breakdown": breakdown, "patterns": patterns,
+            "oi_quadrant": quad_label
+        }
 
 # =====================================================================
 # DYNAMIC STOP LOSS
