@@ -2487,20 +2487,13 @@ class BacktestEngine:
                 exit_price = candles[min(i + 96, len(candles)-1)]["close"]
                 exit_reason = "TimeExit"
 
+            rem_move = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
             if tp2_hit:
-                move = 0.5 * abs(tp1 - entry) + 0.3 * abs(tp2 - entry) + 0.2 * abs(exit_price - entry)
-                if direction == "SELL":
-                    move = -move if exit_price > entry else move
+                move = 0.5 * abs(tp1 - entry) + 0.3 * abs(tp2 - entry) + 0.2 * rem_move
             elif tp1_hit:
-                move = 0.5 * abs(tp1 - entry) + 0.5 * abs(exit_price - entry)
-                if direction == "SELL":
-                    move = -move if exit_price > entry else move
+                move = 0.5 * abs(tp1 - entry) + 0.5 * rem_move
             else:
-                move = (exit_price - entry) if direction == "BUY" else (entry - exit_price)
-                move -= abs(entry) * self.slippage
-
-            if direction == "SELL" and not tp1_hit:
-                move = (entry - exit_price) - abs(entry) * self.slippage
+                move = rem_move - abs(entry) * self.slippage
 
             risk_usd = balance * (Config.RISK_PER_TRADE_PCT / 100.0)
             pnl_usd = (move / risk) * risk_usd if risk > 0 else 0
