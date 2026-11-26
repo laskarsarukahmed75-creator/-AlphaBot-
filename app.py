@@ -1905,9 +1905,10 @@ class InstitutionalSignalEngine:
             total_score = trend_score + loc_score + flow_score + struct_score
             breakdown["Total"] = total_score
             breakdown["Direction"] = direction
-            brain_blocked = False
-            if self.xray_brain is not None:
-                brain_res = self.xray_brain.evaluate_pattern(
+        brain_blocked = False
+        p_name = "NONE"
+        if self.xray_brain is not None:
+            brain_res = self.xray_brain.evaluate_pattern(
                 asset=asset,
                 price=price,
                 ema20_15=ema20_15,
@@ -1917,7 +1918,9 @@ class InstitutionalSignalEngine:
             )
             p_name = brain_res.get("pattern", "NONE")
             p_bonus = int(brain_res.get("bonus", 0) or 0)
-            if direction == "BUY" and not brain_res.get("allow_buy", False):
+            if getattr(Config, "REQUIRE_PATTERN_CONFIRMATION", False) and p_name in ("NONE", "NORMAL_SCAN", ""):
+                brain_blocked = True
+            elif direction == "BUY" and not brain_res.get("allow_buy", False):
                 brain_blocked = True
             elif direction == "SELL" and not brain_res.get("allow_sell", False):
                 brain_blocked = True
@@ -1925,7 +1928,10 @@ class InstitutionalSignalEngine:
                 if p_bonus:
                     total_score += p_bonus
                     breakdown["PatternBrain"] = p_bonus
-            breakdown["Total"] = total_score
+        elif getattr(Config, "REQUIRE_PATTERN_CONFIRMATION", False):
+            brain_blocked = True
+        breakdown["Pattern"] = p_name
+        breakdown["Total"] = total_score
 
             if regime["regime"] == "MOMENTUM":
                 te, th, tv = 72, 60, 52
