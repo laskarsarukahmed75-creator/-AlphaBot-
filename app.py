@@ -2565,6 +2565,8 @@ class AIOrchestrator:
         self.sizing_engine = PositionSizingEngine(self.memory)
 
         self.telegram = TelegramPipeline(orch=self)
+        if getattr(self.signal_engine, "xray_brain", None) is not None:
+        self.signal_engine.xray_brain.telegram = self.telegram
 
         self.active_trades = {}
         self.trade_lock = threading.Lock()
