@@ -3026,10 +3026,9 @@ class AIOrchestrator:
                 self._close_trade(tid, exit_p, raw_move, reason)
 
     def _close_trade(self, tid, price, raw_move, reason=""):
-def _close_trade(self, tid, price, raw_move, reason=""):
-    trade = self.active_trades.pop(tid, None)
-    if not trade:
-        return
+        trade = self.active_trades.pop(tid, None)
+        if not trade:
+            return
         
     entry_time = trade.get('entry_time', int(time.time()))
     entry = trade.get('entry', 0)
