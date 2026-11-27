@@ -3026,72 +3026,88 @@ class AIOrchestrator:
                 self._close_trade(tid, exit_p, raw_move, reason)
 
     def _close_trade(self, tid, price, raw_move, reason=""):
-        trade = self.active_trades.pop(tid, None)
-        if not trade:
-            return
-        entry_time = trade.get('entry_time', int(time.time()))
-        entry = trade.get('entry', 0)
-        asset = trade.get('asset', '')
-        d = trade.get('direction', 'BUY')
-        tp1 = trade.get('tp1', entry)
-        tp2 = trade.get('tp2', entry)
-
-        if trade.get('tp2_hit'):
-            move_tp1 = abs(tp1 - entry)
-            move_tp2 = abs(tp2 - entry)
-            pnl = 0.50 * move_tp1 + 0.30 * move_tp2 + 0.20 * raw_move
-        elif trade.get('tp1_hit'):
-            move_tp1 = abs(tp1 - entry)
-            pnl = 0.50 * move_tp1 + 0.50 * raw_move
-        else:
-            pnl = raw_move
-
-        pnl -= abs(entry) * Config.SLIPPAGE_PCT
-
-        self.db.close_trade(tid, price, pnl, reason)
-        self.mongo.close_trade_mongo(tid, price, pnl, reason)
-        self.telegram.fire_trade_close(tid, asset, entry, price, pnl, reason, entry_time)
-        logger.info(f"🔒 Trade #{tid} ({asset}) closed @ {price:.2f} | Weighted PnL: {pnl:+.2f} | Reason: {reason}")
-
-        mem = self.memory.get_or_create_state()
-        consec_losses = int(mem.get("consecutive_losses", 0))
-        updates = {"total_trades_closed": 1, "total_pnl": float(pnl)}
-
-        if pnl > 0:
-            updates["total_wins"] = 1
-            updates["consecutive_losses"] = 0
-        elif pnl < 0:
-            updates["total_losses"] = 1
-            consec_losses += 1
-            updates["consecutive_losses"] = consec_losses
-            
-            if consec_losses >= Config.MCB_MAX_CONSECUTIVE_LOSSES:
-                until_ts = int(time.time()) + Config.MCB_COOLDOWN_SECONDS
-                updates["mcb_until_ts"] = until_ts
-                self.pending_queue.clear_all("MCB Activated")
-                self.telegram.fire_cb_alert("MCB (3 Consecutive Losses)", Config.MCB_COOLDOWN_SECONDS // 60)
-
-        self.memory.update_state(updates, absolute_keys={"consecutive_losses", "mcb_until_ts"})
-
-        daily_balance = float(mem.get("daily_start_balance", Config.ACCOUNT_BALANCE_USD))
-        weekly_balance = float(mem.get("weekly_start_balance", Config.ACCOUNT_BALANCE_USD))
-        current_balance = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0)) + pnl
+def _close_trade(self, tid, price, raw_move, reason=""):
+    trade = self.active_trades.pop(tid, None)
+    if not trade:
+        return
         
-        daily_loss_pct = ((daily_balance - current_balance) / daily_balance * 100) if daily_balance > 0 else 0
-        weekly_loss_pct = ((weekly_balance - current_balance) / weekly_balance * 100) if weekly_balance > 0 else 0
+    entry_time = trade.get('entry_time', int(time.time()))
+    entry = trade.get('entry', 0)
+    asset = trade.get('asset', '')
+    d = trade.get('direction', 'BUY')
+    tp1 = trade.get('tp1', entry)
+    tp2 = trade.get('tp2', entry)
+    
+    # 🚨 FIX: असली Quantity निकालें
+    qty = float(trade.get('quantity', 0.0)) 
 
-        if daily_loss_pct >= Config.DAILY_LOSS_LIMIT_PCT:
-            until_ts = int(time.time()) + Config.DAILY_LOSS_PAUSE_SECONDS
-            self.memory.update_state({"daily_cb_until_ts": until_ts}, absolute_keys={"daily_cb_until_ts"})
-            self.pending_queue.clear_all("Daily CB Activated")
-            self.telegram.fire_cb_alert("Daily Loss Limit Hit", Config.DAILY_LOSS_PAUSE_SECONDS // 60)
-            
-        if weekly_loss_pct >= Config.WEEKLY_LOSS_LIMIT_PCT:
-            until_ts = int(time.time()) + Config.WEEKLY_LOSS_PAUSE_SECONDS
-            self.memory.update_state({"weekly_cb_until_ts": until_ts}, absolute_keys={"weekly_cb_until_ts"})
-            self.pending_queue.clear_all("Weekly CB Activated")
-            self.telegram.fire_cb_alert("Weekly Loss Limit Hit", Config.WEEKLY_LOSS_PAUSE_SECONDS // 60)
+    # 1. Weighted Price Movement (पॉइंट्स में)
+    if trade.get('tp2_hit'):
+        move_tp1 = abs(tp1 - entry)
+        move_tp2 = abs(tp2 - entry)
+        weighted_move = 0.50 * move_tp1 + 0.30 * move_tp2 + 0.20 * raw_move
+    elif trade.get('tp1_hit'):
+        move_tp1 = abs(tp1 - entry)
+        weighted_move = 0.50 * move_tp1 + 0.50 * raw_move
+    else:
+        weighted_move = raw_move
 
+    # 2. Slippage (कीमत के अंतर में से निकालें)
+    slippage = abs(entry) * Config.SLIPPAGE_PCT
+    if weighted_move > 0:
+        weighted_move = max(0, weighted_move - slippage)
+    else:
+        weighted_move -= slippage
+
+    # 3. असली USD PnL (पॉइंट्स × Quantity)
+    pnl = weighted_move * qty if qty > 0 else 0.0
+
+    # 4. Database और Telegram अपडेट करें
+    self.db.close_trade(tid, price, pnl, reason)
+    self.mongo.close_trade_mongo(tid, price, pnl, reason)
+    self.telegram.fire_trade_close(tid, asset, entry, price, pnl, reason, entry_time)
+    logger.info(f"🔒 Trade #{tid} ({asset}) closed @ {price:.2f} | Qty: {qty} | PnL: ${pnl:+.2f} | Reason: {reason}")
+
+    # 5. Memory और Circuit Breakers अपडेट करें
+    mem = self.memory.get_or_create_state()
+    conse_losses = int(mem.get("consecutive_losses", 0))
+    updates = {"total_trades_closed": 1, "total_pnl": float(pnl)}
+
+    if pnl > 0:
+        updates["total_wins"] = 1
+        updates["consecutive_losses"] = 0
+    elif pnl < 0:
+        updates["total_losses"] = 1
+        conse_losses += 1
+        updates["consecutive_losses"] = conse_losses
+
+    if conse_losses >= Config.MCB_MAX_CONSECUTIVE_LOSSES:
+        until_ts = int(time.time()) + Config.MCB_COOLDOWN_SECONDS
+        updates["mcb_until_ts"] = until_ts
+        self.pending_queue.clear_all("MCB Activated")
+        self.telegram.fire_cb_alert("MCB (3 Consecutive Losses)", Config.MCB_COOLDOWN_SECONDS // 60)
+
+    self.memory.update_state(updates, absolute_keys={"consecutive_losses", "mcb_until_ts"})
+
+    # Daily / Weekly Loss Limit Check
+    daily_balance = float(mem.get("daily_start_balance", Config.ACCOUNT_BALANCE_USD))
+    weekly_balance = float(mem.get("weekly_start_balance", Config.ACCOUNT_BALANCE_USD))
+    current_balance = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0)) + pnl
+
+    daily_loss_pct = ((daily_balance - current_balance) / daily_balance * 100) if daily_balance > 0 else 0
+    weekly_loss_pct = ((weekly_balance - current_balance) / weekly_balance * 100) if weekly_balance > 0 else 0
+
+    if daily_loss_pct >= Config.DAILY_LOSS_LIMIT_PCT:
+        until_ts = int(time.time()) + Config.DAILY_LOSS_PAUSE_SECONDS
+        self.memory.update_state({"daily_cb_until_ts": until_ts}, absolute_keys={"daily_cb_until_ts"})
+        self.pending_queue.clear_all("Daily CB Activated")
+        self.telegram.fire_cb_alert("Daily Loss Limit Hit", Config.DAILY_LOSS_PAUSE_SECONDS // 60)
+
+    if weekly_loss_pct >= Config.WEEKLY_LOSS_LIMIT_PCT:
+        until_ts = int(time.time()) + Config.WEEKLY_LOSS_PAUSE_SECONDS
+        self.memory.update_state({"weekly_cb_until_ts": until_ts}, absolute_keys={"weekly_cb_until_ts"})
+        self.pending_queue.clear_all("Weekly CB Activated")
+        self.telegram.fire_cb_alert("Weekly Loss Limit Hit", Config.WEEKLY_LOSS_PAUSE_SECONDS // 60)
     def _update_indicators(self, asset, price):
         try:
             with self.topology.lock:
