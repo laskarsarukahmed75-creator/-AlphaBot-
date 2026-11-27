@@ -3081,8 +3081,6 @@ class AIOrchestrator:
             updates["consecutive_losses"] = conse_losses
 
         if conse_losses >= Config.MCB_MAX_CONSECUTIVE_LOSSES:
-
-        if conse_losses >= Config.MCB_MAX_CONSECUTIVE_LOSSES:
            until_ts = int(time.time()) + Config.MCB_COOLDOWN_SECONDS
            updates["mcb_until_ts"] = until_ts
            self.pending_queue.clear_all("MCB Activated")
