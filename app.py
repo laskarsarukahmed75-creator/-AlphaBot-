@@ -3096,17 +3096,18 @@ class AIOrchestrator:
         daily_loss_pct = ((daily_balance - current_balance) / daily_balance * 100) if daily_balance > 0 else 0
         weekly_loss_pct = ((weekly_balance - current_balance) / weekly_balance * 100) if weekly_balance > 0 else 0
 
-    if daily_loss_pct >= Config.DAILY_LOSS_LIMIT_PCT:
-        until_ts = int(time.time()) + Config.DAILY_LOSS_PAUSE_SECONDS
-        self.memory.update_state({"daily_cb_until_ts": until_ts}, absolute_keys={"daily_cb_until_ts"})
-        self.pending_queue.clear_all("Daily CB Activated")
-        self.telegram.fire_cb_alert("Daily Loss Limit Hit", Config.DAILY_LOSS_PAUSE_SECONDS // 60)
+        if daily_loss_pct >= Config.DAILY_LOSS_LIMIT_PCT:
+            until_ts = int(time.time()) + Config.DAILY_LOSS_PAUSE_SECONDS
+            self.memory.update_state({"daily_cb_until_ts": until_ts}, absolute_keys=("daily_cb_until_ts",))
+            self.pending_queue.clear_all("Daily CB Activated")
+            self.telegram.fire_cb_alert("Daily Loss Limit Hit", Config.DAILY_LOSS_PAUSE_SECONDS // 60)
 
-    if weekly_loss_pct >= Config.WEEKLY_LOSS_LIMIT_PCT:
-        until_ts = int(time.time()) + Config.WEEKLY_LOSS_PAUSE_SECONDS
-        self.memory.update_state({"weekly_cb_until_ts": until_ts}, absolute_keys={"weekly_cb_until_ts"})
-        self.pending_queue.clear_all("Weekly CB Activated")
-        self.telegram.fire_cb_alert("Weekly Loss Limit Hit", Config.WEEKLY_LOSS_PAUSE_SECONDS // 60)
+        if weekly_loss_pct >= Config.WEEKLY_LOSS_LIMIT_PCT:
+            until_ts = int(time.time()) + Config.WEEKLY_LOSS_PAUSE_SECONDS
+            self.memory.update_state({"weekly_cb_until_ts": until_ts}, absolute_keys=("weekly_cb_until_ts",))
+            self.pending_queue.clear_all("Weekly CB Activated")
+            self.telegram.fire_cb_alert("Weekly Loss Limit Hit", Config.WEEKLY_LOSS_PAUSE_SECONDS // 60)
+
     def _update_indicators(self, asset, price):
         try:
             with self.topology.lock:
