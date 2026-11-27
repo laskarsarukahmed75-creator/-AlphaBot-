@@ -3081,20 +3081,20 @@ class AIOrchestrator:
             updates["consecutive_losses"] = conse_losses
 
         if conse_losses >= Config.MCB_MAX_CONSECUTIVE_LOSSES:
-           until_ts = int(time.time()) + Config.MCB_COOLDOWN_SECONDS
-           updates["mcb_until_ts"] = until_ts
-           self.pending_queue.clear_all("MCB Activated")
-           self.telegram.fire_cb_alert("MCB (3 Consecutive Losses)", Config.MCB_COOLDOWN_SECONDS // 60)
+            until_ts = int(time.time()) + Config.MCB_COOLDOWN_SECONDS
+            updates["mcb_until_ts"] = until_ts
+            self.pending_queue.clear_all("MCB Activated")
+            self.telegram.fire_cb_alert("MCB (3 Consecutive Losses)", Config.MCB_COOLDOWN_SECONDS // 60)
 
-       self.memory.update_state(updates, absolute_keys={"consecutive_losses", "mcb_until_ts"})
+        self.memory.update_state(updates, absolute_keys=("consecutive_losses", "mcb_until_ts"))
 
-       # Daily / Weekly Loss Limit Check
-       daily_balance = float(mem.get("daily_start_balance", Config.ACCOUNT_BALANCE_USD))
-       weekly_balance = float(mem.get("weekly_start_balance", Config.ACCOUNT_BALANCE_USD))
-       current_balance = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0)) + pnl
+        # Daily / Weekly Loss Limit Check
+        daily_balance = float(mem.get("daily_start_balance", Config.ACCOUNT_BALANCE_USD))
+        weekly_balance = float(mem.get("weekly_start_balance", Config.ACCOUNT_BALANCE_USD))
+        current_balance = Config.ACCOUNT_BALANCE_USD + float(mem.get("total_pnl", 0.0)) + pnl
 
-       daily_loss_pct = ((daily_balance - current_balance) / daily_balance * 100) if daily_balance > 0 else 0
-       weekly_loss_pct = ((weekly_balance - current_balance) / weekly_balance * 100) if weekly_balance > 0 else 0
+        daily_loss_pct = ((daily_balance - current_balance) / daily_balance * 100) if daily_balance > 0 else 0
+        weekly_loss_pct = ((weekly_balance - current_balance) / weekly_balance * 100) if weekly_balance > 0 else 0
 
     if daily_loss_pct >= Config.DAILY_LOSS_LIMIT_PCT:
         until_ts = int(time.time()) + Config.DAILY_LOSS_PAUSE_SECONDS
